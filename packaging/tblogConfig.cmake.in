@@ -1,0 +1,29 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/tblogTargets.cmake")
+
+# tblog::tblog -> tblog::tblog_shared, or tblog::tblog_static when tblog was
+# configured with TBLOG_BUILD_SHARED=OFF. A consumer can force the static
+# library with set(TBLOG_USE_STATIC ON) before find_package(tblog).
+if(NOT TARGET tblog::tblog)
+  if(DEFINED TBLOG_USE_STATIC)
+    set(_tblog_static ${TBLOG_USE_STATIC})
+  elseif(@TBLOG_BUILD_SHARED@)
+    set(_tblog_static OFF)
+  else()
+    set(_tblog_static ON)
+  endif()
+  add_library(tblog::tblog INTERFACE IMPORTED)
+  if(_tblog_static)
+    set_target_properties(tblog::tblog PROPERTIES INTERFACE_LINK_LIBRARIES tblog::tblog_static)
+  else()
+    set_target_properties(tblog::tblog PROPERTIES INTERFACE_LINK_LIBRARIES tblog::tblog_shared)
+  endif()
+  unset(_tblog_static)
+endif()
+
+check_required_components(tblog)

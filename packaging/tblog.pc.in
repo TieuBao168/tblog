@@ -1,0 +1,11 @@
+prefix=@TBLOG_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@TBLOG_PC_LIBDIR@
+includedir=@TBLOG_PC_INCLUDEDIR@
+
+Name: tblog
+Description: Asynchronous C/C++ logging library with a C99 API
+Version: @TBLOG_VERSION@
+Libs: -L${libdir} -ltblog
+Libs.private: -lstdc++ -pthread
+Cflags: -I${includedir}

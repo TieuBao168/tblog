@@ -1,8 +1,11 @@
 # tblog build. `make` -> build/libtblog.a, `make test`, `make SAN=thread test`,
 # `make STD=c++11 test` (C++11/14/17),
 # `make SAN=address test`, `make bench`.
+# Packaging: `make shared` / `make static`, `make install PREFIX=/usr/local
+# DESTDIR=`, `make uninstall`, `make check-symbols`, `make check-install`.
 CXX      ?= g++
 CC       ?= gcc
+AR       ?= ar
 SAN      ?=
 # C++ standard used to build the library: c++11, c++14 or c++17 (default).
 STD      ?= c++17
@@ -23,16 +26,40 @@ OBJS  := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(SRCS))
 LIB   := $(BUILD)/libtblog.a
 TESTS := $(patsubst tests/unit/%.cpp,$(BUILD)/tests/%,$(wildcard tests/unit/*.cpp))
 
-.PHONY: all test bench examples clean
-all: $(LIB)
+# Shared library: libtblog.so.$(VERSION), soname libtblog.so.$(SOVERSION).
+VERSION   := 0.1.0
+SOVERSION := 0
+SONAME    := libtblog.so.$(SOVERSION)
+SHLIB     := $(BUILD)/libtblog.so.$(VERSION)
+SHLINKS   := $(BUILD)/$(SONAME) $(BUILD)/libtblog.so
+# Library objects are PIC (shared by .a and .so) and hide everything that is
+# not marked TBLOG_API; the version script also hides std:: instantiations.
+LIB_CXXFLAGS := -fPIC -fvisibility=hidden
+SHLIB_LDFLAGS = -shared -Wl,-soname,$(SONAME) -Wl,--version-script=packaging/tblog.map \
+                $(if $(SAN),,-Wl,--no-undefined)
+
+.PHONY: all static shared test bench examples clean install uninstall check-symbols check-install
+all: $(LIB) $(SHLINKS)
+static: $(LIB)
+shared: $(SHLINKS)
 
 $(BUILD)/obj/%.o: src/%.cpp src/internal.h include/tblog/log.h
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(LIB_CXXFLAGS) -c $< -o $@
 
 $(LIB): $(OBJS)
 	@mkdir -p $(dir $@)
-	ar rcs $@ $^
+	$(AR) rcs $@ $^
+
+$(SHLIB): $(OBJS) packaging/tblog.map
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(filter-out -rdynamic,$(LDFLAGS)) $(SHLIB_LDFLAGS) $(OBJS) -o $@
+
+$(BUILD)/$(SONAME): $(SHLIB)
+	ln -sf $(notdir $<) $@
+
+$(BUILD)/libtblog.so: $(BUILD)/$(SONAME)
+	ln -sf $(notdir $<) $@
 
 $(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h
 	@mkdir -p $(dir $@)
@@ -56,6 +83,49 @@ $(BUILD)/examples/%: examples/%.c $(LIB)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lstdc++ -o $@
 
 examples: $(patsubst examples/%.c,$(BUILD)/examples/%,$(wildcard examples/*.c))
+
+# ---- install -----------------------------------------------------------------
+PREFIX       ?= /usr/local
+DESTDIR      ?=
+LIBDIR       ?= $(PREFIX)/lib
+INCLUDEDIR   ?= $(PREFIX)/include
+PKGCONFIGDIR ?= $(LIBDIR)/pkgconfig
+INSTALL      ?= install
+NM           ?= nm
+PKG_CONFIG   ?= pkg-config
+HEADERS      := $(wildcard include/tblog/*.h include/tblog/*.hpp)
+# .pc paths are written relative to ${prefix} when they live under PREFIX.
+PC_LIBDIR     = $(patsubst $(PREFIX)/%,$${prefix}/%,$(LIBDIR))
+PC_INCLUDEDIR = $(patsubst $(PREFIX)/%,$${prefix}/%,$(INCLUDEDIR))
+
+install: $(LIB) $(SHLINKS) packaging/tblog.pc.in
+	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)/tblog $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PKGCONFIGDIR)
+	$(INSTALL) -m 644 $(HEADERS) $(DESTDIR)$(INCLUDEDIR)/tblog/
+	$(INSTALL) -m 644 $(LIB) $(DESTDIR)$(LIBDIR)/
+	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
+	ln -sf libtblog.so.$(VERSION) $(DESTDIR)$(LIBDIR)/$(SONAME)
+	ln -sf $(SONAME) $(DESTDIR)$(LIBDIR)/libtblog.so
+	sed -e 's|@TBLOG_PC_PREFIX@|$(PREFIX)|' -e 's|@TBLOG_PC_LIBDIR@|$(PC_LIBDIR)|' \
+	    -e 's|@TBLOG_PC_INCLUDEDIR@|$(PC_INCLUDEDIR)|' -e 's|@TBLOG_VERSION@|$(VERSION)|' \
+	    packaging/tblog.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
+	chmod 644 $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
+
+uninstall:
+	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/tblog/,$(notdir $(HEADERS)))
+	-rmdir $(DESTDIR)$(INCLUDEDIR)/tblog 2>/dev/null
+	rm -f $(DESTDIR)$(LIBDIR)/libtblog.a $(DESTDIR)$(LIBDIR)/libtblog.so.$(VERSION) \
+	      $(DESTDIR)$(LIBDIR)/$(SONAME) $(DESTDIR)$(LIBDIR)/libtblog.so \
+	      $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
+
+# The .so must export exactly the tblog_* functions that libtblog.a defines.
+check-symbols: $(LIB) $(SHLINKS)
+	NM="$(NM)" sh packaging/check-symbols.sh $(LIB) $(SHLIB)
+
+# Install into $(BUILD)/check-install, then build and run examples/basic.c
+# against the installed static and shared libs via pkg-config.
+check-install: $(LIB) $(SHLINKS) check-symbols
+	BUILD="$(BUILD)" MAKE="$(MAKE)" CC="$(CC)" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" \
+	RUNNER="$(RUNNER)" PKG_CONFIG="$(PKG_CONFIG)" sh packaging/check-install.sh
 
 clean:
 	rm -rf build build-*

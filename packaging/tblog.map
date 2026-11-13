@@ -1,0 +1,11 @@
+/* Linker version script for libtblog.so: export the public C API only.
+ * -fvisibility=hidden already hides tblog's own C++ internals; this also
+ * hides the std:: template instantiations (std::vector<...>, std::string
+ * helpers, ...) that libstdc++ headers mark visibility("default") and that
+ * would otherwise leak out of the .so as weak symbols. */
+{
+  global:
+    tblog_*;
+  local:
+    *;
+};

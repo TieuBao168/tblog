@@ -4,6 +4,17 @@
 
 #include <stdint.h>
 
+/* Export marker for public functions. The library is built with
+ * -fvisibility=hidden, so every public tblog_* function MUST carry TBLOG_API
+ * (`make check-symbols` fails otherwise). */
+#ifndef TBLOG_API
+#if defined(__GNUC__) || defined(__clang__)
+#define TBLOG_API __attribute__((visibility("default")))
+#else
+#define TBLOG_API
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,29 +39,29 @@ typedef struct tblog_module {
 
 /* Lifecycle. config_path may be NULL (defaults). Returns 0 on success.
  * Calling tblog_write before tblog_init writes to stderr. */
-int  tblog_init(const char *config_path);
-void tblog_shutdown(void);  /* drain, fsync, stop worker; idempotent */
-void tblog_flush(void);     /* ask the worker to flush now and wait for it */
+TBLOG_API int  tblog_init(const char *config_path);
+TBLOG_API void tblog_shutdown(void);  /* drain, fsync, stop worker; idempotent */
+TBLOG_API void tblog_flush(void);     /* ask the worker to flush now and wait for it */
 
 /* Levels. module NULL or "" = root; setting root updates every module that
  * has no explicit level of its own. */
-void        tblog_set_level(const char *module, tblog_level lv);
-tblog_level tblog_get_level(const char *module);
+TBLOG_API void        tblog_set_level(const char *module, tblog_level lv);
+TBLOG_API tblog_level tblog_get_level(const char *module);
 
 /* Returns a stable pointer (never freed) for the module name; NULL/"" = root.
  * Names longer than 45 chars are truncated. Thread-safe. */
-tblog_module *tblog_module_get(const char *name);
+TBLOG_API tblog_module *tblog_module_get(const char *name);
 
 static inline tblog_level tblog_module_level(const tblog_module *m) {
     return (tblog_level)__atomic_load_n(&m->level, __ATOMIC_RELAXED);
 }
 
-void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
-                 const char *func, const char *fmt, ...)
+TBLOG_API void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
+                           const char *func, const char *fmt, ...)
     __attribute__((format(printf, 6, 7)));
 
 /* Number of lines dropped because the buffer/region was full. */
-uint64_t tblog_dropped_count(void);
+TBLOG_API uint64_t tblog_dropped_count(void);
 
 #ifndef TBLOG_COMPILE_LEVEL
 #define TBLOG_COMPILE_LEVEL TBLOG_LV_TRACE

@@ -5,3 +5,6 @@
 # Logs written by examples and benchmarks
 /logs/
 *.log
+
+# Claude Code agent worktrees and local state
+/.claude/

@@ -15,6 +15,21 @@ CXXFLAGS += -std=$(STD) -Wall -Wextra -pthread -Iinclude -Isrc -fno-omit-frame-p
 CFLAGS   ?= -O2 -g
 CFLAGS   += -std=c99 -Wall -Wextra -pthread -Iinclude
 LDFLAGS  += -pthread -rdynamic
+# zlib for file.compress=gzip, autodetected (HAVE_ZLIB=1: needs <zlib.h> and
+# -lz; programs linking libtblog.a then need -lz too). Without it the library
+# spawns `gzip -n`. Override with `make HAVE_ZLIB=0`.
+ifeq ($(origin HAVE_ZLIB),undefined)
+  HAVE_ZLIB := $(shell printf '\043include <zlib.h>\nint main(void){return zlibVersion()==0;}\n' | \
+                 $(CC) -x c - -lz -o /dev/null >/dev/null 2>&1 && echo 1 || echo 0)
+endif
+# Libraries libtblog itself depends on: linked AFTER the objects of the .so
+# (--as-needed would drop them otherwise) and listed in tblog.pc.
+LIB_LIBS :=
+ifeq ($(HAVE_ZLIB),1)
+  CXXFLAGS += -DTBLOG_HAVE_ZLIB=1
+  LIB_LIBS += -lz
+  LDFLAGS  += -lz
+endif
 ifneq ($(SAN),)
   CXXFLAGS += -fsanitize=$(SAN)
   CFLAGS   += -fsanitize=$(SAN)
@@ -53,7 +68,7 @@ $(LIB): $(OBJS)
 
 $(SHLIB): $(OBJS) packaging/tblog.map
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(filter-out -rdynamic,$(LDFLAGS)) $(SHLIB_LDFLAGS) $(OBJS) -o $@
+	$(CXX) $(CXXFLAGS) $(filter-out -rdynamic,$(LDFLAGS)) $(SHLIB_LDFLAGS) $(OBJS) $(LIB_LIBS) -o $@
 
 $(BUILD)/$(SONAME): $(SHLIB)
 	ln -sf $(notdir $<) $@
@@ -115,6 +130,7 @@ install: $(LIB) $(SHLINKS) packaging/tblog.pc.in
 	ln -sf $(SONAME) $(DESTDIR)$(LIBDIR)/libtblog.so
 	sed -e 's|@TBLOG_PC_PREFIX@|$(PREFIX)|' -e 's|@TBLOG_PC_LIBDIR@|$(PC_LIBDIR)|' \
 	    -e 's|@TBLOG_PC_INCLUDEDIR@|$(PC_INCLUDEDIR)|' -e 's|@TBLOG_VERSION@|$(VERSION)|' \
+	    -e 's|@TBLOG_PC_PRIVATE_LIBS@|$(strip $(LIB_LIBS))|' \
 	    packaging/tblog.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
 	chmod 644 $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
 

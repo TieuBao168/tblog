@@ -135,11 +135,24 @@ std::unique_ptr<Sink> make_syslog_sink(const char *ident); // openlog/syslog
 // ============================================================================
 enum class FullPolicy { Drop, Block };
 
+// file.rotate: Size = app.log -> app.1.log ... (index shifting). Daily/Hourly =
+// rotate at each local-time period boundary into app.2026-11-13.log /
+// app.2026-11-13T14.log (a size rotation inside one period adds .1, .2, ...);
+// max_size still caps every file. Boundaries are detected on the worker side.
+enum class RotateMode { Size, Daily, Hourly };
+// file.compress: gzip rotated files on a background thread (src/backend/archiver.*).
+enum class CompressMode { None, Gzip };
+
 struct FileOptions {
     std::string path = "./logs/app.log";
     uint64_t max_size = 256ull << 20;          // rotate when exceeded
-    int max_files = 5;                         // app.log, app.1.log .. app.(N-1).log
+    int max_files = 5;                         // app.log + up to N-1 newest rotated files
     tblog_level urgent_level = TBLOG_LV_ERROR; // append at >= this wakes worker + marks urgent
+    RotateMode rotate = RotateMode::Size;
+    CompressMode compress = CompressMode::None;
+    // Test hook: wall clock in seconds since the epoch used for period
+    // decisions (nullptr = CLOCK_REALTIME). Called on the worker only.
+    int64_t (*now_fn)() = nullptr;
 };
 
 class Backend {
@@ -224,7 +237,7 @@ struct Config {
 };
 
 // Keys: level, pattern, backend (sync|buffer|mmap), file.path, file.max_size,
-// file.max_files, buffer.size, mmap.region_size, full_policy (drop|block),
+// file.max_files, file.rotate (size|daily|hourly), file.compress (none|gzip), buffer.size, mmap.region_size, full_policy (drop|block),
 // flush.interval_ms, sync.interval_ms, sync.on_level, console, console.color,
 // syslog, module.<name>, reload.watch.
 // Sizes accept B/KB/MB/GB suffixes. Bools: true/false/1/0/yes/no/on/off.

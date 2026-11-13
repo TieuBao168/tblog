@@ -27,6 +27,16 @@ include(GNUInstallDirs)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
+# zlib for file.compress=gzip; without it the library spawns `gzip -n`.
+option(TBLOG_WITH_ZLIB "Use zlib for gzip compression of rotated files" ON)
+set(TBLOG_HAVE_ZLIB OFF)
+if(TBLOG_WITH_ZLIB)
+  find_package(ZLIB QUIET)
+  if(ZLIB_FOUND)
+    set(TBLOG_HAVE_ZLIB ON)
+  endif()
+endif()
+
 # New modules added under src/ are picked up automatically (re-run cmake on
 # CMake < 3.12, which lacks CONFIGURE_DEPENDS).
 if(NOT CMAKE_VERSION VERSION_LESS 3.12)
@@ -51,6 +61,10 @@ function(tblog_configure_library target)
       ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_options(${target} PRIVATE ${TBLOG_WARNINGS} ${TBLOG_LIB_OPTIONS})
   target_link_libraries(${target} PUBLIC Threads::Threads)
+  if(TBLOG_HAVE_ZLIB)
+    target_compile_definitions(${target} PRIVATE TBLOG_HAVE_ZLIB=1)
+    target_link_libraries(${target} PRIVATE ZLIB::ZLIB)
+  endif()
   set_target_properties(${target} PROPERTIES
     OUTPUT_NAME tblog
     CXX_STANDARD ${TBLOG_CXX_STANDARD}
@@ -159,6 +173,11 @@ foreach(kind LIBDIR INCLUDEDIR)
   endif()
 endforeach()
 set(TBLOG_VERSION ${PROJECT_VERSION})
+if(TBLOG_HAVE_ZLIB)
+  set(TBLOG_PC_PRIVATE_LIBS "-lz")
+else()
+  set(TBLOG_PC_PRIVATE_LIBS "")
+endif()
 configure_file(packaging/tblog.pc.in "${CMAKE_CURRENT_BINARY_DIR}/tblog.pc" @ONLY)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/tblog.pc"
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

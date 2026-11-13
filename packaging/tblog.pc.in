@@ -7,5 +7,5 @@ Name: tblog
 Description: Asynchronous C/C++ logging library with a C99 API
 Version: @TBLOG_VERSION@
 Libs: -L${libdir} -ltblog
-Libs.private: -lstdc++ -pthread
+Libs.private: -lstdc++ -pthread @TBLOG_PC_PRIVATE_LIBS@
 Cflags: -I${includedir}

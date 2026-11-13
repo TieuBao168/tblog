@@ -90,6 +90,38 @@ TEST(full_example) {
     EXPECT_TRUE(c.reload_watch);
 }
 
+TEST(rotate_and_compress) {
+    Config c;
+    EXPECT_TRUE(c.file.rotate == RotateMode::Size);  // defaults
+    EXPECT_TRUE(c.file.compress == CompressMode::None);
+    EXPECT_TRUE(c.file.now_fn == nullptr);
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string("file.rotate = daily\nfile.compress = gzip  # comment\n", c, &w));
+    EXPECT_EQ(w.size(), size_t(0));
+    EXPECT_TRUE(c.file.rotate == RotateMode::Daily);
+    EXPECT_TRUE(c.file.compress == CompressMode::Gzip);
+    EXPECT_TRUE(parse_config_string("file.rotate = HOURLY\nfile.compress = None\n", c, nullptr));
+    EXPECT_TRUE(c.file.rotate == RotateMode::Hourly);
+    EXPECT_TRUE(c.file.compress == CompressMode::None);
+    EXPECT_TRUE(parse_config_string("file.rotate = Size", c, nullptr));
+    EXPECT_TRUE(c.file.rotate == RotateMode::Size);
+
+    // Invalid values warn (with the line) and keep the previous value.
+    c.file.rotate = RotateMode::Daily;
+    c.file.compress = CompressMode::Gzip;
+    w.clear();
+    EXPECT_FALSE(parse_config_string("level = INFO\nfile.rotate = weekly\nfile.compress = zstd\n"
+                                     "file.rotate =\n",
+                                     c, &w));
+    ASSERT_TRUE(w.size() == 3);
+    EXPECT_TRUE(w[0].find("line 2") != std::string::npos);
+    EXPECT_TRUE(w[0].find("size|daily|hourly") != std::string::npos);
+    EXPECT_TRUE(w[1].find("line 3") != std::string::npos);
+    EXPECT_TRUE(w[1].find("none|gzip") != std::string::npos);
+    EXPECT_TRUE(c.file.rotate == RotateMode::Daily);
+    EXPECT_TRUE(c.file.compress == CompressMode::Gzip);
+}
+
 TEST(other_keys_and_values) {
     Config c;
     std::vector<std::string> w;

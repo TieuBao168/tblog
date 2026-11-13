@@ -61,7 +61,10 @@ $(BUILD)/$(SONAME): $(SHLIB)
 $(BUILD)/libtblog.so: $(BUILD)/$(SONAME)
 	ln -sf $(notdir $<) $@
 
-$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h
+# Public headers are prerequisites so header-only changes rebuild the tests.
+PUBLIC_HDRS := $(wildcard include/tblog/*.h include/tblog/*.hpp include/tblog/detail/*.hpp)
+
+$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h $(PUBLIC_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -Itests $< $(LIB) $(LDFLAGS) -o $@
 
@@ -82,7 +85,12 @@ $(BUILD)/examples/%: examples/%.c $(LIB)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $< $(LIB) $(LDFLAGS) -lstdc++ -o $@
 
-examples: $(patsubst examples/%.c,$(BUILD)/examples/%,$(wildcard examples/*.c))
+$(BUILD)/examples/%: examples/%.cpp $(LIB) $(PUBLIC_HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $< $(LIB) $(LDFLAGS) -o $@
+
+examples: $(patsubst examples/%.c,$(BUILD)/examples/%,$(wildcard examples/*.c)) \
+          $(patsubst examples/%.cpp,$(BUILD)/examples/%,$(wildcard examples/*.cpp))
 
 # ---- install -----------------------------------------------------------------
 PREFIX       ?= /usr/local

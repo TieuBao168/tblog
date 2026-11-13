@@ -1,8 +1,11 @@
-// RotatingFile — append-only log file with size-based rotation. Internal to
-// the backends (not thread-safe: callers serialise write_all/rotate/open/close;
-// fd() and raw_write_all() may be used concurrently, e.g. from a signal handler).
+// RotatingFile — append-only log file with size- and time-based rotation.
+// Internal to the backends (not thread-safe: callers serialise
+// write_all/rotate/check_time/open/close; fd() and raw_write_all() may be used
+// concurrently, e.g. from a signal handler). Naming, retention and gzip of the
+// rotated files live in Archiver (archiver.h).
 #pragma once
 
+#include "backend/archiver.h"
 #include "internal.h"
 
 #include <atomic>
@@ -30,7 +33,14 @@ public:
     // lost_bytes() with a rate-limited warning on stderr; never throws.
     void write_all(const char *data, size_t len) noexcept;
 
-    void rotate() noexcept;     // app.log -> app.1.log -> ... ; reopen app.log
+    void rotate() noexcept;     // app.log -> app.1.log / app.<period>[.N].log; reopen app.log
+
+    // Time rotation (file.rotate = daily|hourly): if the clock passed the
+    // current period's end, rotate (a non-empty file) and start the new
+    // period. Worker side only: callers call it once per flush, AFTER taking
+    // the data to write (so a line never lands in a file of an earlier period
+    // than the one in effect when it was appended). Cheap: one clock read.
+    void check_time() noexcept;
     void datasync() noexcept;   // fdatasync
     void close() noexcept;
 
@@ -52,7 +62,12 @@ private:
     void write_chunk(const char *data, size_t len) noexcept;
     void report_loss(size_t n, int err) noexcept;
 
+    void start_period(int64_t now) noexcept;
+
     FileOptions opt_;
+    Archiver arch_;
+    int64_t period_ = 0;                 // any time inside the current file's period
+    int64_t next_boundary_ = INT64_MAX;  // rotate when now >= this (time modes)
     std::atomic<int> fd_{-1};
     uint64_t size_ = 0;
     std::atomic<uint64_t> lost_{0};

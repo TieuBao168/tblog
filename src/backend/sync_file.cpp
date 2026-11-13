@@ -37,6 +37,7 @@ public:
 
     void flush() override {
         std::lock_guard<std::mutex> lk(mu_);
+        if (!closed_) file_.check_time();  // time rotation is decided by the worker
         for (Sink *s : sinks_) s->flush();
     }
 

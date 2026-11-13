@@ -120,6 +120,38 @@
 // never used after that file was finalized.
 // If the process dies between the switch and the rename, the newest lines are
 // in `<path>.next`; the next open finishes that rotation.
+// The rename of app.log into the rotated set (app.1.log shifting, or
+// app.<period>[.N].log in time modes, plus retention and gzip) is done by the
+// shared Archiver (archiver.h). A rotated file is handed to the compressor
+// only once it is finalized (ftruncated + fdatasync'd + closed).
+//
+// Time rotation (file.rotate = daily|hourly). Callers never look at the clock
+// for this; the worker checks it once per flush() (after process_rotation).
+// When the period ended, it:
+//   1. creates `<path>.next` and its first region (unpublished; this is the
+//      slow part: fallocate + mmap + populate) unless a size rotation already
+//      queued regions in `<path>.next`;
+//   2. seals every live region of the active file, current and queued: CAS
+//      pos -> size exactly like the padding path, recording pad_start = the
+//      old pos and committing the remainder (no memset: the file is
+//      ftruncated to its used length when finalized, so the claimed bytes are
+//      cut off). Queued regions seal at 0 and add nothing to the length;
+//   3. walks current_ through the sealed regions itself (try_switch, the same
+//      CAS a writer does), so the new region can be published without
+//      violating the slot-reuse bound, publishes it and switches into it;
+//   4. runs process_rotation(): app.log -> app.<old period>.log,
+//      `<path>.next` -> app.log. The old file is finalized (and compressed)
+//      once its in-flight writers committed and its regions are retired.
+//   A line therefore lands in the old file iff its reservation precedes the
+//   seal. Worst-case lateness of the switch = the worker's wakeup period
+//   (flush.interval_ms, default 200 ms) + one region preparation (~2.5 ms for
+//   16 MB) + scheduling delay; lines appended in that window after the
+//   boundary go to the previous period's file. Between seal and publish (no
+//   syscalls) writers briefly see no region and spin. If `<path>.next` cannot
+//   be created, the rotation is retried at the next flush().
+//   If a size rotation is already pending at the boundary, the pending file
+//   becomes the new period's file (it may hold the lines that writers put
+//   there just before the seal).
 //
 // Startup: trailing '\0' bytes (preallocation left by a crash) are trimmed
 // from app.log (and app.1.log), and appending continues at the real end of
@@ -152,6 +184,7 @@
 //    (1 ms while the worker is in flush()) for a region; was ~60 us of pure
 //    spinning before lookahead. With ENOSPC (alloc failure) it drops after
 //    the short pause spin.
+#include "backend/archiver.h"
 #include "internal.h"
 
 #include <algorithm>
@@ -194,32 +227,7 @@ inline void cpu_relax() noexcept {
 #endif
 }
 
-// ---- small file helpers (own rotate/rename helper; see rotating_file.* for v1)
-
-// rotated_name("logs/app.log", 2) -> "logs/app.2.log"; i == 0 -> path itself.
-std::string rotated_name(const std::string &path, int i) {
-    if (i == 0) return path;
-    size_t slash = path.rfind('/');
-    size_t dot = path.rfind('.');
-    size_t base = slash == std::string::npos ? 0 : slash + 1;
-    if (dot == std::string::npos || dot <= base)
-        return path + "." + std::to_string(i);
-    return path.substr(0, dot) + "." + std::to_string(i) + path.substr(dot);
-}
-
-// app.(N-2) -> app.(N-1), ..., app.log -> app.1.log. The oldest is replaced.
-void rotate_chain(const std::string &path, int max_files) {
-    if (max_files <= 1) {
-        ::unlink(path.c_str());
-        return;
-    }
-    for (int i = max_files - 1; i >= 1; --i) {
-        std::string from = rotated_name(path, i - 1), to = rotated_name(path, i);
-        if (::rename(from.c_str(), to.c_str()) != 0 && errno != ENOENT)
-            std::fprintf(stderr, "tblog: mmap backend: rename %s -> %s: %s\n",
-                         from.c_str(), to.c_str(), std::strerror(errno));
-    }
-}
+// ---- small file helpers (rotated-file naming / retention: archiver.h)
 
 void mkdirs_for(const std::string &path) {
     size_t slash = path.rfind('/');
@@ -267,6 +275,8 @@ int64_t trim_file(const std::string &path) {
 
 struct File {
     int fd = -1;
+    int64_t period = 0;     // time modes: a time inside this file's period
+    uint64_t arch = 0;      // Archiver handle once rotated out (compressed when finalized)
     bool pending = false;   // created as <path>.next, not yet renamed to <path>
     uint64_t used_len = 0;  // max end of data over retired regions
     uint64_t alloc_end = 0; // posix_fallocate'd up to here (by this backend)
@@ -299,13 +309,13 @@ public:
         : path_(opt.file.path),
           next_path_(opt.file.path + ".next"),
           max_size_(opt.file.max_size),
-          max_files_(opt.file.max_files < 1 ? 1 : opt.file.max_files),
           urgent_level_(opt.file.urgent_level),
           policy_(opt.policy) {
         long ps = ::sysconf(_SC_PAGESIZE);
         page_ = ps > 0 ? (uint64_t)ps : 4096;
         uint64_t rs = opt.region_size < page_ ? page_ : opt.region_size;
         rs_ = (rs + page_ - 1) / page_ * page_;
+        arch_.configure(opt.file);
     }
 
     ~MmapFileBackend() override {
@@ -319,21 +329,29 @@ public:
 
     bool init() {
         mkdirs_for(path_);
+        arch_.recover();  // interrupted compressions
+        const int64_t now = arch_.now();
+        // mtime (before trimming touches it) = period of an existing file's data.
+        struct stat st;
+        int64_t live_mtime = ::stat(path_.c_str(), &st) == 0 ? (int64_t)st.st_mtime : now;
         // Finish a rotation that a crash interrupted after writers switched
         // into <path>.next but before it was renamed.
-        struct stat st;
         if (::stat(next_path_.c_str(), &st) == 0) {
+            const int64_t next_mtime = (int64_t)st.st_mtime;
             if (trim_file(next_path_) > 0) {
                 trim_file(path_);
-                rotate_chain(path_, max_files_);
+                arch_.archive(path_, live_mtime, true);
                 if (::rename(next_path_.c_str(), path_.c_str()) != 0)
                     std::fprintf(stderr, "tblog: mmap backend: rename %s: %s\n",
                                  next_path_.c_str(), std::strerror(errno));
+                live_mtime = next_mtime;
             } else {
                 ::unlink(next_path_.c_str());
             }
         }
-        trim_file(rotated_name(path_, 1));  // old file not finalised by a crash
+        // Newest rotated file, possibly not finalised by a crash.
+        std::string newest = arch_.newest_plain_archive();
+        if (!newest.empty()) trim_file(newest);
 
         int fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (fd < 0) {
@@ -348,9 +366,14 @@ public:
             ::close(fd);
             return false;
         }
-        if (end > 0 && (uint64_t)end >= max_size_) {
+        bool rotate_now = end > 0 && (uint64_t)end >= max_size_;
+        // Time modes: a non-empty file from an earlier period is rotated out.
+        if (end > 0 && arch_.time_mode() &&
+            arch_.period_start(live_mtime) != arch_.period_start(now))
+            rotate_now = true;
+        if (rotate_now) {
             ::close(fd);
-            rotate_chain(path_, max_files_);
+            arch_.archive(path_, live_mtime, true);
             fd = ::open(path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
             if (fd < 0) {
                 std::fprintf(stderr, "tblog: mmap backend: cannot open %s: %s\n",
@@ -361,8 +384,11 @@ public:
         }
         File *f = new File;
         f->fd = fd;
+        f->period = now;
         files_.push_back(f);
         active_ = f;
+        next_boundary_ = arch_.next_boundary(now);
+        arch_.start();  // retention + compress leftovers
         uint64_t aligned = (uint64_t)end / page_ * page_;
         Region *r = create_region(f, aligned, (uint64_t)end - aligned, 1);
         if (!r) {
@@ -456,6 +482,7 @@ public:
         if (done_) return;
         worker_busy_.store(true, std::memory_order_relaxed);
         process_rotation();
+        check_time();
         // Top the queue up first: munmap in retire() was measured to take up
         // to ~350 us under load, writers may be waiting for a region.
         prepare_ahead();
@@ -534,7 +561,7 @@ public:
         // Data-driven: if anything landed in the pending file, finish rotation.
         for (File *f : files_) {
             if (f->pending && f->used_len > 0) {
-                rotate_chain(path_, max_files_);
+                if (active_) active_->arch = arch_.archive(path_, active_->period, false);
                 ::rename(next_path_.c_str(), path_.c_str());
                 f->pending = false;
             }
@@ -550,12 +577,14 @@ public:
                                  std::strerror(errno));
                 ::fdatasync(f->fd);
                 ::close(f->fd);
+                arch_.mark_ready(f->arch);
             }
             f->fd = -1;
         }
         for (File *f : files_) delete f;
         files_.clear();
         active_ = nullptr;
+        arch_.finish();  // let queued compressions complete (bounded)
         wake_worker();
     }
 
@@ -748,12 +777,90 @@ private:
         Region *cur = current_.load(std::memory_order_acquire);
         File *f = cur->file;
         if (f == active_ || !f->pending) return;
-        rotate_chain(path_, max_files_);
+        active_->arch = arch_.archive(path_, active_->period, false);
         if (::rename(next_path_.c_str(), path_.c_str()) != 0)
             std::fprintf(stderr, "tblog: mmap backend: rename %s -> %s: %s\n",
                          next_path_.c_str(), path_.c_str(), std::strerror(errno));
         f->pending = false;
+        f->period = arch_.now();
         active_ = f;
+    }
+
+    // Time rotation check, once per flush (see the header comment).
+    void check_time() {
+        if (!arch_.time_mode()) return;
+        const int64_t now = arch_.now();
+        if (now < next_boundary_) return;
+        if (time_rotate(now)) next_boundary_ = arch_.next_boundary(now);
+    }
+
+    // Claims the unreserved remainder of r (as the padding path does, without
+    // writing the padding: it lies beyond the file's final length).
+    static void seal_early(Region *r) noexcept {
+        uint64_t p = r->pos.load(std::memory_order_acquire);
+        while (p < r->size) {
+            if (r->pos.compare_exchange_weak(p, r->size, std::memory_order_acq_rel,
+                                             std::memory_order_acquire)) {
+                r->pad_start.store(p, std::memory_order_relaxed);
+                r->committed.fetch_add(r->size - p, std::memory_order_release);
+                return;
+            }
+        }
+    }
+
+    // Returns false if it must be retried (cannot create <path>.next).
+    bool time_rotate(int64_t now) {
+        process_rotation();
+        Region *cur = current_.load(std::memory_order_acquire);
+        // Nothing written to the live file yet: just start the new period.
+        if (cur->file == active_ && cur->file_off == 0 &&
+            cur->pos.load(std::memory_order_acquire) == 0) {
+            active_->period = now;
+            return true;
+        }
+        Region *nr = nullptr;
+        if (tail_->file == active_) {
+            int fd = ::open(next_path_.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            if (fd < 0) {
+                std::fprintf(stderr, "tblog: mmap backend: cannot create %s: %s\n",
+                             next_path_.c_str(), std::strerror(errno));
+                return false;
+            }
+            File *nf = new File;
+            nf->fd = fd;
+            nf->pending = true;
+            nr = create_region(nf, 0, 0, std::min<uint64_t>(kLookahead, regions_fitting(0)));
+            if (!nr) {
+                ::close(fd);
+                ::unlink(next_path_.c_str());
+                delete nf;
+                return false;
+            }
+            files_.push_back(nf);
+        }
+        // From here on, no syscall until the new region is published.
+        for (Region *r : live_)
+            if (r->file == active_) seal_early(r);
+        // Walk current_ to the last region of the active file (or into the
+        // already pending file), exactly like switching writers do.
+        for (;;) {
+            Region *r = current_.load(std::memory_order_acquire);
+            if (r->file != active_ || !try_switch(r, false)) break;
+        }
+        if (nr) {
+            // current_ is the old tail_ now (nothing later was published), so
+            // seq - current_->seq == 1 <= kLookahead: the slot is free.
+            const uint64_t seq = published_.load(std::memory_order_relaxed);
+            nr->seq = seq;
+            tail_ = nr;
+            ring_[seq % kRing].store(nr, std::memory_order_release);
+            published_.store(seq + 1, std::memory_order_release);
+            notify_blocked();
+            Region *r = current_.load(std::memory_order_acquire);
+            if (r->file == active_) try_switch(r, false);
+        }
+        process_rotation();  // app.log -> app.<old period>.log, .next -> app.log
+        return true;
     }
 
     void retire() {
@@ -777,6 +884,7 @@ private:
                                  std::strerror(errno));
                 ::fdatasync(f->fd);
                 ::close(f->fd);
+                arch_.mark_ready(f->arch);  // complete now: may be compressed
                 delete f;
                 files_.erase(files_.begin() + (long)i);
             } else {
@@ -847,10 +955,11 @@ private:
     }
 
     // config
+    Archiver arch_;                       // rotated files: names, retention, gzip
+    int64_t next_boundary_ = INT64_MAX;   // worker-only: next period boundary
     const std::string path_;
     const std::string next_path_;
     const uint64_t max_size_;
-    const int max_files_;
     const tblog_level urgent_level_;
     const FullPolicy policy_;
     uint64_t page_ = 4096;

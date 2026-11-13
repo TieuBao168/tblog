@@ -49,13 +49,45 @@ bool RotatingFile::open(const FileOptions &opt) {
                      opt_.path.c_str(), std::strerror(errno));
         return false;
     }
+    arch_.configure(opt_);
+    arch_.recover();
     if (!open_fd()) {
         std::fprintf(stderr, "tblog: cannot open %s: %s\n", opt_.path.c_str(),
                      std::strerror(errno));
         return false;
     }
     last_check_ = std::chrono::steady_clock::now();
+    const int64_t now = arch_.now();
+    start_period(now);
+    if (arch_.time_mode() && size_ > 0) {
+        // An existing file belongs to the period of its last write.
+        struct stat st;
+        int fd = fd_.load(std::memory_order_relaxed);
+        if (fd >= 0 && ::fstat(fd, &st) == 0) {
+            int64_t m = static_cast<int64_t>(st.st_mtime);
+            if (arch_.period_start(m) != arch_.period_start(now)) {
+                period_ = m;
+                rotate();  // archives it as app.<its period>.log
+            }
+        }
+    }
+    arch_.start();
     return true;
+}
+
+void RotatingFile::start_period(int64_t now) noexcept {
+    period_ = now;
+    next_boundary_ = arch_.next_boundary(now);
+}
+
+void RotatingFile::check_time() noexcept {
+    if (!arch_.time_mode()) return;
+    const int64_t now = arch_.now();
+    if (now < next_boundary_) return;
+    if (size_ > 0 && fd_.load(std::memory_order_relaxed) >= 0)
+        rotate();  // archives under the old period, then starts the new one
+    else
+        start_period(now);
 }
 
 bool RotatingFile::open_fd() noexcept {
@@ -74,6 +106,7 @@ bool RotatingFile::open_fd() noexcept {
 void RotatingFile::close() noexcept {
     int old = fd_.exchange(-1, std::memory_order_acq_rel);
     if (old >= 0) ::close(old);
+    arch_.finish();  // let queued compressions complete (bounded)
 }
 
 std::string RotatingFile::rotated_name(int index) const {
@@ -88,24 +121,29 @@ std::string RotatingFile::rotated_name(int index) const {
 }
 
 void RotatingFile::rotate() noexcept {
-    try {
-        if (opt_.max_files <= 1) {
-            // No history kept: start the file over.
-            int fd = fd_.load(std::memory_order_acquire);
-            if (fd >= 0 && ::ftruncate(fd, 0) == 0) { size_ = 0; return; }
-            ::unlink(opt_.path.c_str());
-        } else {
-            for (int i = opt_.max_files - 2; i >= 1; --i)
-                ::rename(rotated_name(i).c_str(), rotated_name(i + 1).c_str());
-            ::rename(opt_.path.c_str(), rotated_name(1).c_str());
+    uint64_t handle = 0;
+    if (opt_.max_files <= 1) {
+        // No history kept: start the file over.
+        int fd = fd_.load(std::memory_order_acquire);
+        if (fd >= 0 && ::ftruncate(fd, 0) == 0) {
+            size_ = 0;
+            if (arch_.time_mode()) start_period(arch_.now());
+            return;
         }
-    } catch (...) {
-        // std::string allocation failure: skip renaming, keep appending.
+        ::unlink(opt_.path.c_str());
+    } else {
+        // Shifts app.1.log... (size) or picks app.<period>[.N].log (time);
+        // allocation failure -> no rename, keep appending.
+        handle = arch_.archive(opt_.path, period_, false);
     }
     if (!open_fd()) {
-        close();
+        int old = fd_.exchange(-1, std::memory_order_acq_rel);
+        if (old >= 0) ::close(old);
         report_loss(0, errno);
     }
+    // The old fd is closed: nothing writes to the rotated file any more.
+    arch_.mark_ready(handle);
+    if (arch_.time_mode()) start_period(arch_.now());
     last_check_ = std::chrono::steady_clock::now();
 }
 

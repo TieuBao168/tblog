@@ -386,6 +386,11 @@ private:
             any = true;
         }
 
+        // Time rotation, decided here AFTER the swaps: every line taken above
+        // was appended before this clock read, so it never lands in a file of
+        // an earlier period than the one in effect when it was appended.
+        if (!crashed_.load(std::memory_order_acquire)) file_.check_time();
+
         // 2. Write them out (RotatingFile has no writev: one write per shard).
         if (any) {
             wake_blocked();

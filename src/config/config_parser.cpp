@@ -255,6 +255,17 @@ private:
             } else {
                 cfg_.file.max_files = int(n);
             }
+        } else if (key == "file.rotate") {
+            std::string l = to_lower(v);
+            if (l == "size") cfg_.file.rotate = RotateMode::Size;
+            else if (l == "daily") cfg_.file.rotate = RotateMode::Daily;
+            else if (l == "hourly") cfg_.file.rotate = RotateMode::Hourly;
+            else warn("invalid file.rotate (size|daily|hourly)", text);
+        } else if (key == "file.compress") {
+            std::string l = to_lower(v);
+            if (l == "none") cfg_.file.compress = CompressMode::None;
+            else if (l == "gzip") cfg_.file.compress = CompressMode::Gzip;
+            else warn("invalid file.compress (none|gzip)", text);
         } else if (key == "buffer.size") {
             uint64_t n;
             if (get_size(v, text, &n)) cfg_.buffer_size = size_t(n);

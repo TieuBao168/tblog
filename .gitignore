@@ -1,0 +1,7 @@
+# Build outputs (make, make SAN=..., make STD=...)
+/build/
+/build-*/
+
+# Logs written by examples and benchmarks
+/logs/
+*.log

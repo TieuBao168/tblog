@@ -49,6 +49,25 @@ void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
                  const char *func, const char *fmt, ...)
     __attribute__((format(printf, 6, 7)));
 
+/* Static descriptor of one log statement, emitted by TBLOG_LOG (one per call
+ * site, static storage). `fmt` is the format string when it is a compile-time
+ * constant (a string literal), else NULL. `cache_` is library-private (atomic
+ * access only, starts NULL). */
+typedef struct tblog_site {
+    const char *file;
+    const char *func;
+    const char *fmt;
+    int line;
+    void *cache_;
+} tblog_site;
+
+/* Same as tblog_write with the call site described by `site`. With
+ * `format.mode = deferred` (buffer backend) and fmt == site->fmt, the
+ * arguments are captured in binary and formatted later by the worker. */
+void tblog_write_site(tblog_module *m, tblog_level lv, tblog_site *site,
+                      const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
 /* Number of lines dropped because the buffer/region was full. */
 uint64_t tblog_dropped_count(void);
 
@@ -66,9 +85,28 @@ uint64_t tblog_dropped_count(void);
                 __atomic_store_n(&tblog_m_cache_, tblog_m_, __ATOMIC_RELEASE);    \
             }                                                                     \
             if ((lv) >= tblog_module_level(tblog_m_))                             \
-                tblog_write(tblog_m_, (lv), __FILE__, __LINE__, __func__, __VA_ARGS__); \
+                TBLOG_EMIT_(tblog_m_, (lv), __VA_ARGS__);                         \
         }                                                                         \
     } while (0)
+
+/* First macro argument (the format). */
+#define TBLOG_FMT0_(f, ...) f
+#ifdef TBLOG_NO_SITE
+/* Opt-out: the pre-site call (always formatted eagerly on the caller). */
+#define TBLOG_EMIT_(m, lv, ...) tblog_write(m, lv, __FILE__, __LINE__, __func__, __VA_ARGS__)
+#else
+/* __builtin_constant_p is folded at compile time: a string literal format is
+ * recorded in the site, anything else becomes NULL (formatted eagerly). */
+#define TBLOG_EMIT_(m, lv, ...)                                                   \
+    do {                                                                          \
+        static tblog_site tblog_site_ = {                                         \
+            __FILE__, __func__,                                                   \
+            __builtin_constant_p(TBLOG_FMT0_(__VA_ARGS__, 0))                     \
+                ? TBLOG_FMT0_(__VA_ARGS__, 0) : 0,                                \
+            __LINE__, 0};                                                         \
+        tblog_write_site(m, lv, &tblog_site_, __VA_ARGS__);                       \
+    } while (0)
+#endif
 
 #define TBLOG_TRACE(...) TBLOG_LOG(TBLOG_LV_TRACE, 0, __VA_ARGS__)
 #define TBLOG_DEBUG(...) TBLOG_LOG(TBLOG_LV_DEBUG, 0, __VA_ARGS__)

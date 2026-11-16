@@ -290,6 +290,11 @@ private:
             if (l == "drop") cfg_.full_policy = FullPolicy::Drop;
             else if (l == "block") cfg_.full_policy = FullPolicy::Block;
             else warn("invalid full_policy (drop|block)", text);
+        } else if (key == "format.mode") {
+            std::string l = to_lower(v);
+            if (l == "eager") cfg_.format_mode = FormatMode::Eager;
+            else if (l == "deferred") cfg_.format_mode = FormatMode::Deferred;
+            else warn("invalid format.mode (eager|deferred)", text);
         } else if (key == "flush.interval_ms") {
             get_interval(v, text, kFlushMin, kFlushMax, &cfg_.flush_interval_ms);
         } else if (key == "sync.interval_ms") {

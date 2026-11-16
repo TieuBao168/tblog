@@ -490,7 +490,13 @@ TEST(lookahead_stress_drop) {
     if (b->dropped() > 0)
         std::printf("  note: %llu of %d lines dropped (budget %llu)\n",
                     (unsigned long long)b->dropped(), T * S, (unsigned long long)budget);
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+    // Sanitizers slow the worker 2-10x: timing is not representative there,
+    // only the correctness checks above apply.
+    (void)budget;
+#else
     EXPECT_TRUE(b->dropped() <= budget);
+#endif
 }
 
 // 9. rotation with lookahead: 3 regions per file, so the queue (K = 2) keeps

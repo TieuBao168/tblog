@@ -1,4 +1,4 @@
-// End-to-end tests through the public C API, for each backend.
+// End-to-end tests through the public C API.
 #include "tiny_test.h"
 #include "tblog/log.h"
 
@@ -59,24 +59,24 @@ std::vector<std::string> lines_of(const std::string &s) {
     return out;
 }
 
-std::string config(const std::string &dir, const std::string &backend, const std::string &extra = "") {
+std::string config(const std::string &dir, const std::string &extra = "") {
     std::string cfg = dir + "/log.conf";
     write_file(cfg, "level = INFO\n"
                     "pattern = [%L] [%n] %m\n"
-                    "backend = " + backend + "\n"
                     "file.path = " + dir + "/app.log\n"
                     "buffer.size = 256KB\n"
-                    "mmap.region_size = 256KB\n"
                     "full_policy = block\n"
                     "flush.interval_ms = 20\n"
                     "reload.watch = true\n" + extra);
     return cfg;
 }
 
+}  // namespace
+
 // Logs kThreads x kPerThread lines through the API and checks every line once.
-void run_multithread(const std::string &backend) {
-    const std::string dir = fresh("mt_" + backend);
-    ASSERT_TRUE(tblog_init(config(dir, backend).c_str()) == 0);
+TEST(multithread) {
+    const std::string dir = fresh("mt");
+    ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
     constexpr int kThreads = 8, kPerThread = 20000;
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t)
@@ -100,15 +100,9 @@ void run_multithread(const std::string &backend) {
     EXPECT_EQ(tblog_dropped_count(), uint64_t(0));
 }
 
-}  // namespace
-
-TEST(multithread_sync) { run_multithread("sync"); }
-TEST(multithread_buffer) { run_multithread("buffer"); }
-TEST(multithread_mmap) { run_multithread("mmap"); }
-
 TEST(module_levels_and_flush) {
     const std::string dir = fresh("modules");
-    ASSERT_TRUE(tblog_init(config(dir, "buffer", "module.network = DEBUG\nmodule.db = ERROR\n").c_str()) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "module.network = DEBUG\nmodule.db = ERROR\n").c_str()) == 0);
     TBLOG_MDEBUG("network", "net debug visible");
     TBLOG_MWARN("db", "db warn hidden");
     TBLOG_MERROR("db", "db error visible");
@@ -124,7 +118,7 @@ TEST(module_levels_and_flush) {
 
 TEST(hot_reload_level) {
     const std::string dir = fresh("reload");
-    const std::string cfg = config(dir, "buffer");
+    const std::string cfg = config(dir);
     ASSERT_TRUE(tblog_init(cfg.c_str()) == 0);
     TBLOG_DEBUG("before reload");
     // Rewrite with a different size so the watcher sees it even within one mtime tick.
@@ -148,39 +142,10 @@ TEST(log_before_init_goes_to_stderr_and_does_not_crash) {
     EXPECT_TRUE(true);
 }
 
-// The headline v2 property: SIGKILL right after logging loses nothing.
-TEST(sigkill_keeps_logs_with_mmap) {
-    const std::string dir = fresh("sigkill");
-    const std::string cfg = config(dir, "mmap");
-    int pfd[2];
-    ASSERT_TRUE(pipe(pfd) == 0);
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pfd[0]);
-        if (tblog_init(cfg.c_str()) != 0) _exit(2);
-        for (int i = 0; i < 5000; ++i) TBLOG_INFO("line %d", i);
-        if (write(pfd[1], "x", 1) != 1) _exit(3);
-        pause();
-        _exit(0);
-    }
-    close(pfd[1]);
-    char c;
-    ASSERT_TRUE(read(pfd[0], &c, 1) == 1);
-    kill(pid, SIGKILL);
-    int st = 0;
-    waitpid(pid, &st, 0);
-    close(pfd[0]);
-    EXPECT_TRUE(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
-    std::set<std::string> seen;
-    for (const auto &l : lines_of(read_file(dir + "/app.log")))
-        if (l.rfind("[INFO] [-] line ", 0) == 0) seen.insert(l);
-    EXPECT_EQ(seen.size(), size_t(5000));
-}
-
-// v1 keeps logs on SIGSEGV through the crash handler.
-TEST(segv_keeps_logs_with_buffer) {
+// Buffered lines survive SIGSEGV through the crash handler.
+TEST(segv_keeps_logs) {
     const std::string dir = fresh("segv");
-    const std::string cfg = config(dir, "buffer", "flush.interval_ms = 60000\n");
+    const std::string cfg = config(dir, "flush.interval_ms = 60000\n");
     pid_t pid = fork();
     if (pid == 0) {
         // Under ASan/TSan the sanitizer's SEGV handler would be the "previous"

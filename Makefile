@@ -16,8 +16,8 @@ CFLAGS   ?= -O2 -g
 CFLAGS   += -std=c99 -Wall -Wextra -pthread -Iinclude
 LDFLAGS  += -pthread -rdynamic
 # zlib for file.compress=gzip, autodetected (HAVE_ZLIB=1: needs <zlib.h> and
-# -lz; programs linking libtblog.a then need -lz too). Without it the library
-# spawns `gzip -n`. Override with `make HAVE_ZLIB=0`.
+# -lz; programs linking libtblog.a then need -lz too). Without it
+# file.compress = gzip is ignored (with a warning). Override with `make HAVE_ZLIB=0`.
 ifeq ($(origin HAVE_ZLIB),undefined)
   HAVE_ZLIB := $(shell printf '\043include <zlib.h>\nint main(void){return zlibVersion()==0;}\n' | \
                  $(CC) -x c - -lz -o /dev/null >/dev/null 2>&1 && echo 1 || echo 0)

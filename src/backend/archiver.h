@@ -1,6 +1,6 @@
 // Archiver — the set of rotated files of one log path: naming, retention and
-// background gzip compression. Shared by RotatingFile (sync / v1) and the v2
-// mmap backend. Internal.
+// background gzip compression (zlib builds only). Used by RotatingFile.
+// Internal.
 //
 // Names (path "dir/app.log" -> stem "dir/app", ext ".log"):
 //   size mode    dir/app.1.log (newest) .. dir/app.(N-1).log, shifted on rotation
@@ -45,7 +45,9 @@ public:
     Archiver(const Archiver &) = delete;
     Archiver &operator=(const Archiver &) = delete;
 
-    // Before anything else (and again only after finish()).
+    // Before anything else (and again only after finish()). Without zlib
+    // (TBLOG_HAVE_ZLIB unset) CompressMode::Gzip prints a warning to stderr
+    // and falls back to None.
     void configure(const FileOptions &opt);
 
     bool time_mode() const noexcept { return rotate_ != RotateMode::Size; }
@@ -61,19 +63,17 @@ public:
     std::string size_name(int index) const;  // index 0 = path itself
     std::string time_name(const std::string &label, int index) const;
 
-    // ---- startup, in this order: recover(); [v2: trim newest_plain_archive()];
-    // start(). recover() cleans interrupted compressions; start() queues every
-    // uncompressed rotated file for compression (if enabled) and applies
-    // retention (time modes).
+    // ---- startup, in this order: recover(); start(). recover() cleans
+    // interrupted compressions; start() queues every uncompressed rotated file
+    // for compression (if enabled) and applies retention (time modes).
     void recover() noexcept;
-    std::string newest_plain_archive();  // newest rotated, uncompressed file or ""
     void start() noexcept;
 
     // Renames `live` into the rotated set (period = any time inside the
     // period its content belongs to; unused in size mode) and applies
     // retention. max_files <= 1: `live` is unlinked. Returns a handle for
     // mark_ready() (0 = nothing to compress). With ready == false the file is
-    // compressed only after mark_ready(handle) (v2: once it is finalized).
+    // compressed only after mark_ready(handle) (e.g. once its fd is closed).
     uint64_t archive(const std::string &live, int64_t period, bool ready) noexcept;
     void mark_ready(uint64_t handle) noexcept;
 

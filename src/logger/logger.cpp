@@ -27,9 +27,6 @@ struct Runtime {
     std::atomic<const Formatter *> formatter{nullptr};
     std::vector<std::unique_ptr<Formatter>> formatters;  // owned (worker/init only)
 
-    // format.mode = deferred with the buffer backend (fixed at init).
-    bool deferred = false;
-
     std::atomic<uint32_t> flush_interval_ms{200};
     std::atomic<uint32_t> sync_interval_ms{1000};
 
@@ -38,7 +35,7 @@ struct Runtime {
     std::atomic<bool> stop{false};
 
     // fdatasync runs on its own thread so a slow disk never stalls the worker
-    // (which must keep preparing buffers / mmap regions).
+    // (which must keep swapping and writing buffers).
     std::thread syncer;
     std::mutex sync_mu;
     std::condition_variable sync_cv;
@@ -101,19 +98,13 @@ void reload(Runtime *rt) {
     rt->flush_interval_ms.store(next.flush_interval_ms, std::memory_order_relaxed);
     rt->sync_interval_ms.store(next.sync_interval_ms, std::memory_order_relaxed);
 
-    if (next.backend != rt->cfg.backend || next.file.path != rt->cfg.file.path ||
-        next.buffer_size != rt->cfg.buffer_size || next.mmap_region_size != rt->cfg.mmap_region_size ||
-        next.console != rt->cfg.console || next.syslog != rt->cfg.syslog ||
-        next.format_mode != rt->cfg.format_mode) {
-        std::fprintf(stderr,
-                     "tblog: config: backend/file/buffer/sink/format.mode changes need a restart\n");
+    if (next.file.path != rt->cfg.file.path || next.buffer_size != rt->cfg.buffer_size ||
+        next.console != rt->cfg.console || next.syslog != rt->cfg.syslog) {
+        std::fprintf(stderr, "tblog: config: file/buffer/sink changes need a restart\n");
     }
-    next.format_mode = rt->cfg.format_mode;
     // Keep the restart-only fields as they are actually running.
-    next.backend = rt->cfg.backend;
     next.file = rt->cfg.file;
     next.buffer_size = rt->cfg.buffer_size;
-    next.mmap_region_size = rt->cfg.mmap_region_size;
     next.full_policy = rt->cfg.full_policy;
     next.console = rt->cfg.console;
     next.syslog = rt->cfg.syslog;
@@ -191,27 +182,12 @@ void worker_main(Runtime *rt) {
     }
 }
 
-std::unique_ptr<Backend> make_backend(const Config &c, Runtime *rt) {
-    switch (c.backend) {
-        case BackendKind::Sync:
-            return make_sync_file_backend(c.file);
-        case BackendKind::Mmap: {
-            MmapOptions o;
-            o.file = c.file;
-            o.region_size = c.mmap_region_size;
-            o.policy = c.full_policy;
-            return make_mmap_file_backend(o);
-        }
-        case BackendKind::Buffer:
-        default: {
-            BufferOptions o;
-            o.file = c.file;
-            o.buffer_size = c.buffer_size;
-            o.policy = c.full_policy;
-            if (rt->deferred) o.formatter = &rt->formatter;
-            return make_double_buffer_backend(o);
-        }
-    }
+std::unique_ptr<Backend> make_backend(const Config &c) {
+    BufferOptions o;
+    o.file = c.file;
+    o.buffer_size = c.buffer_size;
+    o.policy = c.full_policy;
+    return make_double_buffer_backend(o);
 }
 
 }  // namespace
@@ -232,30 +208,15 @@ extern "C" int tblog_init(const char *config_path) {
         print_warnings(warnings);
     }
 
-    // The formatter exists before the backend: deferred buffers render with it.
-    rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern));
-    rt->formatter.store(rt->formatters.back().get(), std::memory_order_release);
-    if (rt->cfg.format_mode == FormatMode::Deferred) {
-        if (rt->cfg.backend == BackendKind::Buffer) {
-            rt->deferred = true;
-            deferred_note_utc_offset(now_ns());
-        } else {
-            // v2 (mmap) keeps text in the file when the call returns; the sync
-            // backend writes on the caller anyway: both stay eager.
-            std::fprintf(stderr, "tblog: format.mode = deferred needs backend = buffer; "
-                                 "formatting eagerly\n");
-        }
-    }
-
-    rt->backend = make_backend(rt->cfg, rt.get());
+    rt->backend = make_backend(rt->cfg);
     if (!rt->backend) return -1;
 
     if (rt->cfg.console) rt->sinks.push_back(make_console_sink(rt->cfg.console_color));
     if (rt->cfg.syslog) rt->sinks.push_back(make_syslog_sink("tblog"));
-    if (!rt->sinks.empty() && rt->cfg.backend == BackendKind::Mmap)
-        std::fprintf(stderr, "tblog: console/syslog sinks are not fed by the mmap backend\n");
     for (auto &s : rt->sinks) rt->backend->add_sink(s.get());
 
+    rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern));
+    rt->formatter.store(rt->formatters.back().get(), std::memory_order_release);
     rt->flush_interval_ms.store(rt->cfg.flush_interval_ms);
     rt->sync_interval_ms.store(rt->cfg.sync_interval_ms);
     if (rt->cfg.reload_watch && !rt->config_path.empty())
@@ -312,66 +273,27 @@ extern "C" uint64_t tblog_dropped_count(void) {
     return n;
 }
 
-namespace {
-
-void write_eager(Runtime *rt, tblog_module *m, tblog_level lv, const char *file, int line,
-                 const char *func, const char *fmt, va_list ap) {
+extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
+                            const char *func, const char *fmt, ...) {
     ThreadContext &tc = thread_ctx();
     Record rec{now_ns(), tc.tid, lv, m ? m->name : "", file, line, func};
+
+    Runtime *rt = g_rt.load(std::memory_order_acquire);
     const Formatter *f = rt ? rt->formatter.load(std::memory_order_acquire) : &default_formatter();
+
+    va_list ap;
+    va_start(ap, fmt);
     const size_t n = f->format(tc.scratch, kScratchSize, rec, fmt, ap);
+    va_end(ap);
 
     if (!rt || !rt->backend->append(tc.scratch, static_cast<uint32_t>(n), lv)) {
         // Not initialised / already shut down -> stderr. (A full buffer under
         // the Drop policy also lands here only when the backend is stopped.)
         if (!rt || rt->stop.load(std::memory_order_relaxed)) write_stderr(tc.scratch, n);
     }
-}
 
-void fatal_epilogue(tblog_level lv) {
     if (lv == TBLOG_LV_FATAL) {
         tblog_flush();
         std::abort();
     }
-}
-
-// Per-thread buffer for an encoded deferred record (POD: no TLS constructor).
-thread_local char t_record[kRecordMax];
-
-}  // namespace
-
-extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
-                            const char *func, const char *fmt, ...) {
-    Runtime *rt = g_rt.load(std::memory_order_acquire);
-    va_list ap;
-    va_start(ap, fmt);
-    write_eager(rt, m, lv, file, line, func, fmt, ap);
-    va_end(ap);
-    fatal_epilogue(lv);
-}
-
-extern "C" void tblog_write_site(tblog_module *m, tblog_level lv, tblog_site *site,
-                                 const char *fmt, ...) {
-    Runtime *rt = g_rt.load(std::memory_order_acquire);
-    va_list ap;
-    va_start(ap, fmt);
-    if (rt && rt->deferred && fmt && fmt == site->fmt) {
-        const uint32_t tid = thread_ctx().tid;
-        va_list cp;
-        va_copy(cp, ap);
-        const size_t n = deferred_encode(t_record, kRecordMax, now_ns(), tid, lv, m, site, fmt, cp);
-        va_end(cp);
-        // n == 0: unsupported conversion / too large -> eager below. A
-        // record the backend refused is dropped (counted) unless the backend
-        // is stopped, in which case the eager path sends it to stderr.
-        if (n && (rt->backend->append_record(t_record, static_cast<uint32_t>(n), lv) ||
-                  !rt->stop.load(std::memory_order_relaxed))) {
-            va_end(ap);
-            fatal_epilogue(lv);
-            return;
-        }
-    }
-    write_eager(rt, m, lv, site->file, site->line, site->func, fmt, ap);
-    va_end(ap);
-    fatal_epilogue(lv);
 }

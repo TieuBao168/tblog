@@ -1,4 +1,4 @@
-// v1 backend: sharded double buffers. Callers memcpy into the active buffer
+// File backend: sharded double buffers. Callers memcpy into the active buffer
 // of their own shard under a short per-shard spinlock; the worker swaps every
 // shard's buffers and write()s the full ones outside the locks.
 //
@@ -34,16 +34,6 @@
 //   returns), or data racing with a concurrent worker swap. After on_crash()
 //   the backend is "dead": append() returns false and flush() writes nothing
 //   more (it checks before each shard), so data is not written a second time.
-//
-// Deferred formatting (opt.formatter != nullptr, format.mode = deferred):
-//   Every entry in a buffer is framed: u32 header (payload length, top bit
-//   set for a binary record from deferred_encode(), clear for a text line)
-//   followed by the payload. flush() renders records to text into a
-//   worker-owned chunk buffer and writes the chunks; `pending_done` then is
-//   the offset of the first entry not yet handed to write() (always an entry
-//   boundary). on_crash() walks the same entries and renders records with the
-//   async-signal-safe deferred_render_crash(), so the file only ever gets
-//   text, never raw records.
 #include "backend/rotating_file.h"
 
 #include <unistd.h>
@@ -77,11 +67,6 @@ TBLOG_ASSERT_LOCK_FREE(bool);
 
 constexpr size_t kMaxShards = 16;
 constexpr size_t kMinShardSize = 64u << 10;
-
-// Deferred mode framing.
-constexpr uint32_t kRecordBit = 0x80000000u;
-constexpr size_t kFrameHdr = sizeof(uint32_t);
-constexpr size_t kChunkSize = 64u << 10;  // worker render buffer
 
 class SpinLock {
 public:
@@ -157,7 +142,6 @@ public:
           threshold_(cap_ - cap_ / 4),
           policy_(opt.policy),
           urgent_level_(opt.file.urgent_level),
-          formatter_(opt.formatter),
           shards_(new Shard[nshards_]) {}
 
     ~DoubleBufferBackend() override {
@@ -180,26 +164,13 @@ public:
                 }
             }
         }
-        if (formatter_) chunk_.reset(new char[kChunkSize]);
         return file_.open(opt.file);
     }
 
     // ------------------------------------------------------------------ hot path
     bool append(const char *data, uint32_t len, tblog_level lv) noexcept override {
         if (len == 0) return true;
-        return append_entry(data, len, lv, formatter_ ? kFrameHdr : 0, 0);
-    }
-
-    bool append_record(const char *data, uint32_t len, tblog_level lv) noexcept override {
-        if (!formatter_ || len == 0) return false;
-        return append_entry(data, len, lv, kFrameHdr, kRecordBit);
-    }
-
-    // hdr = 0 (plain text buffers) or kFrameHdr (framed: u32 len | tag).
-    bool append_entry(const char *data, uint32_t len, tblog_level lv, size_t hdr,
-                      uint32_t tag) noexcept {
-        const size_t total = len + hdr;
-        if (total > cap_ || len >= kRecordBit) {  // can never fit
+        if (len > cap_) {  // can never fit
             dropped_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -213,13 +184,9 @@ public:
                 if (closed_.load(std::memory_order_relaxed)) return false;
                 Buffer &b = sh.bufs[sh.active.load(std::memory_order_relaxed)];
                 used = b.len.load(std::memory_order_relaxed);
-                if (used + total <= cap_) {
-                    if (hdr) {
-                        const uint32_t h = len | tag;
-                        std::memcpy(b.data + used, &h, sizeof h);
-                    }
-                    std::memcpy(b.data + used + hdr, data, len);
-                    used += total;
+                if (used + len <= cap_) {
+                    std::memcpy(b.data + used, data, len);
+                    used += len;
                     b.len.store(used, std::memory_order_release);
                     ok = true;
                 } else {
@@ -320,51 +287,14 @@ public:
             if (p >= 0) {
                 size_t done = sh.pending_done.load(std::memory_order_acquire);
                 size_t end = sh.bufs[p].len.load(std::memory_order_acquire);
-                if (done < end) crash_drain(fd, sh.bufs[p].data, done, end);
+                if (done < end)
+                    RotatingFile::raw_write_all(fd, sh.bufs[p].data + done, end - done);
             }
             if (a != p) {
                 size_t end = sh.bufs[a].len.load(std::memory_order_acquire);
-                if (end) crash_drain(fd, sh.bufs[a].data, 0, end);
+                if (end) RotatingFile::raw_write_all(fd, sh.bufs[a].data, end);
             }
         }
-    }
-
-    // Async-signal-safe. Plain buffers: raw bytes. Framed buffers: text
-    // entries as is, records rendered to text (batched on the stack).
-    void crash_drain(int fd, const char *data, size_t from, size_t end) noexcept {
-        if (!formatter_) {
-            RotatingFile::raw_write_all(fd, data + from, end - from);
-            return;
-        }
-        const Formatter *f = formatter_->load(std::memory_order_acquire);
-        char out[8192];
-        size_t n = 0;
-        size_t off = from;
-        while (off + kFrameHdr <= end) {
-            uint32_t h;
-            std::memcpy(&h, data + off, sizeof h);
-            const size_t plen = h & ~kRecordBit;
-            const char *payload = data + off + kFrameHdr;
-            if (plen > end - off - kFrameHdr) break;  // torn: stop
-            off += kFrameHdr + plen;
-            if (n + kScratchSize > sizeof out) {
-                RotatingFile::raw_write_all(fd, out, n);
-                n = 0;
-            }
-            if (!(h & kRecordBit)) {
-                if (plen > sizeof out - n) {
-                    RotatingFile::raw_write_all(fd, out, n);
-                    n = 0;
-                    RotatingFile::raw_write_all(fd, payload, plen);
-                } else {
-                    std::memcpy(out + n, payload, plen);
-                    n += plen;
-                }
-            } else if (f) {
-                n += deferred_render_crash(out + n, *f, payload, plen);
-            }
-        }
-        if (n) RotatingFile::raw_write_all(fd, out, n);
     }
 
     void crash_write(const char *data, size_t len) noexcept override {
@@ -429,50 +359,6 @@ private:
         block_cv_.notify_all();
     }
 
-    // Caller holds flush_mu_. Hands text to file + sinks unless crashed.
-    bool emit(const char *p, size_t n) {
-        if (crashed_.load(std::memory_order_acquire)) return false;
-        if (n) {
-            file_.write_all(p, n);
-            for (Sink *s : sinks_) s->write(p, n);
-        }
-        return true;
-    }
-
-    // Caller holds flush_mu_. Renders the framed entries of one swapped
-    // buffer into chunk_ and writes it chunk by chunk; pending_done follows
-    // the entry boundary of what has been handed to write().
-    void write_framed(Shard &sh, const char *data, size_t end) {
-        const Formatter *f = formatter_->load(std::memory_order_acquire);
-        char *out = chunk_.get();
-        size_t n = 0;
-        size_t off = 0;
-        while (off + kFrameHdr <= end) {
-            uint32_t h;
-            std::memcpy(&h, data + off, sizeof h);
-            const size_t plen = h & ~kRecordBit;
-            const char *payload = data + off + kFrameHdr;
-            if (plen > end - off - kFrameHdr) break;  // cannot happen: whole entries only
-            const size_t room = kChunkSize - n;
-            const bool rec = (h & kRecordBit) != 0;
-            if ((rec && room < kScratchSize) || (!rec && room < plen)) {
-                if (!emit(out, n)) return;
-                n = 0;
-                sh.pending_done.store(off, std::memory_order_release);
-            }
-            if (rec) {
-                if (f) n += deferred_render(out + n, *f, payload, plen);
-            } else if (plen > kChunkSize) {
-                if (!emit(payload, plen)) return;
-            } else {
-                std::memcpy(out + n, payload, plen);
-                n += plen;
-            }
-            off += kFrameHdr + plen;
-        }
-        if (emit(out, n)) sh.pending_done.store(end, std::memory_order_release);
-    }
-
     // Caller holds flush_mu_.
     void flush_locked() {
         // Reset before swapping: a notification raised after this point is
@@ -513,9 +399,7 @@ private:
                 Shard &sh = shards_[i];
                 Buffer &b = sh.bufs[full[i]];
                 // The crash handler already drained this shard: don't duplicate.
-                if (formatter_) {
-                    write_framed(sh, b.data, b.len.load(std::memory_order_acquire));
-                } else if (!crashed_.load(std::memory_order_acquire)) {
+                if (!crashed_.load(std::memory_order_acquire)) {
                     size_t n = b.len.load(std::memory_order_acquire);
                     file_.write_all(b.data, n);
                     sh.pending_done.store(n, std::memory_order_release);
@@ -546,7 +430,6 @@ private:
     const size_t threshold_;  // 75% of cap_
     const FullPolicy policy_;
     const tblog_level urgent_level_;
-    const std::atomic<const Formatter *> *const formatter_;  // deferred mode if set
     Shard *const shards_;
 
     // Read on every append, written once at shutdown/crash.
@@ -560,7 +443,6 @@ private:
     // Worker side.
     alignas(64) std::mutex flush_mu_;
     RotatingFile file_;
-    std::unique_ptr<char[]> chunk_;  // deferred mode: rendered text
     std::vector<Sink *> sinks_;
     uint64_t reported_dropped_ = 0;
     bool shut_ = false;

@@ -74,15 +74,13 @@ std::vector<std::string> lines_of(const std::string &s) {
     return out;
 }
 
-std::string config(const std::string &dir, const std::string &backend, const std::string &pattern = "[%L] [%n] %m",
+std::string config(const std::string &dir, const std::string &pattern = "[%L] [%n] %m",
                    const std::string &extra = "") {
     std::string cfg = dir + "/log.conf";
     std::ofstream(cfg.c_str()) << "level = INFO\n"
                                   "pattern = " << pattern << "\n"
-                                  "backend = " << backend << "\n"
                                   "file.path = " << dir << "/app.log\n"
                                   "buffer.size = 256KB\n"
-                                  "mmap.region_size = 256KB\n"
                                   "full_policy = block\n"
                                   "flush.interval_ms = 20\n" << extra;
     return cfg;
@@ -444,7 +442,7 @@ TEST(truncation_and_bounds) {
 
 TEST(truncation_through_logger) {
     const std::string dir = fresh("trunc");
-    ASSERT_TRUE(tblog_init(config(dir, "sync", "%m").c_str()) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "%m").c_str()) == 0);
     const std::string big(3000, 'x');
     TBLOGF_INFO("start {} end", big);
     TBLOGF_INFO("short {}", 1);
@@ -460,7 +458,7 @@ TEST(truncation_through_logger) {
 // ===================================================== level filtering ==
 TEST(filtered_calls_do_not_evaluate_or_format) {
     const std::string dir = fresh("filter");
-    ASSERT_TRUE(tblog_init(config(dir, "sync", "[%L] [%n] %m", "module.cppnet = DEBUG\n").c_str()) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "[%L] [%n] %m", "module.cppnet = DEBUG\n").c_str()) == 0);
     user::g_formats = 0;
     g_evals = 0;
     for (int i = 0; i < 100; ++i) {
@@ -514,7 +512,7 @@ TEST(filtered_calls_do_not_evaluate_or_format) {
 
 TEST(module_variants_and_call_site) {
     const std::string dir = fresh("modules");
-    ASSERT_TRUE(tblog_init(config(dir, "buffer", "[%L] [%n] %f:%l %F| %m", "module.network = DEBUG\nmodule.db = ERROR\n").c_str()) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "[%L] [%n] %f:%l %F| %m", "module.network = DEBUG\nmodule.db = ERROR\n").c_str()) == 0);
     TBLOGF_MDEBUG("network", "net {}", "debug");
     TBLOGF_MWARN("db", "db warn hidden");
     TBLOGF_MERROR("db", "db error {:05.1f}", 2.5);
@@ -545,9 +543,9 @@ TEST(module_variants_and_call_site) {
 }
 
 // ======================================================= multithreaded ==
-static void run_multithread(const std::string &backend) {
-    const std::string dir = fresh("mt_" + backend);
-    ASSERT_TRUE(tblog_init(config(dir, backend).c_str()) == 0);
+TEST(multithread) {
+    const std::string dir = fresh("mt");
+    ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
     const int kThreads = 8, kPerThread = 10000;
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t)
@@ -587,15 +585,12 @@ static void run_multithread(const std::string &backend) {
     EXPECT_EQ(tblog_dropped_count(), uint64_t(0));
 }
 
-TEST(multithread_buffer) { run_multithread("buffer"); }
-TEST(multithread_mmap) { run_multithread("mmap"); }
-
 // =========================================================== benchmark ==
 // Not a pass/fail test: prints ns/call of the printf macro vs the {} macro
 // through the buffer backend (and the pure formatting cost).
 TEST(benchmark_vs_printf_macro) {
     const std::string dir = fresh("bench");
-    ASSERT_TRUE(tblog_init(config(dir, "buffer", "%D %T [%L] [%t] %m", "buffer.size = 4MB\n").c_str()) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "%D %T [%L] [%t] %m", "buffer.size = 4MB\n").c_str()) == 0);
     const int N = 20000;
     const char *payload = "abcdefghijklmnop";
     uint64_t t0 = now_ns();

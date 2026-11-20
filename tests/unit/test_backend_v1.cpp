@@ -1,4 +1,4 @@
-// Tests for v1 storage: RotatingFile, sync backend, double-buffer backend.
+// Tests for the file storage: RotatingFile and the double-buffer backend.
 #include "backend/rotating_file.h"
 #include "internal.h"
 #include "tiny_test.h"
@@ -290,7 +290,6 @@ TEST(rotating_open_failure) {
     o.path = d.file("blocker/app.log");  // parent is a regular file
     std::fprintf(stderr, "(expected error follows)\n");
     EXPECT_FALSE(rf.open(o));
-    EXPECT_TRUE(make_sync_file_backend(o) == nullptr);
     BufferOptions bo;
     bo.file = o;
     EXPECT_TRUE(make_double_buffer_backend(bo) == nullptr);
@@ -305,76 +304,6 @@ TEST(rotating_write_error_counts_loss) {
     std::fprintf(stderr, "(expected ENOSPC warning follows, once)\n");
     for (int i = 0; i < 100; ++i) rf.write_all("0123456789\n", 11);
     EXPECT_EQ(rf.lost_bytes(), 1100ull);
-}
-
-// ---------------------------------------------------------------- sync backend
-TEST(sync_backend_threads_and_rotation) {
-    TempDir d("sync");
-    FileOptions o;
-    o.path = d.file("app.log");
-    auto b = make_sync_file_backend(o);
-    ASSERT_TRUE(b != nullptr);
-    const int T = 4, N = 20000 / kScale;
-    std::vector<std::thread> th;
-    for (int t = 0; t < T; ++t)
-        th.emplace_back([&, t] {
-            char line[128];
-            for (int i = 0; i < N; ++i) {
-                int n = make_line(line, t, i);
-                EXPECT_TRUE(b->append(line, n, TBLOG_LV_INFO));
-            }
-        });
-    for (auto &x : th) x.join();
-    EXPECT_FALSE(b->consume_urgent());
-    EXPECT_TRUE(b->append("T00 boom\n", 9, TBLOG_LV_ERROR));
-    EXPECT_TRUE(b->consume_urgent());
-    EXPECT_FALSE(b->consume_urgent());
-    b->flush();
-    b->sync();
-    b->shutdown();
-    b->shutdown();
-    EXPECT_FALSE(b->append("x\n", 2, TBLOG_LV_INFO));
-    std::string c = read_file(o.path);
-    c = c.substr(0, c.size() - 9);  // drop "T00 boom\n"
-    EXPECT_EQ(verify_lines(c, T, N, true), static_cast<long>(T * N));
-    EXPECT_EQ(b->dropped(), 0ull);
-
-    // Rotation through the backend.
-    FileOptions r;
-    r.path = d.file("rot.log");
-    r.max_size = 1000;
-    r.max_files = 2;
-    auto rb = make_sync_file_backend(r);
-    ASSERT_TRUE(rb != nullptr);
-    for (int i = 0; i < 25; ++i) {
-        std::string l = fixed_line(i);
-        rb->append(l.data(), static_cast<uint32_t>(l.size()), TBLOG_LV_INFO);
-    }
-    rb->shutdown();
-    EXPECT_EQ(fs::file_size(d.file("rot.log")), 500u);
-    EXPECT_EQ(fs::file_size(d.file("rot.1.log")), 1000u);
-    EXPECT_FALSE(fs::exists(d.file("rot.2.log")));
-}
-
-TEST(sync_backend_wait_wakes) {
-    TempDir d("syncwait");
-    FileOptions o;
-    o.path = d.file("app.log");
-    auto b = make_sync_file_backend(o);
-    ASSERT_TRUE(b != nullptr);
-    std::thread w([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
-        b->wake();
-    });
-    auto t0 = std::chrono::steady_clock::now();
-    b->wait_for_work(std::chrono::seconds(5));
-    EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
-    w.join();
-    const char m[] = "*** crash ***\n";
-    b->crash_write(m, sizeof m - 1);
-    b->on_crash();
-    b->shutdown();
-    EXPECT_EQ(read_file(o.path), std::string(m));
 }
 
 // ---------------------------------------------------------------- double buffer
@@ -556,6 +485,25 @@ TEST(dbuf_urgent_and_notify) {
     p.join();
     b->shutdown();
     EXPECT_EQ(fs::file_size(o.file.path), 50300u);
+}
+
+TEST(dbuf_rotation) {
+    TempDir d("dbuf_rot");
+    BufferOptions o;
+    o.file.path = d.file("rot.log");
+    o.file.max_size = 1000;
+    o.file.max_files = 2;
+    auto b = make_double_buffer_backend(o);
+    ASSERT_TRUE(b != nullptr);
+    for (int i = 0; i < 25; ++i) {
+        std::string l = fixed_line(i);
+        EXPECT_TRUE(b->append(l.data(), static_cast<uint32_t>(l.size()), TBLOG_LV_INFO));
+    }
+    b->shutdown();
+    EXPECT_EQ(fs::file_size(d.file("rot.log")), 500u);
+    EXPECT_EQ(fs::file_size(d.file("rot.1.log")), 1000u);
+    EXPECT_FALSE(fs::exists(d.file("rot.2.log")));
+    EXPECT_EQ(read_file(d.file("rot.log")).substr(0, 5), std::string("L0020"));
 }
 
 TEST(dbuf_shutdown_idempotent) {
@@ -802,12 +750,6 @@ TEST(bench_append_latency) {
     auto dbb = make_double_buffer_backend(o);
     ASSERT_TRUE(dbb != nullptr);
     bench("dbuf(block)", dbb.get(), 4, 250000 / kScale);
-    FileOptions f;
-    f.path = d.file("sync.log");
-    f.max_size = 1ull << 40;
-    auto sb = make_sync_file_backend(f);
-    ASSERT_TRUE(sb != nullptr);
-    bench("sync_file", sb.get(), 4, 50000 / kScale);
 }
 
 TINY_TEST_MAIN()

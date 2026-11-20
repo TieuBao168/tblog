@@ -72,34 +72,27 @@ int main(int argc, char **argv) {
     std::printf("timer overhead ~%llu ns (min); lines/thread=%d; rate/thread=%s; policy=%s\n",
                 (unsigned long long)timer, per_thread, rate ? std::to_string(rate).c_str() : "flood",
                 policy.c_str());
-    std::printf("%-9s %3s %9s %9s %9s %10s %12s %8s\n", "backend", "thr", "p50(ns)", "p99(ns)",
-                "p999(ns)", "max(ns)", "lines/s", "dropped");
+    std::printf("%3s %9s %9s %9s %10s %12s %8s\n", "thr", "p50(ns)", "p99(ns)", "p999(ns)",
+                "max(ns)", "lines/s", "dropped");
 
-    // name, backend, extra config. "deferred" = buffer backend with format.mode = deferred.
-    struct Case { const char *name, *backend, *extra; };
-    const Case cases[] = {{"sync", "sync", ""}, {"buffer", "buffer", ""},
-                          {"deferred", "buffer", "format.mode = deferred\n"}, {"mmap", "mmap", ""}};
-    for (const Case &c : cases) {
-        const char *b = c.name;
-        for (int threads : {1, 4, 8}) {
-            std::string dir = "build/bench_tmp/" + std::string(b) + std::to_string(threads);
-            std::string cmd = "rm -rf " + dir + " && mkdir -p " + dir;
-            if (std::system(cmd.c_str()) != 0) return 1;
-            std::ofstream(dir + "/log.conf")
-                << "backend = " << c.backend << "\n" << c.extra << "file.path = " << dir << "/app.log\n"
-                << "file.max_size = 4GB\nbuffer.size = 8MB\nmmap.region_size = 16MB\n"
-                << "full_policy = " << policy << "\nreload.watch = false\n";
-            const uint64_t dropped_before = tblog_dropped_count();
-            if (tblog_init((dir + "/log.conf").c_str()) != 0) return 1;
-            Result r = run(threads, per_thread, rate);
-            tblog_shutdown();
-            const unsigned long long dropped = (unsigned long long)(tblog_dropped_count() - dropped_before);
-            std::printf("%-9s %3d %9.0f %9.0f %9.0f %10.0f %12.0f %8llu\n", b, threads, r.p50, r.p99,
-                        r.p999, r.max, r.lines_per_s, dropped);
-            std::fflush(stdout);
-            std::string rm = "rm -rf " + dir;
-            if (std::system(rm.c_str()) != 0) return 1;
-        }
+    for (int threads : {1, 4, 8}) {
+        std::string dir = "build/bench_tmp/buffer" + std::to_string(threads);
+        std::string cmd = "rm -rf " + dir + " && mkdir -p " + dir;
+        if (std::system(cmd.c_str()) != 0) return 1;
+        std::ofstream(dir + "/log.conf")
+            << "file.path = " << dir << "/app.log\n"
+            << "file.max_size = 4GB\nbuffer.size = 8MB\n"
+            << "full_policy = " << policy << "\nreload.watch = false\n";
+        const uint64_t dropped_before = tblog_dropped_count();
+        if (tblog_init((dir + "/log.conf").c_str()) != 0) return 1;
+        Result r = run(threads, per_thread, rate);
+        tblog_shutdown();
+        const unsigned long long dropped = (unsigned long long)(tblog_dropped_count() - dropped_before);
+        std::printf("%3d %9.0f %9.0f %9.0f %10.0f %12.0f %8llu\n", threads, r.p50, r.p99, r.p999,
+                    r.max, r.lines_per_s, dropped);
+        std::fflush(stdout);
+        std::string rm = "rm -rf " + dir;
+        if (std::system(rm.c_str()) != 0) return 1;
     }
     return 0;
 }

@@ -46,12 +46,10 @@ void set_mtime(const std::string &p, time_t sec) {
 const char *kExample =
     "level = INFO\n"
     "pattern = %D %T.%us [%L] [%t] %f:%l - %m\n"
-    "backend = mmap\n"
     "file.path = ./logs/app.log\n"
     "file.max_size = 256MB\n"
     "file.max_files = 5\n"
     "buffer.size = 4MB\n"
-    "mmap.region_size = 16MB\n"
     "full_policy = drop\n"
     "flush.interval_ms = 200\n"
     "sync.interval_ms = 1000\n"
@@ -73,12 +71,10 @@ TEST(full_example) {
     EXPECT_EQ(w.size(), size_t(0));
     EXPECT_EQ(int(c.level), int(TBLOG_LV_INFO));
     EXPECT_EQ(c.pattern, std::string("%D %T.%us [%L] [%t] %f:%l - %m"));
-    EXPECT_TRUE(c.backend == BackendKind::Mmap);
     EXPECT_EQ(c.file.path, std::string("./logs/app.log"));
     EXPECT_EQ(c.file.max_size, uint64_t(256) << 20);
     EXPECT_EQ(c.file.max_files, 5);
     EXPECT_EQ(c.buffer_size, size_t(4) << 20);
-    EXPECT_EQ(c.mmap_region_size, size_t(16) << 20);
     EXPECT_TRUE(c.full_policy == FullPolicy::Drop);
     EXPECT_EQ(c.flush_interval_ms, 200u);
     EXPECT_EQ(c.sync_interval_ms, 1000u);
@@ -125,10 +121,9 @@ TEST(rotate_and_compress) {
 TEST(other_keys_and_values) {
     Config c;
     std::vector<std::string> w;
-    EXPECT_TRUE(parse_config_string("backend = SYNC\nfull_policy = Block\nconsole.color = off\n"
+    EXPECT_TRUE(parse_config_string("full_policy = Block\nconsole.color = off\n"
                                     "syslog = yes\nlevel = warning\nconsole = 1\n",
                                     c, &w));
-    EXPECT_TRUE(c.backend == BackendKind::Sync);
     EXPECT_TRUE(c.full_policy == FullPolicy::Block);
     EXPECT_FALSE(c.console_color);
     EXPECT_TRUE(c.syslog);
@@ -138,8 +133,32 @@ TEST(other_keys_and_values) {
         Config d;
         EXPECT_TRUE(parse_config_string(std::string("level = ") + lv, d, nullptr));
     }
-    parse_config_string("backend = buffer", c, nullptr);
-    EXPECT_TRUE(c.backend == BackendKind::Buffer);
+}
+
+// Keys of removed features warn ("option removed") and change nothing, so old
+// config files keep loading.
+TEST(removed_options_warn_and_are_ignored) {
+    Config c;
+    const Config before = c;
+    std::vector<std::string> w;
+    EXPECT_FALSE(parse_config_string("backend = mmap\nmmap.region_size = 16MB\nlevel = DEBUG\n"
+                                     "format.mode = deferred\nbackend = bogus\n",
+                                     c, &w));
+    ASSERT_TRUE(w.size() == 4);
+    EXPECT_TRUE(w[0].find("line 1") != std::string::npos);
+    EXPECT_TRUE(w[0].find("backend: option removed, ignored") != std::string::npos);
+    EXPECT_TRUE(w[1].find("line 2") != std::string::npos);
+    EXPECT_TRUE(w[1].find("mmap.region_size: option removed, ignored") != std::string::npos);
+    EXPECT_TRUE(w[2].find("line 4") != std::string::npos);
+    EXPECT_TRUE(w[2].find("format.mode: option removed, ignored") != std::string::npos);
+    EXPECT_TRUE(w[3].find("line 5") != std::string::npos);
+    EXPECT_TRUE(w[3].find("backend: option removed, ignored") != std::string::npos);
+    for (const auto &s : w) EXPECT_TRUE(s.find("unknown key") == std::string::npos);
+    // The valid line in between is still applied; nothing else changed.
+    EXPECT_EQ(int(c.level), int(TBLOG_LV_DEBUG));
+    EXPECT_EQ(c.file.max_size, before.file.max_size);
+    EXPECT_EQ(c.buffer_size, before.buffer_size);
+    EXPECT_TRUE(c.full_policy == before.full_policy);
 }
 
 TEST(comments_and_whitespace) {
@@ -191,9 +210,9 @@ TEST(invalid_values_keep_previous) {
     EXPECT_TRUE(parse_config_string(kExample, c, nullptr));
     Config before = c;
     const char *bad[] = {
-        "level = LOUD", "pattern =", "backend = disk", "file.path =", "file.max_size = 12XB",
+        "level = LOUD", "pattern =", "file.path =", "file.max_size = 12XB",
         "file.max_size = -5MB", "file.max_files = abc", "buffer.size = 0",
-        "buffer.size = MB", "mmap.region_size = 1.5MB", "full_policy = maybe",
+        "buffer.size = MB", "full_policy = maybe",
         "flush.interval_ms = fast", "flush.interval_ms = -3", "sync.interval_ms = 1e3",
         "sync.on_level = NOPE", "console = maybe", "console.color = 2", "syslog = ",
         "reload.watch = yesno", "module.net = LOUD", "module. = INFO", "no equals sign",
@@ -213,12 +232,10 @@ TEST(invalid_values_keep_previous) {
     }
     EXPECT_EQ(int(c.level), int(before.level));
     EXPECT_EQ(c.pattern, before.pattern);
-    EXPECT_TRUE(c.backend == before.backend);
     EXPECT_EQ(c.file.path, before.file.path);
     EXPECT_EQ(c.file.max_size, before.file.max_size);
     EXPECT_EQ(c.file.max_files, before.file.max_files);
     EXPECT_EQ(c.buffer_size, before.buffer_size);
-    EXPECT_EQ(c.mmap_region_size, before.mmap_region_size);
     EXPECT_TRUE(c.full_policy == before.full_policy);
     EXPECT_EQ(c.flush_interval_ms, before.flush_interval_ms);
     EXPECT_EQ(c.sync_interval_ms, before.sync_interval_ms);
@@ -311,13 +328,6 @@ TEST(interval_clamping) {
 TEST(sanity_rules) {
     Config c;
     std::vector<std::string> w;
-    EXPECT_FALSE(parse_config_string("mmap.region_size = 5000", c, &w));
-    EXPECT_EQ(c.mmap_region_size, size_t(8192));
-    EXPECT_TRUE(any_contains(w, "4096"));
-    EXPECT_TRUE(parse_config_string("mmap.region_size = 8KB", c, nullptr));
-    EXPECT_EQ(c.mmap_region_size, size_t(8192));
-
-    w.clear();
     EXPECT_FALSE(parse_config_string("file.max_files = 0", c, &w));
     EXPECT_EQ(c.file.max_files, 1);
     EXPECT_EQ(w.size(), size_t(1));
@@ -326,18 +336,9 @@ TEST(sanity_rules) {
     EXPECT_FALSE(parse_config_string("file.max_files = -2", c, &w));
     EXPECT_EQ(c.file.max_files, 1);
 
-    // max_size raised to region size with backend=mmap, order independent
-    Config m;
-    w.clear();
-    EXPECT_FALSE(parse_config_string("file.max_size = 1MB\nbackend = mmap\nmmap.region_size = 16MB\n",
-                                     m, &w));
-    EXPECT_EQ(m.file.max_size, uint64_t(16) << 20);
-    ASSERT_TRUE(w.size() == 1);
-    EXPECT_TRUE(w[0].find("line 1") != std::string::npos);
-    EXPECT_TRUE(w[0].find("file.max_size = 1MB") != std::string::npos);
-    // ...but not for other backends
+    // A small file.max_size is taken as is.
     Config b;
-    EXPECT_TRUE(parse_config_string("file.max_size = 1MB\nbackend = buffer\n", b, nullptr));
+    EXPECT_TRUE(parse_config_string("file.max_size = 1MB\n", b, nullptr));
     EXPECT_EQ(b.file.max_size, uint64_t(1) << 20);
 }
 
@@ -349,7 +350,7 @@ TEST(load_config_file) {
     std::vector<std::string> w;
     EXPECT_TRUE(load_config(p.c_str(), c, &w));
     EXPECT_EQ(w.size(), size_t(0));
-    EXPECT_TRUE(c.backend == BackendKind::Mmap);
+    EXPECT_EQ(c.file.max_size, uint64_t(256) << 20);
     // warnings do not make load_config fail
     write_file(p, "bogus = 1\nlevel = ERROR\n");
     w.clear();

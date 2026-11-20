@@ -16,11 +16,6 @@
 
 #ifdef TBLOG_HAVE_ZLIB
 #include <zlib.h>
-#else
-#include <signal.h>
-#include <spawn.h>
-#include <sys/wait.h>
-extern char **environ;
 #endif
 
 namespace tblog {
@@ -70,14 +65,6 @@ void fsync_dir(const std::string &dir) {
     ::close(fd);
 }
 
-// Keep fds away from 0..2 so dup2 onto stdin/stdout in a child is never a no-op.
-int high_fd(int fd) {
-    if (fd < 0 || fd > 2) return fd;
-    int d = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
-    ::close(fd);
-    return d;
-}
-
 }  // namespace
 
 Archiver::~Archiver() { finish(std::chrono::milliseconds(0)); }
@@ -87,6 +74,12 @@ void Archiver::configure(const FileOptions &opt) {
     max_files_ = opt.max_files < 1 ? 1 : opt.max_files;
     rotate_ = opt.rotate;
     compress_ = opt.compress;
+#ifndef TBLOG_HAVE_ZLIB
+    if (compress_ != CompressMode::None) {
+        std::fprintf(stderr, "tblog: built without zlib, file.compress = gzip disabled\n");
+        compress_ = CompressMode::None;
+    }
+#endif
     now_fn_ = opt.now_fn;
     size_t slash = path_.rfind('/');
     size_t base = slash == std::string::npos ? 0 : slash + 1;
@@ -240,18 +233,6 @@ void Archiver::recover() noexcept {
         }
     } catch (...) {
     }
-}
-
-std::string Archiver::newest_plain_archive() {
-    std::lock_guard<std::mutex> lk(mu_);
-    std::vector<Entry> es = scan();
-    const Entry *best = nullptr;
-    for (const Entry &e : es) {
-        if (e.is_time != time_mode()) continue;
-        // Size mode: index 1 is the newest; time mode: the largest key.
-        if (!best || (time_mode() ? e.key > best->key : e.key < best->key)) best = &e;
-    }
-    return best && best->plain && !best->gz ? best->name : std::string();
 }
 
 void Archiver::start() noexcept {
@@ -432,10 +413,8 @@ void Archiver::compressor_main() {
         if (abort_.load() || j == jobs_.end()) break;
         j->active = true;
         const std::string tmp = j->src + ".gz.tmp";
-        int in = high_fd(::open(j->src.c_str(), O_RDONLY | O_CLOEXEC));
-        int out = in < 0 ? -1
-                         : high_fd(::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
-                                          0644));
+        int in = ::open(j->src.c_str(), O_RDONLY | O_CLOEXEC);
+        int out = in < 0 ? -1 : ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (in < 0 || out < 0) {
             if (!j->cancelled)
                 std::fprintf(stderr, "tblog: compress %s: %s\n", j->src.c_str(),
@@ -499,50 +478,8 @@ bool Archiver::compress_fds(int in, int out) noexcept {
     return ::gzclose(gz) == Z_OK && ok;  // gzclose closes d
 }
 #else
-// No zlib at build time: `gzip -n -c < in > out` via posix_spawn. The result is
-// checked against the gzip trailer (ISIZE = input length mod 2^32), which also
-// covers an application that set SIGCHLD to SIG_IGN (waitpid -> ECHILD).
-bool Archiver::compress_fds(int in, int out) noexcept {
-    posix_spawn_file_actions_t fa;
-    if (::posix_spawn_file_actions_init(&fa) != 0) return false;
-    ::posix_spawn_file_actions_adddup2(&fa, in, 0);
-    ::posix_spawn_file_actions_adddup2(&fa, out, 1);
-    static char a0[] = "gzip", a1[] = "-n", a2[] = "-c";
-    char *argv[] = {a0, a1, a2, nullptr};
-    pid_t pid;
-    int e = ::posix_spawnp(&pid, "gzip", &fa, nullptr, argv, environ);
-    ::posix_spawn_file_actions_destroy(&fa);
-    if (e != 0) {
-        static std::atomic<bool> warned{false};
-        if (!warned.exchange(true))
-            std::fprintf(stderr, "tblog: cannot run gzip: %s\n", std::strerror(e));
-        return false;
-    }
-    int st = 0;
-    bool status_known = true;
-    for (;;) {
-        pid_t r = ::waitpid(pid, &st, WNOHANG);
-        if (r == pid) break;
-        if (r < 0 && errno == EINTR) continue;
-        if (r < 0) { status_known = false; break; }  // ECHILD: SIGCHLD ignored
-        if (abort_.load(std::memory_order_relaxed)) {
-            ::kill(pid, SIGKILL);
-            while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {
-            }
-            return false;
-        }
-        struct timespec ts = {0, 2 * 1000 * 1000};
-        ::nanosleep(&ts, nullptr);
-    }
-    if (status_known && !(WIFEXITED(st) && WEXITSTATUS(st) == 0)) return false;
-    struct stat si, so;
-    if (::fstat(in, &si) != 0 || ::fstat(out, &so) != 0 || so.st_size < 18) return false;
-    unsigned char t[4];
-    if (::pread(out, t, 4, so.st_size - 4) != 4) return false;
-    uint32_t isize = uint32_t(t[0]) | uint32_t(t[1]) << 8 | uint32_t(t[2]) << 16 |
-                     uint32_t(t[3]) << 24;
-    return isize == static_cast<uint32_t>(si.st_size);
-}
+// Without zlib configure() turns compression off, so no job is ever queued.
+bool Archiver::compress_fds(int, int) noexcept { return false; }
 #endif
 
 }  // namespace tblog

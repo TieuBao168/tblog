@@ -17,7 +17,6 @@
 namespace tblog {
 namespace {
 
-constexpr uint64_t kPage = 4096;
 constexpr uint32_t kFlushMin = 1, kFlushMax = 60000;
 constexpr uint32_t kSyncMax = 3600000;
 
@@ -140,21 +139,6 @@ public:
         apply(key, value, t);
     }
 
-    void finish() {
-        if (cfg_.backend == BackendKind::Mmap && cfg_.file.max_size < cfg_.mmap_region_size) {
-            char buf[256];
-            std::snprintf(buf, sizeof buf,
-                          "file.max_size (%llu) is smaller than mmap.region_size (%llu) with "
-                          "backend=mmap; raised to %llu",
-                          (unsigned long long)cfg_.file.max_size,
-                          (unsigned long long)cfg_.mmap_region_size,
-                          (unsigned long long)cfg_.mmap_region_size);
-            lineno_ = max_size_line_;
-            warn(buf, max_size_text_);
-            cfg_.file.max_size = cfg_.mmap_region_size;
-        }
-    }
-
     int warnings() const { return nwarn_; }
 
 private:
@@ -226,22 +210,16 @@ private:
         } else if (key == "pattern") {
             if (v.empty()) warn("empty pattern", text);
             else cfg_.pattern = v;
-        } else if (key == "backend") {
-            std::string l = to_lower(v);
-            if (l == "sync") cfg_.backend = BackendKind::Sync;
-            else if (l == "buffer") cfg_.backend = BackendKind::Buffer;
-            else if (l == "mmap") cfg_.backend = BackendKind::Mmap;
-            else warn("invalid backend (sync|buffer|mmap)", text);
+        } else if (key == "backend" || key == "mmap.region_size" || key == "format.mode") {
+            // Options of removed features (sync/mmap backends, deferred
+            // formatting): accepted so old config files keep working.
+            warn(key + ": option removed, ignored", text);
         } else if (key == "file.path") {
             if (v.empty()) warn("empty file.path", text);
             else cfg_.file.path = v;
         } else if (key == "file.max_size") {
             uint64_t n;
-            if (get_size(v, text, &n)) {
-                cfg_.file.max_size = n;
-                max_size_line_ = lineno_;
-                max_size_text_ = text;
-            }
+            if (get_size(v, text, &n)) cfg_.file.max_size = n;
         } else if (key == "file.max_files") {
             uint64_t n;
             NumErr e = parse_uint(v, &n);
@@ -269,32 +247,11 @@ private:
         } else if (key == "buffer.size") {
             uint64_t n;
             if (get_size(v, text, &n)) cfg_.buffer_size = size_t(n);
-        } else if (key == "mmap.region_size") {
-            uint64_t n;
-            if (get_size(v, text, &n)) {
-                if (n % kPage) {
-                    if (n > std::numeric_limits<size_t>::max() - kPage) {
-                        warn(num_err_text(NumErr::Overflow), text);
-                        return;
-                    }
-                    uint64_t r = (n + kPage - 1) / kPage * kPage;
-                    warn("mmap.region_size must be a multiple of 4096, rounded up to " +
-                             std::to_string(r),
-                         text);
-                    n = r;
-                }
-                cfg_.mmap_region_size = size_t(n);
-            }
         } else if (key == "full_policy") {
             std::string l = to_lower(v);
             if (l == "drop") cfg_.full_policy = FullPolicy::Drop;
             else if (l == "block") cfg_.full_policy = FullPolicy::Block;
             else warn("invalid full_policy (drop|block)", text);
-        } else if (key == "format.mode") {
-            std::string l = to_lower(v);
-            if (l == "eager") cfg_.format_mode = FormatMode::Eager;
-            else if (l == "deferred") cfg_.format_mode = FormatMode::Deferred;
-            else warn("invalid format.mode (eager|deferred)", text);
         } else if (key == "flush.interval_ms") {
             get_interval(v, text, kFlushMin, kFlushMax, &cfg_.flush_interval_ms);
         } else if (key == "sync.interval_ms") {
@@ -332,8 +289,6 @@ private:
     std::vector<std::string> *warn_;
     int lineno_ = 0;
     int nwarn_ = 0;
-    int max_size_line_ = 0;
-    std::string max_size_text_;
 };
 
 }  // namespace
@@ -352,7 +307,6 @@ bool parse_config_string(const std::string &text, Config &out,
         p.line(no, text.substr(pos, nl - pos));
         pos = nl + 1;
     }
-    p.finish();
     return p.warnings() == 0;
 }
 

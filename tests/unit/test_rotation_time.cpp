@@ -1,7 +1,8 @@
 // Tests for time-based rotation (file.rotate = daily|hourly), retention and
 // gzip compression of rotated files (src/backend/archiver.*), for RotatingFile
-// (sync / v1) and the v2 mmap backend. Time is injected through
-// FileOptions::now_fn; TZ is forced to UTC so expected names are fixed.
+// and the double-buffer backend. Compression tests need a zlib build
+// (TBLOG_HAVE_ZLIB). Time is injected through FileOptions::now_fn; TZ is
+// forced to UTC so expected names are fixed.
 #include "backend/archiver.h"
 #include "backend/rotating_file.h"
 #include "internal.h"
@@ -20,7 +21,6 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #ifdef TBLOG_HAVE_ZLIB
@@ -110,36 +110,21 @@ void set_mtime(const std::string &p, int64_t sec) {
     ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
 }
 
-// Decompresses a .gz file (zlib if the library was built with it, else gzip -dc).
-// *ok = false if it is not a valid gzip stream.
-std::string gunzip(const std::string &path, bool *ok) {
-    std::string out;
-    *ok = false;
 #ifdef TBLOG_HAVE_ZLIB
+// Decompresses a .gz file; expects a valid gzip stream.
+std::string gunzip(const std::string &path) {
+    std::string out;
     gzFile g = ::gzopen(path.c_str(), "rb");
+    EXPECT_TRUE(g != nullptr);
     if (!g) return out;
     char buf[65536];
     int n;
     while ((n = ::gzread(g, buf, sizeof buf)) > 0) out.append(buf, (size_t)n);
-    *ok = n == 0 && ::gzclose(g) == Z_OK;
-#else
-    FILE *p = ::popen(("gzip -dc '" + path + "' 2>/dev/null").c_str(), "r");
-    if (!p) return out;
-    char buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-    int st = ::pclose(p);
-    *ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
-#endif
+    EXPECT_TRUE(n == 0);
+    EXPECT_TRUE(::gzclose(g) == Z_OK);
     return out;
 }
-
-std::string gunzip(const std::string &path) {
-    bool ok;
-    std::string s = gunzip(path, &ok);
-    EXPECT_TRUE(ok);
-    return s;
-}
+#endif
 
 // Fixed-size 100-byte line (for exact size-rotation arithmetic).
 std::string fixed_line(int i) {
@@ -173,13 +158,6 @@ std::vector<std::string> split_lines(const std::string &data) {
             b = i + 1;
         }
     if (b < data.size()) out.push_back(data.substr(b));  // incomplete tail
-    return out;
-}
-
-std::string strip_blank_lines(const std::string &data) {
-    std::string out;
-    for (auto &l : split_lines(data))
-        if (!l.empty()) out += l + "\n";
     return out;
 }
 
@@ -267,11 +245,11 @@ struct Writers {
 };
 
 // Checks every rotated/live file in `d`: each line once, whole, and the day
-// of the file it landed in vs the day the writer saw. `v1` (double buffer):
-// never in an earlier day's file (the worker reads the clock after taking the
-// data). v2: never more than one period off either way (the seal point decides).
-// Per thread, files are non-decreasing in time. Returns the number of days seen.
-int check_rollover(const std::string &d, const std::vector<int> &count, int last_day, bool v1,
+// of the file it landed in vs the day the writer saw: never in an earlier
+// day's file (the worker reads the clock after taking the data), at most one
+// day later. Per thread, files are non-decreasing in time. Returns the number
+// of days seen.
+int check_rollover(const std::string &d, const std::vector<int> &count, int last_day,
                    bool exact) {
     const int T = (int)count.size();
     std::vector<std::vector<int>> seen((size_t)T);
@@ -309,15 +287,12 @@ int check_rollover(const std::string &d, const std::vector<int> &count, int last
         EXPECT_TRUE(data.find('\0') == std::string::npos);
         EXPECT_TRUE(data.empty() || data.back() == '\n');
         for (auto &l : split_lines(data)) {
-            if (l.empty()) continue;  // v2 region padding
             int t, s, p;
             if (!parse_line(l, &t, &s, &p) || t < 0 || t >= T) { ++bad; continue; }
             if (s >= count[(size_t)t]) { ++extra; continue; }
             if (seen[(size_t)t][(size_t)s] >= 0) ++dup;
             seen[(size_t)t][(size_t)s] = of.first;
-            if (exact ? of.first != p : (v1 ? (of.first < p || of.first > p + 1)
-                                            : (of.first < p - 1 || of.first > p + 1)))
-                ++off;
+            if (exact ? of.first != p : (of.first < p || of.first > p + 1)) ++off;
             if (of.first < last_file_day[(size_t)t] || s < last_s[(size_t)t]) ++order;
             last_file_day[(size_t)t] = of.first;
             last_s[(size_t)t] = s;
@@ -371,7 +346,7 @@ TEST(archiver_names_and_periods) {
     EXPECT_EQ(a.next_boundary(t), INT64_MAX);
 }
 
-// ------------------------------------------------------------ RotatingFile (v1 storage)
+// ------------------------------------------------------------ RotatingFile
 TEST(rotating_daily_basic) {
     std::string d = fresh_dir("daily_basic");
     g_now = kBase + 10 * 3600;
@@ -461,6 +436,7 @@ TEST(rotating_restart_rotates_stale_live_file) {
     r3.close();
 }
 
+#ifdef TBLOG_HAVE_ZLIB
 TEST(rotating_retention_counts_compressed) {
     std::string d = fresh_dir("retention");
     // Older rotated files from a previous run: one compressed, one not, plus
@@ -573,14 +549,40 @@ TEST(compress_crash_recovery) {
     EXPECT_TRUE(gunzip(d + "/app.2030-01-01.log.gz") == x);
     EXPECT_TRUE(gunzip(d + "/app.2030-01-02.log.gz") == y);
 }
+#else
+// Without zlib, file.compress = gzip warns once and behaves as none.
+TEST(compress_without_zlib_is_disabled) {
+    std::string d = fresh_dir("gz_off");
+    g_now = kBase + 1;
+    RotatingFile rf;
+    std::fprintf(stderr, "(expected 'built without zlib' warning follows)\n");
+    ASSERT_TRUE(rf.open(file_opts(d, RotateMode::Daily, CompressMode::Gzip)));
+    std::string a = fixed_line(1);
+    rf.write_all(a.data(), a.size());
+    g_now = kBase + kDay;
+    rf.check_time();
+    std::string b = fixed_line(2);
+    rf.write_all(b.data(), b.size());
+    rf.close();
+    std::vector<std::string> expect = {"app.2030-01-01.log", "app.log"};
+    EXPECT_TRUE(list_dir(d) == expect);
+    EXPECT_FALSE(exists(d + "/app.2030-01-01.log.gz"));
+    EXPECT_EQ(read_file(d + "/app.2030-01-01.log"), a);
+    EXPECT_EQ(read_file(d + "/app.log"), b);
+}
+#endif
 
-TEST(sync_backend_time_rotation) {
-    std::string d = fresh_dir("sync");
+// ------------------------------------------------------------ double buffer backend
+TEST(dbuf_time_rotation) {
+    std::string d = fresh_dir("dbuf_time");
     g_now = kBase + 100;
-    auto b = make_sync_file_backend(file_opts(d, RotateMode::Daily, CompressMode::None));
+    BufferOptions o;
+    o.file = file_opts(d, RotateMode::Daily, CompressMode::None);
+    auto b = make_double_buffer_backend(o);
     ASSERT_TRUE(b != nullptr);
     std::string a = make_line(0, 0, 0), c = make_line(0, 1, 1);
     b->append(a.data(), (uint32_t)a.size(), TBLOG_LV_INFO);
+    b->flush();  // written during day 0
     g_now = kBase + kDay + 1;
     b->flush();  // the worker notices the new day
     b->append(c.data(), (uint32_t)c.size(), TBLOG_LV_INFO);
@@ -589,7 +591,6 @@ TEST(sync_backend_time_rotation) {
     EXPECT_EQ(read_file(d + "/app.log"), c);
 }
 
-// ------------------------------------------------------------ v1 double buffer
 namespace {
 std::unique_ptr<Backend> make_v1(const std::string &d, CompressMode cm, uint64_t max_size) {
     BufferOptions o;
@@ -599,18 +600,10 @@ std::unique_ptr<Backend> make_v1(const std::string &d, CompressMode cm, uint64_t
     return make_double_buffer_backend(o);
 }
 
-std::unique_ptr<Backend> make_v2(const std::string &d, CompressMode cm, uint64_t max_size) {
-    MmapOptions o;
-    o.file = file_opts(d, RotateMode::Daily, cm, max_size);
-    o.region_size = 16u << 10;
-    o.policy = FullPolicy::Block;
-    return make_mmap_file_backend(o);
-}
-
 // Quiesced phases: lines of day k are all appended (by T threads) and taken
 // by the worker before the clock moves to day k + 1, so every file must hold
 // exactly its own day's lines.
-void run_exact(Backend *b, const std::string &d, int days, bool v1, int S = 1500 / kScale) {
+void run_exact(Backend *b, const std::string &d, int days, int S = 1500 / kScale) {
     const int T = 4;
     std::vector<int> count((size_t)T, 0);
     {
@@ -629,18 +622,18 @@ void run_exact(Backend *b, const std::string &d, int days, bool v1, int S = 1500
                 });
             for (auto &th : ths) th.join();
             s0 += S;
-            w.wait_cycles(2);  // the worker took (v1) / committed (v2) everything
+            w.wait_cycles(2);  // the worker took everything
         }
         w.halt();
         for (auto &c : count) c = s0;
     }
     b->shutdown();
     EXPECT_EQ(b->dropped(), 0ull);
-    EXPECT_EQ(check_rollover(d, count, days - 1, v1, true), days);
+    EXPECT_EQ(check_rollover(d, count, days - 1, true), days);
 }
 
 // Writers run continuously while the day changes several times.
-void run_concurrent(Backend *b, const std::string &d, bool v1) {
+void run_concurrent(Backend *b, const std::string &d) {
     const int T = 4, days = 4;
     {
         Worker w(b);
@@ -659,7 +652,7 @@ void run_concurrent(Backend *b, const std::string &d, bool v1) {
         int total = 0;
         for (int c : writers.count) total += c;
         std::printf("  %d lines over %d days\n", total, days);
-        EXPECT_EQ(check_rollover(d, writers.count, days - 1, v1, false), days);
+        EXPECT_EQ(check_rollover(d, writers.count, days - 1, false), days);
     }
 }
 }  // namespace
@@ -669,7 +662,7 @@ TEST(v1_rollover_exact) {
     g_now = kBase;
     auto b = make_v1(d, CompressMode::None, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
-    run_exact(b.get(), d, 3, true);
+    run_exact(b.get(), d, 3);
 }
 
 TEST(v1_rollover_concurrent) {
@@ -677,35 +670,17 @@ TEST(v1_rollover_concurrent) {
     g_now = kBase;
     auto b = make_v1(d, CompressMode::None, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
-    run_concurrent(b.get(), d, true);
+    run_concurrent(b.get(), d);
 }
 
-// ------------------------------------------------------------ v2 mmap
-TEST(v2_rollover_exact) {
-    std::string d = fresh_dir("v2_exact");
+// max_size (64 KB) caps files inside a day: app.<day>.log, app.<day>.1.log,
+// ... with only that day's lines.
+TEST(v1_size_and_time_naming) {
+    std::string d = fresh_dir("v1_size_time");
     g_now = kBase;
-    auto b = make_v2(d, CompressMode::None, 1ull << 30);
+    auto b = make_v1(d, CompressMode::None, 64u << 10);
     ASSERT_TRUE(b != nullptr);
-    run_exact(b.get(), d, 3, false);
-    EXPECT_FALSE(exists(d + "/app.log.next"));
-}
-
-TEST(v2_rollover_concurrent) {
-    std::string d = fresh_dir("v2_conc");
-    g_now = kBase;
-    auto b = make_v2(d, CompressMode::None, 1ull << 30);
-    ASSERT_TRUE(b != nullptr);
-    run_concurrent(b.get(), d, false);
-}
-
-// max_size (64 KB = 4 regions) caps files inside a day: app.<day>.log,
-// app.<day>.1.log, ... with only that day's lines.
-TEST(v2_size_and_time_naming) {
-    std::string d = fresh_dir("v2_size_time");
-    g_now = kBase;
-    auto b = make_v2(d, CompressMode::None, 64u << 10);
-    ASSERT_TRUE(b != nullptr);
-    run_exact(b.get(), d, 2, false, 1500);  // ~270 KB a day
+    run_exact(b.get(), d, 2, 1500);  // ~270 KB a day
     auto files = list_dir(d);
     for (auto &f : files) std::printf("  %s\n", f.c_str());
     EXPECT_TRUE(std::find(files.begin(), files.end(), "app.2030-01-01.log") != files.end());
@@ -717,6 +692,7 @@ TEST(v2_size_and_time_naming) {
     }
 }
 
+#ifdef TBLOG_HAVE_ZLIB
 TEST(v1_size_and_time_compressed) {
     std::string d = fresh_dir("v1_size_time_gz");
     g_now = kBase;
@@ -761,10 +737,10 @@ TEST(v1_size_and_time_compressed) {
     EXPECT_TRUE(std::find(files.begin(), files.end(), "app.2030-01-01.1.log.gz") != files.end());
 }
 
-TEST(v2_compress_roundtrip) {
-    std::string d = fresh_dir("v2_gz");
+TEST(v1_compress_roundtrip) {
+    std::string d = fresh_dir("v1_gz");
     g_now = kBase + 77;
-    auto b = make_v2(d, CompressMode::Gzip, 1ull << 30);
+    auto b = make_v1(d, CompressMode::Gzip, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     std::string day0, day1;
     {
@@ -787,19 +763,16 @@ TEST(v2_compress_roundtrip) {
     b->shutdown();
     std::vector<std::string> expect = {"app.2030-01-01.log.gz", "app.log"};
     EXPECT_TRUE(list_dir(d) == expect);
-    // Region switches pad with '\n' (blank lines); the content is otherwise exact.
-    std::string out = gunzip(d + "/app.2030-01-01.log.gz");
-    EXPECT_TRUE(out.find('\0') == std::string::npos);
-    EXPECT_TRUE(strip_blank_lines(out) == day0);
-    EXPECT_TRUE(strip_blank_lines(read_file(d + "/app.log")) == day1);
+    EXPECT_TRUE(gunzip(d + "/app.2030-01-01.log.gz") == day0);
+    EXPECT_TRUE(read_file(d + "/app.log") == day1);
 }
 
-TEST(v2_restart_rotates_stale_live_file) {
-    std::string d = fresh_dir("v2_restart");
+TEST(v1_restart_rotates_stale_live_file) {
+    std::string d = fresh_dir("v1_restart");
     write_file(d + "/app.log", fixed_line(1));
     set_mtime(d + "/app.log", kBase - kDay + 5);  // 2029-12-31
     g_now = kBase + 50;
-    auto b = make_v2(d, CompressMode::Gzip, 1ull << 30);
+    auto b = make_v1(d, CompressMode::Gzip, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     std::string l = fixed_line(2);
     b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
@@ -809,5 +782,6 @@ TEST(v2_restart_rotates_stale_live_file) {
     EXPECT_TRUE(gunzip(d + "/app.2029-12-31.log.gz") == fixed_line(1));
     EXPECT_EQ(read_file(d + "/app.log"), l);
 }
+#endif
 
 TINY_TEST_MAIN()

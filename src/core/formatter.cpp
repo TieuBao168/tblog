@@ -172,64 +172,24 @@ Formatter::Formatter(const std::string &pattern) : impl_(new Impl) {
 
 Formatter::~Formatter() { delete impl_; }
 
-namespace {
-
-// Async-signal-safe local date/time from a fixed UTC offset (civil-from-days,
-// proleptic Gregorian). Used by the crash path instead of localtime_r.
-void civil_time(int64_t sec, long utc_offset_s, TimeCache &tc) {
-    int64_t t = sec + utc_offset_s;
-    int64_t days = t >= 0 ? t / 86400 : -((-t + 86399) / 86400);
-    int64_t rem = t - days * 86400;
-    days += 719468;
-    const int64_t era = (days >= 0 ? days : days - 146096) / 146097;
-    const int64_t doe = days - era * 146097;
-    const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = yoe + era * 400;
-    const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const int64_t mp = (5 * doy + 2) / 153;
-    const int d = (int)(doy - (153 * mp + 2) / 5 + 1);
-    const int m = (int)(mp < 10 ? mp + 3 : mp - 9);
-    if (m <= 2) ++y;
-    if (y < 0) y = 0;
-    if (y > 9999) y = 9999;
-    tc.date[0] = (char)('0' + y / 1000);
-    tc.date[1] = (char)('0' + y / 100 % 10);
-    tc.date[2] = (char)('0' + y / 10 % 10);
-    tc.date[3] = (char)('0' + y % 10);
-    tc.date[4] = '-';
-    put2(tc.date + 5, m);
-    tc.date[7] = '-';
-    put2(tc.date + 8, d);
-    put2(tc.time, (int)(rem / 3600));
-    tc.time[2] = ':';
-    put2(tc.time + 3, (int)(rem / 60 % 60));
-    tc.time[5] = ':';
-    put2(tc.time + 6, (int)(rem % 60));
-    tc.sec = sec;
-}
-
-// Walks the compiled ops. `msg(dst, avail)` writes the message like
-// vsnprintf (returns its full length, < 0 drops it); `tm(ts)` returns the
-// date/time strings of the record's second.
-template <class MsgFn, class TimeFn>
-size_t run_ops(const std::string &lits, const std::vector<Op> &ops, char *out, size_t cap,
-               const Record &rec, MsgFn msg, TimeFn tm) {
+size_t Formatter::format(char *out, size_t cap, const Record &rec, const char *fmt,
+                         va_list ap) const {
     if (cap == 0) return 0;
     if (cap < 5) {  // contract says cap >= 64; stay safe anyway
         out[0] = '\n';
         return 1;
     }
     Out o{out, 0, cap - 1, false};
-    const char *text = lits.data();
+    const char *text = impl_->text.data();
     char num[24];
     char *const num_end = num + sizeof num;
 
-    for (const Op &op : ops) {
+    for (const Op &op : impl_->ops) {
         if (o.trunc) break;
         switch (op.kind) {
             case OpKind::Literal: o.put(text + op.off, op.len); break;
-            case OpKind::Date: o.put(tm(rec.ts_ns).date, 10); break;
-            case OpKind::Time: o.put(tm(rec.ts_ns).time, 8); break;
+            case OpKind::Date: o.put(time_cache(rec.ts_ns).date, 10); break;
+            case OpKind::Time: o.put(time_cache(rec.ts_ns).time, 8); break;
             case OpKind::Micros:
                 put_fixed(num, (uint32_t)(rec.ts_ns % 1000000000ull / 1000u), 6);
                 o.put(num, 6);
@@ -259,9 +219,13 @@ size_t run_ops(const std::string &lits, const std::vector<Op> &ops, char *out, s
             }
             case OpKind::Func: o.puts(rec.func ? rec.func : "?"); break;
             case OpKind::Message: {
-                // The message may use the reserved '\n' byte for its NUL.
+                if (!fmt) break;
+                // vsnprintf may use the reserved '\n' byte for its NUL.
                 size_t avail = cap - o.pos;
-                int n = msg(out + o.pos, avail);
+                va_list cp;
+                va_copy(cp, ap);
+                int n = std::vsnprintf(out + o.pos, avail, fmt, cp);
+                va_end(cp);
                 if (n < 0) break;  // encoding error: drop message
                 if ((size_t)n >= avail) {
                     o.pos = o.lim;
@@ -281,47 +245,6 @@ size_t run_ops(const std::string &lits, const std::vector<Op> &ops, char *out, s
     }
     out[o.pos++] = '\n';
     return o.pos;
-}
-
-}  // namespace
-
-size_t Formatter::format(char *out, size_t cap, const Record &rec, const char *fmt,
-                         va_list ap) const {
-    return run_ops(
-        impl_->text, impl_->ops, out, cap, rec,
-        [&](char *dst, size_t avail) -> int {
-            if (!fmt) return 0;
-            va_list cp;
-            va_copy(cp, ap);
-            int n = std::vsnprintf(dst, avail, fmt, cp);
-            va_end(cp);
-            return n;
-        },
-        [](uint64_t ts) -> const TimeCache & { return time_cache(ts); });
-}
-
-size_t Formatter::format_message(char *out, size_t cap, const Record &rec, const char *msg,
-                                 size_t len, const long *utc_offset_s) const noexcept {
-    auto put_msg = [&](char *dst, size_t avail) -> int {
-        if (len > 0x7fffffffu) return -1;  // vsnprintf would fail (EOVERFLOW)
-        // Mirror vsnprintf: at most avail - 1 bytes, then a NUL.
-        size_t n = len < avail ? len : avail - 1;
-        std::memcpy(dst, msg, n);
-        dst[n] = '\0';
-        return (int)len;
-    };
-    if (utc_offset_s) {
-        const long off = *utc_offset_s;
-        TimeCache local;
-        return run_ops(impl_->text, impl_->ops, out, cap, rec, put_msg,
-                       [&](uint64_t ts) -> const TimeCache & {
-                           int64_t sec = (int64_t)(ts / 1000000000ull);
-                           if (local.sec != sec) civil_time(sec, off, local);
-                           return local;
-                       });
-    }
-    return run_ops(impl_->text, impl_->ops, out, cap, rec, put_msg,
-                   [](uint64_t ts) -> const TimeCache & { return time_cache(ts); });
 }
 
 }  // namespace tblog

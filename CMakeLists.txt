@@ -27,7 +27,7 @@ include(GNUInstallDirs)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-# zlib for file.compress=gzip; without it the library spawns `gzip -n`.
+# zlib for file.compress=gzip; without it compression is disabled (with a warning).
 option(TBLOG_WITH_ZLIB "Use zlib for gzip compression of rotated files" ON)
 set(TBLOG_HAVE_ZLIB OFF)
 if(TBLOG_WITH_ZLIB)
@@ -111,6 +111,11 @@ if(TBLOG_BUILD_TESTS)
     target_include_directories(${name} PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_compile_options(${name} PRIVATE ${TBLOG_WARNINGS})
+    if(TBLOG_HAVE_ZLIB)
+      # Compression tests (and their zlib-based gunzip) need it, like the Makefile.
+      target_compile_definitions(${name} PRIVATE TBLOG_HAVE_ZLIB=1)
+      target_link_libraries(${name} PRIVATE ZLIB::ZLIB)
+    endif()
     set_target_properties(${name} PROPERTIES
       CXX_STANDARD ${TBLOG_CXX_STANDARD}
       CXX_STANDARD_REQUIRED ON

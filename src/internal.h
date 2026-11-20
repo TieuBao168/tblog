@@ -4,7 +4,6 @@
 
 #include "tblog/log.h"
 
-#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstddef>
@@ -113,13 +112,6 @@ public:
     size_t format(char *out, size_t cap, const Record &rec,
                   const char *fmt, va_list ap) const;
 
-    // Same line as format() when the message expands to `len` bytes, of which
-    // msg holds at least min(len, cap). If utc_offset_s is non-null the date
-    // and time are computed from it (no localtime_r, no thread_local): the
-    // call is then async-signal-safe. Used by deferred formatting.
-    size_t format_message(char *out, size_t cap, const Record &rec, const char *msg,
-                          size_t len, const long *utc_offset_s = nullptr) const noexcept;
-
 private:
     struct Impl;
     Impl *impl_;
@@ -168,19 +160,16 @@ public:
     virtual ~Backend() = default;
 
     // ---- caller threads (hot path). Thread-safe. No syscalls in the common
-    // case (except the sync backend). Returns false if the line was dropped.
+    // case. Returns false if the line was dropped.
     // `data` is one complete line ending in '\n'.
     virtual bool append(const char *data, uint32_t len, tblog_level lv) noexcept = 0;
-    // Deferred formatting: `data` is a binary record from deferred_encode().
-    // Only backends built with a deferred formatter accept it.
-    virtual bool append_record(const char *, uint32_t, tblog_level) noexcept { return false; }
 
     // ---- worker thread only
     // Block until append() signalled work (buffer half full / urgent) or timeout.
     virtual void wait_for_work(std::chrono::milliseconds timeout) = 0;
-    // Move pending data towards the kernel (write(), prepare next mmap region...).
+    // Move pending data towards the kernel (write()).
     virtual void flush() = 0;
-    // fdatasync / msync.
+    // fdatasync.
     virtual void sync() = 0;
     // True once since the last call if an urgent (>= urgent_level) line arrived.
     virtual bool consume_urgent() noexcept = 0;
@@ -204,45 +193,25 @@ public:
     virtual uint64_t dropped() const noexcept = 0;
 };
 
-// Baseline: write() under a mutex on every append. src/backend/sync_file.cpp
-std::unique_ptr<Backend> make_sync_file_backend(const FileOptions &opt);
-
-// v1. src/backend/double_buffer.cpp
+// Sharded double buffers. src/backend/double_buffer.cpp
+// make_double_buffer_backend() returns nullptr (and prints to stderr) if the
+// file cannot be opened.
 struct BufferOptions {
     FileOptions file;
     size_t buffer_size = 4u << 20;  // per buffer (A and B)
     FullPolicy policy = FullPolicy::Drop;
-    // Non-null: format.mode = deferred. Buffers hold framed entries (text
-    // lines and binary records); the worker renders records with *formatter.
-    const std::atomic<const Formatter *> *formatter = nullptr;
 };
 std::unique_ptr<Backend> make_double_buffer_backend(const BufferOptions &opt);
-
-// v2. src/backend/mmap_file.cpp
-struct MmapOptions {
-    FileOptions file;
-    size_t region_size = 16u << 20;  // multiple of page size
-    FullPolicy policy = FullPolicy::Drop;
-};
-std::unique_ptr<Backend> make_mmap_file_backend(const MmapOptions &opt);
-
-// All factories return nullptr (and print to stderr) if the file cannot be opened.
 
 // ============================================================================
 // Config — src/config/config_parser.cpp, src/config/config_watcher.cpp
 // ============================================================================
-enum class BackendKind { Sync, Buffer, Mmap };
-enum class FormatMode { Eager, Deferred };
-
 struct Config {
     tblog_level level = TBLOG_LV_INFO;
     std::string pattern = "%D %T.%us [%L] [%t] %f:%l - %m";
-    BackendKind backend = BackendKind::Buffer;
     FileOptions file;
     size_t buffer_size = 4u << 20;
-    size_t mmap_region_size = 16u << 20;
     FullPolicy full_policy = FullPolicy::Drop;
-    FormatMode format_mode = FormatMode::Eager;  // deferred: buffer backend only
     uint32_t flush_interval_ms = 200;
     uint32_t sync_interval_ms = 1000;
     bool console = false;
@@ -252,15 +221,16 @@ struct Config {
     bool reload_watch = true;
 };
 
-// Keys: level, pattern, backend (sync|buffer|mmap), file.path, file.max_size,
-// file.max_files, file.rotate (size|daily|hourly), file.compress (none|gzip),
-// buffer.size, mmap.region_size, full_policy (drop|block),
-// format.mode (eager|deferred),
+// Keys: level, pattern, file.path, file.max_size, file.max_files,
+// file.rotate (size|daily|hourly), file.compress (none|gzip; gzip needs a
+// zlib build), buffer.size, full_policy (drop|block),
 // flush.interval_ms, sync.interval_ms, sync.on_level, console, console.color,
 // syslog, module.<name>, reload.watch.
 // Sizes accept B/KB/MB/GB suffixes. Bools: true/false/1/0/yes/no/on/off.
 // '#' starts a comment (outside the value of `pattern`, see parser docs).
 // Unknown key / bad value -> a warning string, field keeps its previous value.
+// Removed keys (backend, mmap.region_size, format.mode) -> "<key>: option
+// removed, ignored" warning.
 bool parse_config_string(const std::string &text, Config &out,
                          std::vector<std::string> *warnings);
 // false if the file cannot be read (out untouched).
@@ -279,32 +249,6 @@ private:
     int64_t size_ = -1;
     uint64_t ino_ = 0;
 };
-
-// ============================================================================
-// Deferred formatting — src/core/deferred.cpp (format.mode = deferred, v1).
-// The caller encodes a binary record (header + raw printf arguments, %s copied
-// by value) instead of formatting; the worker renders it into the same text.
-// ============================================================================
-constexpr size_t kRecordMax = 4096;  // max encoded record (else eager fallback)
-
-// Caller side. Returns the record size, or 0 if this call must be formatted
-// eagerly (fmt is not site->fmt, unsupported conversion, too large...).
-// Consumes ap. Allocates once per call site (the cached argument plan).
-size_t deferred_encode(char *out, size_t cap, uint64_t ts_ns, uint32_t tid, tblog_level lv,
-                       const tblog_module *m, tblog_site *site, const char *fmt,
-                       va_list ap) noexcept;
-// Worker side. out must hold kScratchSize bytes. Output is byte-identical to
-// Formatter::format() of the original call. Returns bytes written.
-size_t deferred_render(char *out, const Formatter &f, const char *rec, size_t len);
-// Signal handler side: async-signal-safe (no malloc/locks/stdio/locale).
-// Exact for integer, char and string conversions; %p and floating point are
-// approximate; date/time uses the UTC offset last noted below.
-size_t deferred_render_crash(char *out, const Formatter &f, const char *rec,
-                             size_t len) noexcept;
-// Remember the local UTC offset for the crash renderer (normal context only).
-void deferred_note_utc_offset(uint64_t ts_ns);
-// Tests: drop the plan cached in a site (sites are normally static).
-void deferred_site_reset(tblog_site *site);
 
 // ============================================================================
 // Crash handling — src/crash/crash_handler.cpp

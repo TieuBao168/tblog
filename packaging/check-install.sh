@@ -86,7 +86,7 @@ say "pkg-config --static --cflags --libs tblog: $(pc --static --cflags --libs tb
 
 conf=$work/test.conf
 run_example() {  # $1 = binary, $2 = log file; extra env is passed by caller
-    printf 'backend = buffer\nfile.path = %s\nreload.watch = false\n' "$2" > "$conf"
+    printf 'file.path = %s\nreload.watch = false\n' "$2" > "$conf"
     (cd "$work" && $RUNNER "$1" "$conf") || fail "$1 exited with $?"
     grep -q 'started, pid-independent message hello' "$2" || fail "$2 lacks the expected line"
     n=$(grep -c 'worker . step' "$2")

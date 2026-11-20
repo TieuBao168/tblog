@@ -1,28 +1,14 @@
 // Console sink: stderr, optional per-line ANSI colouring by level token.
-#include "internal.h"
+#include "sinks/sink.h"
 
-#include <cerrno>
 #include <cstring>
-#include <unistd.h>
 
 namespace tblog {
 
-// Test hook (not in internal.h): write `data` to fd exactly as the console
-// sink would, colourised when `color` is true (no isatty check here).
-void console_write_fd(int fd, const char *data, size_t len, bool color);
-
 namespace {
 
-void write_all(int fd, const char *p, size_t n) {
-    while (n > 0) {
-        ssize_t w = ::write(fd, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return;  // nothing sensible to do for stderr errors
-        }
-        p += w;
-        n -= static_cast<size_t>(w);
-    }
+void write_all(pf::FileHandle h, const char *p, size_t n) {
+    pf::file_write_all(h, p, n);  // nothing sensible to do for stderr errors
 }
 
 // Returns the ANSI prefix for the first "[LEVEL]" token in the line, or
@@ -49,13 +35,13 @@ const char *color_for_line(const char *p, size_t n, bool *found) {
 
 class OutBuf {
 public:
-    explicit OutBuf(int fd) : fd_(fd) {}
+    explicit OutBuf(pf::FileHandle h) : h_(h) {}
     ~OutBuf() { flush(); }
     void put(const char *p, size_t n) {
         if (n > sizeof(buf_) - len_) {
             flush();
             if (n > sizeof(buf_)) {  // huge piece: bypass buffer
-                write_all(fd_, p, n);
+                write_all(h_, p, n);
                 return;
             }
         }
@@ -63,12 +49,12 @@ public:
         len_ += n;
     }
     void flush() {
-        if (len_) write_all(fd_, buf_, len_);
+        if (len_) write_all(h_, buf_, len_);
         len_ = 0;
     }
 
 private:
-    int fd_;
+    pf::FileHandle h_;
     size_t len_ = 0;
     char buf_[8192];
 };
@@ -77,9 +63,10 @@ constexpr char kReset[] = "\033[0m";
 
 class ConsoleSink final : public Sink {
 public:
-    explicit ConsoleSink(bool color) : color_(color && ::isatty(STDERR_FILENO) == 1) {}
+    explicit ConsoleSink(bool color)
+        : color_(color && pf::stderr_is_terminal() && pf::enable_ansi_colors()) {}
     void write(const char *data, size_t len) override {
-        console_write_fd(STDERR_FILENO, data, len, color_);
+        console_write_to(pf::stderr_handle(), data, len, color_);
     }
 
 private:
@@ -88,13 +75,13 @@ private:
 
 }  // namespace
 
-void console_write_fd(int fd, const char *data, size_t len, bool color) {
+void console_write_to(pf::FileHandle h, const char *data, size_t len, bool color) {
     if (!data || len == 0) return;
     if (!color) {
-        write_all(fd, data, len);
+        write_all(h, data, len);
         return;
     }
-    OutBuf out(fd);
+    OutBuf out(h);
     const char *p = data;
     const char *end = data + len;
     while (p < end) {

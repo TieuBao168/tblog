@@ -1,12 +1,13 @@
 // RotatingFile — append-only log file with size- and time-based rotation.
 // Internal to the backends (not thread-safe: callers serialise
-// write_all/rotate/check_time/open/close; fd() and raw_write_all() may be used
-// concurrently, e.g. from a signal handler). Naming, retention and gzip of the
+// write_all/rotate/check_time/open/close; handle() may be used concurrently,
+// e.g. from a signal handler, with pf::file_write_crash()). Naming, retention and gzip of the
 // rotated files live in Archiver (archiver.h).
 #pragma once
 
 #include "backend/archiver.h"
-#include "internal.h"
+#include "backend/backend.h"
+#include "platform/platform.h"
 
 #include <atomic>
 #include <chrono>
@@ -23,7 +24,7 @@ public:
     RotatingFile(const RotatingFile &) = delete;
     RotatingFile &operator=(const RotatingFile &) = delete;
 
-    // mkdir -p the parent directory and open (O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC).
+    // mkdir -p the parent directory and open for append (pf::OpenMode::Append).
     // Prints a message to stderr and returns false on failure.
     bool open(const FileOptions &opt);
 
@@ -41,11 +42,12 @@ public:
     // the data to write (so a line never lands in a file of an earlier period
     // than the one in effect when it was appended). Cheap: one clock read.
     void check_time() noexcept;
-    void datasync() noexcept;   // fdatasync
+    void datasync() noexcept;   // pf::file_datasync
     void close() noexcept;
 
-    // Current fd, or -1. Safe to read from a signal handler.
-    int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
+    // Current handle (invalid when closed). Safe to read from a signal handler.
+    pf::FileHandle handle() const noexcept { return fd_.load(std::memory_order_acquire); }
+    bool is_open() const noexcept { return handle().valid(); }
     uint64_t size() const noexcept { return size_; }
     uint64_t lost_bytes() const noexcept { return lost_.load(std::memory_order_relaxed); }
     const std::string &path() const noexcept { return opt_.path; }
@@ -53,11 +55,8 @@ public:
     // Name of rotated file `index` (0 = path itself): "dir/app.log", "dir/app.1.log".
     std::string rotated_name(int index) const;
 
-    // Async-signal-safe: write() loop with EINTR handling. Returns false on error.
-    static bool raw_write_all(int fd, const char *data, size_t len) noexcept;
-
 private:
-    bool open_fd() noexcept;            // (re)open opt_.path, update size_
+    bool open_fd() noexcept;            // (re)open opt_.path, update size_ (errno on failure)
     void check_reopen() noexcept;       // at most once/second: deleted or renamed?
     void write_chunk(const char *data, size_t len) noexcept;
     void report_loss(size_t n, int err) noexcept;
@@ -68,7 +67,7 @@ private:
     Archiver arch_;
     int64_t period_ = 0;                 // any time inside the current file's period
     int64_t next_boundary_ = INT64_MAX;  // rotate when now >= this (time modes)
-    std::atomic<int> fd_{-1};
+    std::atomic<pf::FileHandle> fd_{pf::no_file()};
     uint64_t size_ = 0;
     std::atomic<uint64_t> lost_{0};
     std::chrono::steady_clock::time_point last_check_{};

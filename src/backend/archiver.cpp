@@ -5,14 +5,11 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
-
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include <memory>
+#include <new>
 
 #ifdef TBLOG_HAVE_ZLIB
 #include <zlib.h>
@@ -22,10 +19,7 @@ namespace tblog {
 
 namespace {
 
-bool exists(const std::string &p) {
-    struct stat st;
-    return ::lstat(p.c_str(), &st) == 0;
-}
+bool exists(const std::string &p) { return pf::path_exists(p); }
 
 bool ends_with(const std::string &s, const std::string &suf) {
     return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
@@ -58,13 +52,6 @@ std::string pad(unsigned long v, int width) {
     return b;
 }
 
-void fsync_dir(const std::string &dir) {
-    int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd < 0) return;
-    ::fsync(fd);
-    ::close(fd);
-}
-
 }  // namespace
 
 Archiver::~Archiver() { finish(std::chrono::milliseconds(0)); }
@@ -75,14 +62,12 @@ void Archiver::configure(const FileOptions &opt) {
     rotate_ = opt.rotate;
     compress_ = opt.compress;
 #ifndef TBLOG_HAVE_ZLIB
-    if (compress_ != CompressMode::None) {
-        std::fprintf(stderr, "tblog: built without zlib, file.compress = gzip disabled\n");
-        compress_ = CompressMode::None;
-    }
+    compress_ = CompressMode::None;  // validate_config() already warned
 #endif
     now_fn_ = opt.now_fn;
-    size_t slash = path_.rfind('/');
+    size_t slash = pf::last_path_separator(path_);
     size_t base = slash == std::string::npos ? 0 : slash + 1;
+    sep_ = slash == std::string::npos ? '/' : path_[slash];
     dir_ = slash == std::string::npos ? "." : (slash == 0 ? "/" : path_.substr(0, slash));
     size_t dot = path_.rfind('.');
     // No extension (or a leading-dot hidden file): suffixes go at the end.
@@ -102,15 +87,13 @@ void Archiver::configure(const FileOptions &opt) {
 // ------------------------------------------------------------------ clock
 int64_t Archiver::now() const noexcept {
     if (now_fn_) return now_fn_();
-    struct timespec ts;
-    ::clock_gettime(CLOCK_REALTIME, &ts);
-    return static_cast<int64_t>(ts.tv_sec);
+    return static_cast<int64_t>(pf::realtime_ns() / 1000000000ull);
 }
 
 int64_t Archiver::period_start(int64_t t) const noexcept {
     time_t tt = static_cast<time_t>(t);
-    struct tm lt;
-    if (!::localtime_r(&tt, &lt)) return t;
+    std::tm lt;
+    if (!pf::local_time(t, &lt)) return t;
     const int64_t into_hour = lt.tm_min * 60 + lt.tm_sec;
     if (rotate_ == RotateMode::Hourly) return t - into_hour;
     struct tm d;
@@ -131,10 +114,9 @@ int64_t Archiver::next_boundary(int64_t t) const noexcept {
     if (rotate_ == RotateMode::Hourly) {
         nb = ps + 3600;
     } else {
-        time_t tt = static_cast<time_t>(ps);
-        struct tm lt;
+        std::tm lt;
         nb = ps + 86400;
-        if (::localtime_r(&tt, &lt)) {
+        if (pf::local_time(ps, &lt)) {
             struct tm d;
             std::memset(&d, 0, sizeof d);
             d.tm_year = lt.tm_year;
@@ -149,10 +131,9 @@ int64_t Archiver::next_boundary(int64_t t) const noexcept {
 }
 
 std::string Archiver::period_label(int64_t t) const {
-    time_t tt = static_cast<time_t>(t);
-    struct tm lt;
+    std::tm lt;
     char buf[32];
-    if (!::localtime_r(&tt, &lt)) return "0000-00-00";
+    if (!pf::local_time(t, &lt)) return "0000-00-00";
     std::strftime(buf, sizeof buf, rotate_ == RotateMode::Hourly ? "%Y-%m-%dT%H" : "%Y-%m-%d",
                   &lt);
     return buf;
@@ -172,11 +153,10 @@ std::string Archiver::time_name(const std::string &label, int index) const {
 
 std::vector<Archiver::Entry> Archiver::scan() const {
     std::vector<Entry> out;
-    DIR *d = ::opendir(dir_.c_str());
-    if (!d) return out;
-    const std::string prefix = dir_ == "/" ? "/" : dir_ + "/";
-    while (dirent *de = ::readdir(d)) {
-        std::string n = de->d_name;
+    std::vector<std::string> names;
+    if (!pf::list_dir(dir_, &names)) return out;
+    const std::string prefix = dir_ == "/" ? "/" : dir_ + sep_;
+    for (std::string &n : names) {
         int kind = 0;  // 0 plain, 1 gz, 2 tmp
         if (ends_with(n, ".gz.tmp")) {
             kind = 2;
@@ -215,7 +195,6 @@ std::vector<Archiver::Entry> Archiver::scan() const {
         Entry &dst = it == out.end() ? (out.push_back(e), out.back()) : *it;
         (kind == 0 ? dst.plain : kind == 1 ? dst.gz : dst.tmp) = true;
     }
-    ::closedir(d);
     std::sort(out.begin(), out.end(),
               [](const Entry &a, const Entry &b) { return a.key < b.key; });
     return out;
@@ -227,9 +206,9 @@ void Archiver::recover() noexcept {
         std::lock_guard<std::mutex> lk(mu_);
         for (const Entry &e : scan()) {
             // Interrupted compression: the original is intact, drop the partial.
-            if (e.tmp) ::unlink((e.name + ".gz.tmp").c_str());
+            if (e.tmp) pf::remove_file(e.name + ".gz.tmp");
             // Crash between rename(.gz) and unlink(original): .gz is complete.
-            if (e.plain && e.gz) ::unlink(e.name.c_str());
+            if (e.plain && e.gz) pf::remove_file(e.name);
         }
     } catch (...) {
     }
@@ -273,9 +252,9 @@ void Archiver::retention_locked() {
     const size_t keep = static_cast<size_t>(max_files_ - 1);
     for (size_t i = 0; i + keep < mine.size(); ++i) {
         const std::string &n = mine[i]->name;
-        ::unlink(n.c_str());
-        ::unlink((n + ".gz").c_str());
-        ::unlink((n + ".gz.tmp").c_str());
+        pf::remove_file(n);
+        pf::remove_file(n + ".gz");
+        pf::remove_file(n + ".gz.tmp");
         cancel_locked(n);
     }
 }
@@ -284,7 +263,7 @@ uint64_t Archiver::archive(const std::string &live, int64_t period, bool ready) 
     try {
         std::lock_guard<std::mutex> lk(mu_);
         if (max_files_ <= 1) {
-            ::unlink(live.c_str());
+            pf::remove_file(live);
             return 0;
         }
         std::string dst;
@@ -295,17 +274,17 @@ uint64_t Archiver::archive(const std::string &live, int64_t period, bool ready) 
             for (int i = top; i >= 1; --i) {
                 const std::string p = size_name(i);
                 if (i == top) {
-                    ::unlink(p.c_str());
-                    ::unlink((p + ".gz").c_str());
-                    ::unlink((p + ".gz.tmp").c_str());
+                    pf::remove_file(p);
+                    pf::remove_file(p + ".gz");
+                    pf::remove_file(p + ".gz.tmp");
                     cancel_locked(p);
                     continue;
                 }
                 const std::string q = size_name(i + 1);
-                ::rename(p.c_str(), q.c_str());
+                pf::rename_replace(p, q);
                 if (compress() || exists(p + ".gz")) {
-                    ::rename((p + ".gz").c_str(), (q + ".gz").c_str());
-                    ::rename((p + ".gz.tmp").c_str(), (q + ".gz.tmp").c_str());
+                    pf::rename_replace(p + ".gz", q + ".gz");
+                    pf::rename_replace(p + ".gz.tmp", q + ".gz.tmp");
                 }
                 for (Job &j : jobs_)
                     if (j.src == p) j.src = q;
@@ -318,7 +297,7 @@ uint64_t Archiver::archive(const std::string &live, int64_t period, bool ready) 
                 if (!exists(dst) && !exists(dst + ".gz") && !exists(dst + ".gz.tmp")) break;
             }
         }
-        if (::rename(live.c_str(), dst.c_str()) != 0) {
+        if (!pf::rename_replace(live, dst)) {
             std::fprintf(stderr, "tblog: rotate %s -> %s: %s\n", live.c_str(), dst.c_str(),
                          std::strerror(errno));
             return 0;
@@ -413,22 +392,22 @@ void Archiver::compressor_main() {
         if (abort_.load() || j == jobs_.end()) break;
         j->active = true;
         const std::string tmp = j->src + ".gz.tmp";
-        int in = ::open(j->src.c_str(), O_RDONLY | O_CLOEXEC);
-        int out = in < 0 ? -1 : ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (in < 0 || out < 0) {
+        pf::FileHandle in = pf::file_open(j->src, pf::OpenMode::Read);
+        pf::FileHandle out = in.valid() ? pf::file_open(tmp, pf::OpenMode::Truncate) : pf::no_file();
+        if (!in.valid() || !out.valid()) {
             if (!j->cancelled)
                 std::fprintf(stderr, "tblog: compress %s: %s\n", j->src.c_str(),
                              std::strerror(errno));
-            if (in >= 0) ::close(in);
+            pf::file_close(in);
             jobs_.erase(j);
             idle_cv_.notify_all();
             continue;
         }
         lk.unlock();
-        bool ok = compress_fds(in, out);
-        ok = ok && ::fsync(out) == 0;
-        ::close(in);
-        ::close(out);
+        bool ok = compress_file(in, out);
+        ok = ok && pf::file_sync(out);
+        pf::file_close(in);
+        pf::file_close(out);
         lk.lock();
         // j stays valid: cancel_locked() only flags active jobs.
         if (j->cancelled) {  // deleted by retention / shifted out meanwhile
@@ -437,49 +416,62 @@ void Archiver::compressor_main() {
             continue;
         }
         const std::string cur_tmp = j->src + ".gz.tmp";
-        if (!ok || ::rename(cur_tmp.c_str(), (j->src + ".gz").c_str()) != 0) {
+        if (!ok || !pf::rename_replace(cur_tmp, j->src + ".gz")) {
             if (!abort_.load())
                 std::fprintf(stderr, "tblog: compression of %s failed; kept uncompressed\n",
                              j->src.c_str());
-            ::unlink(cur_tmp.c_str());
+            pf::remove_file(cur_tmp);
             jobs_.erase(j);
             idle_cv_.notify_all();
             continue;
         }
         // The .gz must be durable before the original disappears.
         lk.unlock();
-        fsync_dir(dir_);
+        pf::sync_dir(dir_);
         lk.lock();
-        if (!j->cancelled) ::unlink(j->src.c_str());
+        if (!j->cancelled) pf::remove_file(j->src);
         jobs_.erase(j);
         idle_cv_.notify_all();
     }
 }
 
 #ifdef TBLOG_HAVE_ZLIB
-bool Archiver::compress_fds(int in, int out) noexcept {
-    int d = ::dup(out);
-    if (d < 0) return false;
-    gzFile gz = ::gzdopen(d, "wb6");
-    if (!gz) {
-        ::close(d);
+// gzip stream (same format and level as gzdopen(fd, "wb6"): deflate with a
+// gzip wrapper, level 6, default memLevel/strategy) written through pf::.
+bool Archiver::compress_file(pf::FileHandle in, pf::FileHandle out) noexcept {
+    constexpr size_t kChunk = 64 * 1024;
+    std::unique_ptr<unsigned char[]> inbuf(new (std::nothrow) unsigned char[kChunk]);
+    std::unique_ptr<unsigned char[]> outbuf(new (std::nothrow) unsigned char[kChunk]);
+    if (!inbuf || !outbuf) return false;
+    z_stream zs;
+    std::memset(&zs, 0, sizeof zs);
+    if (deflateInit2(&zs, 6, Z_DEFLATED, MAX_WBITS + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
         return false;
-    }
-    char buf[64 * 1024];
     bool ok = true;
-    for (;;) {
+    for (bool done = false; !done;) {
         if (abort_.load(std::memory_order_relaxed)) { ok = false; break; }
-        ssize_t n = ::read(in, buf, sizeof buf);
-        if (n < 0 && errno == EINTR) continue;
+        const int64_t n = pf::file_read(in, inbuf.get(), kChunk);
         if (n < 0) { ok = false; break; }
-        if (n == 0) break;
-        if (::gzwrite(gz, buf, static_cast<unsigned>(n)) != static_cast<int>(n)) { ok = false; break; }
+        const int flush = n == 0 ? Z_FINISH : Z_NO_FLUSH;
+        zs.next_in = inbuf.get();
+        zs.avail_in = static_cast<uInt>(n);
+        do {  // drain the input (and, at the end, the trailer)
+            zs.next_out = outbuf.get();
+            zs.avail_out = static_cast<uInt>(kChunk);
+            const int r = deflate(&zs, flush);
+            if (r == Z_STREAM_ERROR) { ok = false; break; }
+            const size_t have = kChunk - zs.avail_out;
+            if (have && !pf::file_write_all(out, outbuf.get(), have)) { ok = false; break; }
+            if (r == Z_STREAM_END) { done = true; break; }
+        } while (zs.avail_out == 0);
+        if (!ok) break;
+        if (n == 0 && !done) { ok = false; break; }  // Z_FINISH must end the stream
     }
-    return ::gzclose(gz) == Z_OK && ok;  // gzclose closes d
+    return deflateEnd(&zs) == Z_OK && ok;
 }
 #else
 // Without zlib configure() turns compression off, so no job is ever queued.
-bool Archiver::compress_fds(int, int) noexcept { return false; }
+bool Archiver::compress_file(pf::FileHandle, pf::FileHandle) noexcept { return false; }
 #endif
 
 }  // namespace tblog

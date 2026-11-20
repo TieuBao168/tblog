@@ -24,7 +24,7 @@
 //   holds whole lines. The buffer the worker is writing is published per shard
 //   in `pending` with `pending_done` = bytes already handed to write().
 //   on_crash() takes NO lock (the crashing thread may own a spinlock) and
-//   writes, for every shard in order, straight to the fd:
+//   writes, for every shard in order, straight to the file handle:
 //     1. pending buffer [pending_done, len)   (older data first)
 //     2. active  buffer [0, len)
 //   What can be lost: the line being memcpy'd at the moment of the crash
@@ -34,9 +34,11 @@
 //   returns), or data racing with a concurrent worker swap. After on_crash()
 //   the backend is "dead": append() returns false and flush() writes nothing
 //   more (it checks before each shard), so data is not written a second time.
+#include "backend/backend.h"
 #include "backend/rotating_file.h"
-
-#include <unistd.h>
+#include "core/compat.h"
+#include "platform/platform.h"
+#include "sinks/sink.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -46,6 +48,7 @@
 #include <mutex>
 #include <new>
 #include <thread>
+#include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -224,18 +227,18 @@ public:
         flush_locked();
     }
 
-    // Don't hold flush_mu_ during fdatasync (it can take ~100 ms): dup the fd
-    // so a concurrent rotation cannot close it under us.
+    // Don't hold flush_mu_ during fdatasync (it can take ~100 ms): dup the
+    // handle so a concurrent rotation cannot close it under us.
     void sync() override {
-        int d = -1;
+        pf::FileHandle d = pf::no_file();
         {
             std::lock_guard<std::mutex> lk(flush_mu_);
-            int fd = file_.fd();
-            if (fd >= 0) d = ::dup(fd);
+            pf::FileHandle h = file_.handle();
+            if (h.valid()) d = pf::file_dup(h);
         }
-        if (d >= 0) {
-            ::fdatasync(d);
-            ::close(d);
+        if (d.valid()) {
+            pf::file_datasync(d);
+            pf::file_close(d);
         }
     }
 
@@ -275,8 +278,8 @@ public:
     void on_crash() noexcept override {
         if (crashed_.exchange(true, std::memory_order_acq_rel)) return;
         closed_.store(true, std::memory_order_release);  // lock-free: no new appends
-        int fd = file_.fd();
-        if (fd < 0) return;
+        const pf::FileHandle h = file_.handle();
+        if (!h.valid()) return;
         for (size_t i = 0; i < nshards_; ++i) {
             Shard &sh = shards_[i];
             // Read `active` BEFORE `pending`: the worker publishes pending
@@ -287,19 +290,18 @@ public:
             if (p >= 0) {
                 size_t done = sh.pending_done.load(std::memory_order_acquire);
                 size_t end = sh.bufs[p].len.load(std::memory_order_acquire);
-                if (done < end)
-                    RotatingFile::raw_write_all(fd, sh.bufs[p].data + done, end - done);
+                if (done < end) pf::file_write_crash(h, sh.bufs[p].data + done, end - done);
             }
             if (a != p) {
                 size_t end = sh.bufs[a].len.load(std::memory_order_acquire);
-                if (end) RotatingFile::raw_write_all(fd, sh.bufs[a].data, end);
+                if (end) pf::file_write_crash(h, sh.bufs[a].data, end);
             }
         }
     }
 
     void crash_write(const char *data, size_t len) noexcept override {
-        int fd = file_.fd();
-        if (fd >= 0) RotatingFile::raw_write_all(fd, data, len);
+        const pf::FileHandle h = file_.handle();
+        if (h.valid()) pf::file_write_crash(h, data, len);
     }
 
     void add_sink(Sink *s) override {

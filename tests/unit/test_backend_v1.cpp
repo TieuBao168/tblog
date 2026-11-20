@@ -1,6 +1,7 @@
 // Tests for the file storage: RotatingFile and the double-buffer backend.
+#include "backend/backend.h"
 #include "backend/rotating_file.h"
-#include "internal.h"
+#include "sinks/sink.h"
 #include "tiny_test.h"
 
 #include <algorithm>
@@ -189,7 +190,7 @@ TEST(rotating_names) {
     EXPECT_EQ(rf.rotated_name(0), o.path);
     EXPECT_EQ(rf.rotated_name(1), d.file("sub/dir/app.1.log"));
     EXPECT_EQ(rf.rotated_name(4), d.file("sub/dir/app.4.log"));
-    EXPECT_TRUE(rf.fd() >= 0);
+    EXPECT_TRUE(rf.is_open());
 
     RotatingFile r2;
     o.path = d.file("noext");

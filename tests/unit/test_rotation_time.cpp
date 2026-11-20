@@ -4,8 +4,8 @@
 // (TBLOG_HAVE_ZLIB). Time is injected through FileOptions::now_fn; TZ is
 // forced to UTC so expected names are fixed.
 #include "backend/archiver.h"
+#include "backend/backend.h"
 #include "backend/rotating_file.h"
-#include "internal.h"
 #include "tiny_test.h"
 
 #include <algorithm>
@@ -550,12 +550,12 @@ TEST(compress_crash_recovery) {
     EXPECT_TRUE(gunzip(d + "/app.2030-01-02.log.gz") == y);
 }
 #else
-// Without zlib, file.compress = gzip warns once and behaves as none.
+// Without zlib, file.compress = gzip behaves as none (validate_config() warns;
+// RotatingFile/Archiver fall back silently).
 TEST(compress_without_zlib_is_disabled) {
     std::string d = fresh_dir("gz_off");
     g_now = kBase + 1;
     RotatingFile rf;
-    std::fprintf(stderr, "(expected 'built without zlib' warning follows)\n");
     ASSERT_TRUE(rf.open(file_opts(d, RotateMode::Daily, CompressMode::Gzip)));
     std::string a = fixed_line(1);
     rf.write_all(a.data(), a.size());

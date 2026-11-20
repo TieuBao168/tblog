@@ -1,4 +1,4 @@
-// tblog configuration parser. See src/internal.h ("Config") for the contract.
+// tblog configuration parser. See config/config.h for the contract.
 //
 // Format: one `key = value` per line. Leading/trailing whitespace is trimmed,
 // blank lines and lines whose first non-blank char is '#' are ignored. An
@@ -6,8 +6,9 @@
 // first character of the value) -- except for `pattern`, whose value is the
 // whole rest of the line. A value may be wrapped in double quotes to keep
 // leading/trailing spaces (and, for non-pattern keys, to contain " #").
-// Invalid values produce a warning and leave the field unchanged.
-#include "internal.h"
+// Invalid values produce a warning and leave the field unchanged. Rules that
+// involve the build or several fields are in validate_config().
+#include "config/config.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -16,9 +17,6 @@
 
 namespace tblog {
 namespace {
-
-constexpr uint32_t kFlushMin = 1, kFlushMax = 60000;
-constexpr uint32_t kSyncMax = 3600000;
 
 bool is_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'; }
 char lower(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
@@ -253,9 +251,9 @@ private:
             else if (l == "block") cfg_.full_policy = FullPolicy::Block;
             else warn("invalid full_policy (drop|block)", text);
         } else if (key == "flush.interval_ms") {
-            get_interval(v, text, kFlushMin, kFlushMax, &cfg_.flush_interval_ms);
+            get_interval(v, text, kFlushIntervalMinMs, kFlushIntervalMaxMs, &cfg_.flush_interval_ms);
         } else if (key == "sync.interval_ms") {
-            get_interval(v, text, 0, kSyncMax, &cfg_.sync_interval_ms);
+            get_interval(v, text, 0, kSyncIntervalMaxMs, &cfg_.sync_interval_ms);
         } else if (key == "sync.on_level") {
             tblog_level lv;
             if (parse_level_local(v, &lv)) cfg_.file.urgent_level = lv;

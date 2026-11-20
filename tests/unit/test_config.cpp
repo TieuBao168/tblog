@@ -1,5 +1,5 @@
-// Unit tests for src/config (parser + watcher).
-#include "internal.h"
+// Unit tests for src/config (parser + validate_config + watcher).
+#include "config/config.h"
 #include "tiny_test.h"
 
 #include <fcntl.h>
@@ -427,6 +427,101 @@ TEST(watcher) {
     if (a.st_ino != b.st_ino) EXPECT_TRUE(w.changed());
     EXPECT_FALSE(w.changed());
     ::unlink(p.c_str());
+}
+
+// ------------------------------------------------------------ validate_config
+TEST(validate_defaults_unchanged) {
+    Config c;
+    std::vector<std::string> w;
+    EXPECT_TRUE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(0));
+    const Config d;
+    EXPECT_EQ(int(c.level), int(d.level));
+    EXPECT_EQ(c.pattern, d.pattern);
+    EXPECT_EQ(c.file.path, d.file.path);
+    EXPECT_EQ(c.file.max_size, d.file.max_size);
+    EXPECT_EQ(c.file.max_files, d.file.max_files);
+    EXPECT_TRUE(c.file.rotate == d.file.rotate);
+    EXPECT_TRUE(c.file.compress == d.file.compress);
+    EXPECT_EQ(c.buffer_size, d.buffer_size);
+    EXPECT_EQ(c.flush_interval_ms, d.flush_interval_ms);
+    EXPECT_EQ(c.sync_interval_ms, d.sync_interval_ms);
+    EXPECT_TRUE(validate_config(c, nullptr));  // null warnings vector is fine
+}
+
+TEST(validate_parsed_config_unchanged) {
+    Config c;
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string(kExample, c, &w));
+    Config before = c;
+    EXPECT_TRUE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(0));
+    EXPECT_EQ(c.file.path, before.file.path);
+    EXPECT_EQ(c.file.max_files, before.file.max_files);
+    EXPECT_EQ(c.flush_interval_ms, before.flush_interval_ms);
+    ASSERT_TRUE(c.module_levels.size() == 1);
+}
+
+TEST(validate_gzip_needs_zlib) {
+    Config c;
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string("file.compress = gzip\n", c, &w));
+    EXPECT_TRUE(c.file.compress == CompressMode::Gzip);  // the parser does not judge the build
+#ifdef TBLOG_HAVE_ZLIB
+    EXPECT_TRUE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(0));
+    EXPECT_TRUE(c.file.compress == CompressMode::Gzip);
+#else
+    EXPECT_FALSE(validate_config(c, &w));
+    ASSERT_TRUE(w.size() == 1);
+    EXPECT_TRUE(any_contains(w, "file.compress"));
+    EXPECT_TRUE(any_contains(w, "zlib"));
+    EXPECT_TRUE(c.file.compress == CompressMode::None);
+    // Idempotent: a validated config validates cleanly.
+    w.clear();
+    EXPECT_TRUE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(0));
+#endif
+}
+
+// Programmatic configs (not from the parser) are normalised too.
+TEST(validate_normalises_out_of_range_fields) {
+    Config c;
+    c.file.path.clear();
+    c.pattern.clear();
+    c.file.max_files = 0;
+    c.file.max_size = 0;
+    c.flush_interval_ms = 0;
+    c.sync_interval_ms = 5000000;
+    std::vector<std::string> w;
+    EXPECT_FALSE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(6));
+    EXPECT_EQ(c.file.path, FileOptions().path);
+    EXPECT_EQ(c.pattern, Config().pattern);
+    EXPECT_EQ(c.file.max_files, 1);
+    EXPECT_EQ(c.file.max_size, uint64_t(1));
+    EXPECT_EQ(c.flush_interval_ms, kFlushIntervalMinMs);
+    EXPECT_EQ(c.sync_interval_ms, kSyncIntervalMaxMs);
+    EXPECT_TRUE(any_contains(w, "file.path"));
+    EXPECT_TRUE(any_contains(w, "pattern"));
+    EXPECT_TRUE(any_contains(w, "file.max_files"));
+    EXPECT_TRUE(any_contains(w, "file.max_size"));
+    EXPECT_TRUE(any_contains(w, "flush.interval_ms"));
+    EXPECT_TRUE(any_contains(w, "sync.interval_ms"));
+
+    c.flush_interval_ms = 100000;
+    c.file.max_files = -3;
+    w.clear();
+    EXPECT_FALSE(validate_config(c, &w));
+    EXPECT_EQ(w.size(), size_t(2));
+    EXPECT_EQ(c.flush_interval_ms, kFlushIntervalMaxMs);
+    EXPECT_EQ(c.file.max_files, 1);
+
+    // sync.interval_ms = 0 means "no periodic sync": valid.
+    c.sync_interval_ms = 0;
+    w.clear();
+    EXPECT_TRUE(validate_config(c, &w));
+    EXPECT_EQ(c.sync_interval_ms, 0u);
 }
 
 TINY_TEST_MAIN()

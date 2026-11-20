@@ -25,6 +25,16 @@ permissions:
 # (macOS).
 
 jobs:
+  # No OS headers / OS calls outside src/platform/ (the platform layer).
+  platform-boundary:
+    name: platform boundary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: packaging/check-platform-boundary.sh
+        run: sh packaging/check-platform-boundary.sh src
+
   cmake-linux:
     name: cmake / ${{ matrix.name }}
     runs-on: ubuntu-latest

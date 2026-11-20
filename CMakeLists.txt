@@ -114,13 +114,28 @@ if(TBLOG_WITH_ZLIB)
   endif()
 endif()
 
-# New modules added under src/ are picked up automatically (re-run cmake on
-# CMake < 3.12, which lacks CONFIGURE_DEPENDS).
+# Library sources: every src/**/*.cpp except the platform layer, plus the one
+# platform implementation for the target OS (src/platform/posix on UNIX,
+# src/platform/win32 on Windows once it exists). New modules are picked up
+# automatically (re-run cmake on CMake < 3.12, which lacks CONFIGURE_DEPENDS).
+set(_tblog_glob_flags)
 if(NOT CMAKE_VERSION VERSION_LESS 3.12)
-  file(GLOB_RECURSE TBLOG_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
-else()
-  file(GLOB_RECURSE TBLOG_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+  set(_tblog_glob_flags CONFIGURE_DEPENDS)
 endif()
+# Relative paths (src/...), so the filter cannot match the checkout's own path.
+file(GLOB_RECURSE TBLOG_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" ${_tblog_glob_flags}
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+list(FILTER TBLOG_SOURCES EXCLUDE REGEX "^src/platform/")
+if(UNIX)
+  set(TBLOG_PLATFORM_DIR posix)
+elseif(WIN32)
+  set(TBLOG_PLATFORM_DIR win32)
+else()
+  message(FATAL_ERROR "tblog: no platform layer for ${CMAKE_SYSTEM_NAME}")
+endif()
+file(GLOB TBLOG_PLATFORM_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" ${_tblog_glob_flags}
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/${TBLOG_PLATFORM_DIR}/*.cpp")
+list(APPEND TBLOG_SOURCES ${TBLOG_PLATFORM_SOURCES})
 
 set(TBLOG_WARNINGS)
 set(TBLOG_LIB_OPTIONS)

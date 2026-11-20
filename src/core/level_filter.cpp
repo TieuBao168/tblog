@@ -1,6 +1,7 @@
 // Levels & module registry.
-#include "internal.h"
+#include "core/levels.h"
 
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 

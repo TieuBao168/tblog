@@ -346,6 +346,7 @@ make -C lite test
 - CMake + CTest trên Linux: GCC C++17, GCC C++11, Clang C++17, ASan+UBSan, TSan, build không có zlib (tất cả với `-Werror`).
 - Cài đặt bằng `cmake --install` rồi build ví dụ từ bản đã cài qua pkg-config (tĩnh và động) và qua `find_package(tblog)` ([packaging/consumer](packaging/consumer/CMakeLists.txt)).
 - Makefile: `make test`, `make check-symbols`, `make check-install`.
+- Ranh giới nền tảng: [packaging/check-platform-boundary.sh](packaging/check-platform-boundary.sh) báo lỗi nếu code ngoài `src/platform/` include header của OS hoặc gọi thẳng API của OS.
 - tblog-lite: `make -C lite test`, `make -C lite test-asan`.
 
 Bộ test gồm:
@@ -373,10 +374,11 @@ Bộ test gồm:
 include/tblog/        log.h (API C), tblog.hpp + detail/ (API C++)
 src/core/             level, module, thread context, formatter
 src/backend/          double buffer, rotating file, archiver (xoay + nén)
-src/config/           parser và watcher của log.conf
+src/config/           parser, validate_config và watcher của log.conf
 src/logger/           C API, worker thread, sync thread
 src/crash/            crash handler
 src/sinks/            console, syslog
+src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/; mọi lời gọi OS nằm ở đây
 tests/unit/           test (tests/tiny_test.h, không cần thư viện ngoài)
 bench/                benchmark latency/throughput
 examples/             basic.c, cpp_api.cpp

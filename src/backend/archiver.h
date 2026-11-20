@@ -18,13 +18,17 @@
 // `name` if `name.gz` exists (the .gz is only ever created complete). A crash
 // thus leaves either the original or a complete .gz (possibly both, briefly).
 //
+// All file system access goes through the platform layer (pf::); zlib is
+// used through its stream API (deflate), so no OS file descriptor reaches it.
+//
 // Threading: archive()/mark_ready() run on the backend worker and only take
 // mu_ for a few rename/unlink/stat syscalls; the compressor thread holds mu_
 // only around open/rename/unlink, never while compressing. Callers' hot path
 // never touches this class.
 #pragma once
 
-#include "internal.h"
+#include "backend/backend.h"
+#include "platform/platform.h"
 
 #include <atomic>
 #include <chrono>
@@ -46,8 +50,8 @@ public:
     Archiver &operator=(const Archiver &) = delete;
 
     // Before anything else (and again only after finish()). Without zlib
-    // (TBLOG_HAVE_ZLIB unset) CompressMode::Gzip prints a warning to stderr
-    // and falls back to None.
+    // (TBLOG_HAVE_ZLIB unset) CompressMode::Gzip silently falls back to None
+    // (validate_config() warns about it).
     void configure(const FileOptions &opt);
 
     bool time_mode() const noexcept { return rotate_ != RotateMode::Size; }
@@ -102,10 +106,11 @@ private:
     void cancel_locked(const std::string &src);
     void add_job_locked(uint64_t id, const std::string &src, bool ready);
     void compressor_main();
-    bool compress_fds(int in, int out) noexcept;
+    bool compress_file(pf::FileHandle in, pf::FileHandle out) noexcept;
     void ensure_thread_locked();
 
     std::string path_, dir_, stem_, ext_, base_prefix_;
+    char sep_ = '/';  // separator used to join dir_ and a name (the one in path_)
     int max_files_ = 5;
     RotateMode rotate_ = RotateMode::Size;
     CompressMode compress_ = CompressMode::None;
@@ -117,7 +122,7 @@ private:
     std::list<Job> jobs_;
     uint64_t next_id_ = 1;
     bool stopping_ = false;
-    std::atomic<bool> abort_{false};  // read by compress_fds() without mu_
+    std::atomic<bool> abort_{false};  // read by compress_file() without mu_
     bool thread_started_ = false;
     std::thread thread_;
 };

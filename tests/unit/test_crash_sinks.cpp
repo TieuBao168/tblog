@@ -1,5 +1,8 @@
 // Tests for src/crash/crash_handler.cpp, src/sinks/console.cpp, src/sinks/syslog.cpp
-#include "internal.h"
+#include "backend/backend.h"
+#include "crash/crash_handler.h"
+#include "platform/platform.h"
+#include "sinks/sink.h"
 #include "tiny_test.h"
 
 #include <atomic>
@@ -13,12 +16,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-namespace tblog {
-// Internal hooks defined in the module .cpp files (not part of internal.h).
-void console_write_fd(int fd, const char *data, size_t len, bool color);
-bool crash_altstack_for_this_thread();
-}  // namespace tblog
 
 namespace {
 
@@ -456,10 +453,10 @@ TEST(crash_stack_overflow_in_thread_with_altstack) {
 namespace {
 std::string console_to_string(const std::string &in, bool color) {
     std::string path = test_dir() + "/console_" + std::to_string(::getpid()) + ".txt";
-    int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0644);
-    if (fd < 0) return "<open failed>";
-    tblog::console_write_fd(fd, in.data(), in.size(), color);
-    ::close(fd);
+    tblog::pf::FileHandle h = tblog::pf::file_open(path, tblog::pf::OpenMode::Truncate);
+    if (!h.valid()) return "<open failed>";
+    tblog::console_write_to(h, in.data(), in.size(), color);
+    tblog::pf::file_close(h);
     std::string out = read_file(path);
     ::unlink(path.c_str());
     return out;

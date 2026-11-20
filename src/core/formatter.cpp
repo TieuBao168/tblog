@@ -1,10 +1,14 @@
 // Pattern formatter. The pattern is compiled once into a list of ops; format()
 // walks the ops writing into the caller's buffer without allocating.
-#include "internal.h"
+#include "core/formatter.h"
+
+#include "core/levels.h"
+#include "platform/platform.h"
 
 #include <cstdio>
 #include <cstring>
-#include <time.h>
+#include <ctime>
+#include <vector>
 
 namespace tblog {
 namespace {
@@ -33,9 +37,8 @@ const TimeCache &time_cache(uint64_t ts_ns) {
     static thread_local TimeCache tc;
     int64_t sec = (int64_t)(ts_ns / 1000000000ull);
     if (__builtin_expect(sec != tc.sec, 0)) {
-        time_t t = (time_t)sec;
-        struct tm tm;
-        if (!localtime_r(&t, &tm)) std::memset(&tm, 0, sizeof tm);
+        std::tm tm;
+        if (!pf::local_time(sec, &tm)) std::memset(&tm, 0, sizeof tm);
         int y = tm.tm_year + 1900;
         if (y < 0) y = 0;
         if (y > 9999) y = 9999;
@@ -76,7 +79,7 @@ inline void put_fixed(char *p, uint32_t v, int digits) {
 inline const char *basename_of(const char *path) {
     const char *b = path;
     for (const char *p = path; *p; ++p)
-        if (*p == '/') b = p + 1;
+        if (pf::is_path_separator(*p)) b = p + 1;
     return b;
 }
 

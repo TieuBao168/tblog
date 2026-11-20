@@ -1,38 +1,36 @@
 // tblog config file watcher: one stat() per changed() call.
-#include "internal.h"
-
-#include <sys/stat.h>
+#include "config/config.h"
 
 namespace tblog {
 namespace {
 
-void snapshot(const std::string &path, int64_t *mtime, int64_t *size, uint64_t *ino) {
-    struct stat st;
-    if (::stat(path.c_str(), &st) != 0) {
+void snapshot(const std::string &path, int64_t *mtime, int64_t *size, pf::FileId *id) {
+    pf::FileInfo fi;
+    if (!pf::path_info(path, &fi)) {
         *mtime = -1;
         *size = -1;
-        *ino = 0;
+        *id = pf::FileId{0, 0};
         return;
     }
-    *mtime = int64_t(st.st_mtim.tv_sec) * 1000000000LL + int64_t(st.st_mtim.tv_nsec);
-    *size = int64_t(st.st_size);
-    *ino = uint64_t(st.st_ino);
+    *mtime = fi.mtime_ns;
+    *size = int64_t(fi.size);
+    *id = fi.id;
 }
 
 }  // namespace
 
 ConfigWatcher::ConfigWatcher(std::string path) : path_(std::move(path)) {
-    snapshot(path_, &mtime_ns_, &size_, &ino_);
+    snapshot(path_, &mtime_ns_, &size_, &id_);
 }
 
 bool ConfigWatcher::changed() {
     int64_t m, s;
-    uint64_t i;
+    pf::FileId i;
     snapshot(path_, &m, &s, &i);
-    if (m == mtime_ns_ && s == size_ && i == ino_) return false;
+    if (m == mtime_ns_ && s == size_ && i == id_) return false;
     mtime_ns_ = m;
     size_ = s;
-    ino_ = i;
+    id_ = i;
     return true;
 }
 

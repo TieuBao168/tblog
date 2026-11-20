@@ -38,7 +38,14 @@ ifneq ($(SAN),)
   LDFLAGS  += -fsanitize=$(SAN)
 endif
 
-SRCS  := $(shell find src -name '*.cpp')
+# Portable sources plus the POSIX platform layer. Other platform directories
+# (src/platform/win32, ...) are not built by this Linux-only Makefile.
+# Source basenames must be unique: `ar` keys archive members by file name.
+SRCS  := $(shell find src -name '*.cpp' -not -path 'src/platform/*') \
+         $(wildcard src/platform/posix/*.cpp)
+# Internal headers: any change rebuilds the library objects and the tests.
+LIB_HDRS := $(shell find src -name '*.h' -not -path 'src/platform/*') \
+            src/platform/platform.h $(wildcard src/platform/posix/*.h)
 OBJS  := $(patsubst src/%.cpp,$(BUILD)/obj/%.o,$(SRCS))
 LIB   := $(BUILD)/libtblog.a
 TESTS := $(patsubst tests/unit/%.cpp,$(BUILD)/tests/%,$(wildcard tests/unit/*.cpp))
@@ -60,7 +67,7 @@ all: $(LIB) $(SHLINKS)
 static: $(LIB)
 shared: $(SHLINKS)
 
-$(BUILD)/obj/%.o: src/%.cpp src/internal.h include/tblog/log.h
+$(BUILD)/obj/%.o: src/%.cpp $(LIB_HDRS) include/tblog/log.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(LIB_CXXFLAGS) -c $< -o $@
 
@@ -81,7 +88,7 @@ $(BUILD)/libtblog.so: $(BUILD)/$(SONAME)
 # Public headers are prerequisites so header-only changes rebuild the tests.
 PUBLIC_HDRS := $(wildcard include/tblog/*.h include/tblog/*.hpp include/tblog/detail/*.hpp)
 
-$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h $(PUBLIC_HDRS)
+$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h $(PUBLIC_HDRS) $(LIB_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -Itests $< $(LIB) $(LDFLAGS) -o $@
 

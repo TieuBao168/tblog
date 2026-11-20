@@ -1,11 +1,18 @@
 // Public C API + worker thread. Glues config, formatter, backend, sinks and
 // the crash handler together.
-#include "internal.h"
-
-#include <unistd.h>
+#include "backend/backend.h"
+#include "config/config.h"
+#include "core/compat.h"
+#include "core/formatter.h"
+#include "core/thread_context.h"
+#include "crash/crash_handler.h"
+#include "platform/platform.h"
+#include "sinks/sink.h"
+#include "tblog/log.h"
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -65,15 +72,6 @@ const Formatter &default_formatter() {
     return f;
 }
 
-void write_stderr(const char *p, size_t n) {
-    while (n > 0) {
-        ssize_t w = ::write(STDERR_FILENO, p, n);
-        if (w <= 0) return;
-        p += w;
-        n -= static_cast<size_t>(w);
-    }
-}
-
 void apply_levels(const Config &c) {
     tblog_set_level(nullptr, c.level);
     for (const auto &ml : c.module_levels) tblog_set_level(ml.first.c_str(), ml.second);
@@ -88,6 +86,7 @@ void reload(Runtime *rt) {
     Config next = rt->cfg;
     std::vector<std::string> warnings;
     if (!load_config(rt->config_path.c_str(), next, &warnings)) return;  // keep old
+    validate_config(next, &warnings);
     print_warnings(warnings);
 
     apply_levels(next);
@@ -200,19 +199,22 @@ extern "C" int tblog_init(const char *config_path) {
     if (g_rt.load(std::memory_order_acquire)) return 0;  // already running
 
     auto rt = tblog::make_unique<Runtime>();
+    std::vector<std::string> warnings;
     if (config_path && *config_path) {
         rt->config_path = config_path;
-        std::vector<std::string> warnings;
         if (!load_config(config_path, rt->cfg, &warnings))
             std::fprintf(stderr, "tblog: cannot read %s, using defaults\n", config_path);
-        print_warnings(warnings);
     }
+    validate_config(rt->cfg, &warnings);
+    print_warnings(warnings);
 
     rt->backend = make_backend(rt->cfg);
     if (!rt->backend) return -1;
 
     if (rt->cfg.console) rt->sinks.push_back(make_console_sink(rt->cfg.console_color));
-    if (rt->cfg.syslog) rt->sinks.push_back(make_syslog_sink("tblog"));
+    if (rt->cfg.syslog) {
+        if (std::unique_ptr<Sink> s = make_syslog_sink("tblog")) rt->sinks.push_back(std::move(s));
+    }
     for (auto &s : rt->sinks) rt->backend->add_sink(s.get());
 
     rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern));
@@ -289,7 +291,7 @@ extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, i
     if (!rt || !rt->backend->append(tc.scratch, static_cast<uint32_t>(n), lv)) {
         // Not initialised / already shut down -> stderr. (A full buffer under
         // the Drop policy also lands here only when the backend is stopped.)
-        if (!rt || rt->stop.load(std::memory_order_relaxed)) write_stderr(tc.scratch, n);
+        if (!rt || rt->stop.load(std::memory_order_relaxed)) pf::stderr_write(tc.scratch, n);
     }
 
     if (lv == TBLOG_LV_FATAL) {

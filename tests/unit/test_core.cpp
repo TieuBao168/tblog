@@ -1,5 +1,7 @@
 // Unit tests for src/core: levels/modules, thread context, formatter.
-#include "internal.h"
+#include "core/formatter.h"
+#include "core/levels.h"
+#include "core/thread_context.h"
 #include "tiny_test.h"
 
 #include <atomic>

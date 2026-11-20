@@ -1,4 +1,6 @@
-# tblog build. `make` -> build/libtblog.a, `make test`, `make SAN=thread test`,
+# tblog - Linux convenience build. CMake (CMakeLists.txt) is the primary,
+# CI-verified build; this Makefile mirrors it for quick work on Linux.
+# `make` -> build/libtblog.a, `make test`, `make SAN=thread test`,
 # `make STD=c++11 test` (C++11/14/17),
 # `make SAN=address test`, `make bench`.
 # Packaging: `make shared` / `make static`, `make install PREFIX=/usr/local

@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Linux only for now. macOS and Windows jobs (a `cmake-macos` and a
+# `cmake-windows` job next to `cmake-linux`) are added once the library builds
+# there: roadmap steps 5 (Windows) and 6 (macOS).
+
+jobs:
+  cmake-linux:
+    name: cmake / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc / C++17 / RelWithDebInfo
+            cc: gcc
+            cxx: g++
+            std: 17
+            options: ''
+          - name: gcc / C++11
+            cc: gcc
+            cxx: g++
+            std: 11
+            options: ''
+          - name: clang / C++17
+            cc: clang
+            cxx: clang++
+            std: 17
+            options: ''
+          - name: gcc / ASan+UBSan
+            cc: gcc
+            cxx: g++
+            std: 17
+            options: -DTBLOG_SANITIZE=address,undefined
+          - name: gcc / TSan
+            cc: gcc
+            cxx: g++
+            std: 17
+            options: -DTBLOG_SANITIZE=thread
+          - name: gcc / no zlib
+            cc: gcc
+            cxx: g++
+            std: 17
+            options: -DTBLOG_WITH_ZLIB=OFF
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zlib1g-dev clang
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=${{ matrix.cc }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DTBLOG_CXX_STANDARD=${{ matrix.std }}
+          -DTBLOG_BUILD_TESTS=ON
+          -DTBLOG_BUILD_EXAMPLES=ON
+          -DTBLOG_BUILD_BENCH=ON
+          -DTBLOG_WERROR=ON
+          ${{ matrix.options }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  install:
+    name: install / pkg-config + find_package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build zlib1g-dev pkg-config
+
+      - name: Build and install
+        run: |
+          PREFIX="$RUNNER_TEMP/tblog"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib -DTBLOG_WERROR=ON
+          cmake --build build
+          cmake --install build
+
+      # examples/basic.c against the installed tree via pkg-config, static and shared.
+      - name: pkg-config consumer (packaging/check-install.sh)
+        env:
+          TBLOG_INSTALLED_PREFIX: ${{ runner.temp }}/tblog
+          BUILD: build
+          CC: gcc
+          CFLAGS: -O2 -std=c99 -Wall -Wextra -Werror -pthread
+          LDFLAGS: -pthread
+        run: sh packaging/check-install.sh
+
+      # find_package(tblog 0.1) + tblog::tblog from a separate CMake project.
+      - name: find_package consumer (packaging/consumer)
+        run: |
+          PREFIX="$RUNNER_TEMP/tblog"
+          cmake -S packaging/consumer -B build-consumer -G Ninja -DCMAKE_PREFIX_PATH="$PREFIX"
+          cmake --build build-consumer
+          export LD_LIBRARY_PATH="$PREFIX/lib"
+          cd build-consumer
+          for exe in basic_default basic_static; do
+            printf 'file.path = %s\nreload.watch = false\n' "$PWD/$exe.log" > "$exe.conf"
+            "./$exe" "$exe.conf"
+            grep -q 'started, pid-independent message hello' "$exe.log"
+            n=$(grep -c 'worker . step' "$exe.log")
+            test "$n" -eq 4000
+          done
+          readelf -d basic_default > basic_default.dyn
+          grep -q 'NEEDED.*\[libtblog\.so\.0\]' basic_default.dyn
+          readelf -d basic_static > basic_static.dyn
+          if grep -q 'NEEDED.*libtblog' basic_static.dyn; then
+            echo "basic_static depends on libtblog.so"; exit 1
+          fi
+          printf 'file.path = %s\nreload.watch = false\n' "$PWD/cpp_api.log" > cpp_api.conf
+          ./cpp_api cpp_api.conf 1000
+          grep -q 'user 42 logged in from 10.0.0.7:8443' cpp_api.log
+
+  make:
+    name: make / test + check-symbols + check-install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zlib1g-dev pkg-config
+
+      - name: make test
+        run: make -j"$(nproc)" test
+
+      - name: make check-symbols
+        run: make check-symbols
+
+      - name: make check-install
+        run: make check-install
+
+  lite:
+    name: tblog-lite / test + test-asan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make -C lite test
+        run: make -C lite test
+
+      - name: make -C lite test-asan
+        run: make -C lite test-asan

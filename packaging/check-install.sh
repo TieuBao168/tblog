@@ -5,13 +5,17 @@
 #   (b) shared:  pkg-config --cflags --libs, run with LD_LIBRARY_PATH
 # and runs both. Also checks a DESTDIR staged install + uninstall.
 # Falls back to a tiny built-in .pc reader if pkg-config is not installed.
+#
+# With TBLOG_INSTALLED_PREFIX=/abs/prefix (e.g. after `cmake --install`, with
+# libdir = <prefix>/lib) it skips both `make install` steps and checks that
+# tree instead; $BUILD is then only the scratch directory.
 set -eu
 : "${BUILD:?}" "${MAKE:=make}" "${CC:=cc}" "${CFLAGS:=}" "${LDFLAGS:=}" "${RUNNER:=}"
-: "${PKG_CONFIG:=pkg-config}"
+: "${PKG_CONFIG:=pkg-config}" "${TBLOG_INSTALLED_PREFIX:=}"
 
 top=$(pwd)
 root=$top/$BUILD/check-install
-prefix=$root/usr
+prefix=${TBLOG_INSTALLED_PREFIX:-$root/usr}
 work=$root/work
 rm -rf "$root"
 mkdir -p "$work"
@@ -63,6 +67,7 @@ else
     say "$PKG_CONFIG not found, using the built-in .pc reader"
 fi
 
+if [ -z "$TBLOG_INSTALLED_PREFIX" ]; then
 # ---- staged install (DESTDIR) + uninstall ------------------------------------
 say "DESTDIR install/uninstall"
 stage=$root/stage
@@ -79,6 +84,12 @@ left=$(find "$stage" -type f -o -type l)
 # ---- real install into $prefix -----------------------------------------------
 say "install PREFIX=$prefix"
 $MAKE --no-print-directory install PREFIX="$prefix" >/dev/null
+else
+say "checking the existing install in $prefix"
+for f in include/tblog/log.h lib/libtblog.a lib/pkgconfig/tblog.pc; do
+    [ -e "$prefix/$f" ] || fail "install is missing $f"
+done
+fi
 [ "$(readlink "$prefix/lib/libtblog.so")" = libtblog.so.0 ] || fail "libtblog.so symlink"
 [ "$(readlink "$prefix/lib/libtblog.so.0")" = libtblog.so.0.1.0 ] || fail "libtblog.so.0 symlink"
 say "pkg-config --cflags --libs tblog:          $(pc --cflags --libs tblog)"

@@ -58,7 +58,42 @@ Mỗi dòng log mặc định có dạng:
 
 ## Build
 
-Yêu cầu: Linux, g++ hỗ trợ C++11 trở lên, GNU make. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
+Yêu cầu: Linux, compiler hỗ trợ C++11 trở lên (GCC hoặc Clang), CMake ≥ 3.10. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
+
+### CMake (cách build chính)
+
+```bash
+cmake -S . -B build-cmake -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON
+cmake --build build-cmake -j8
+cd build-cmake && ctest --output-on-failure && cd ..
+cmake --install build-cmake --prefix /usr/local
+```
+
+Kết quả nằm trong `build-cmake/`: `libtblog.a`, `libtblog.so.0.1.0` cùng các symlink, `tests/`, `examples/` (`basic`, `cpp_api`), `bench/`. Mặc định build type là `RelWithDebInfo`.
+
+| Option | Mặc định | Ý nghĩa |
+|---|---|---|
+| `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` trỏ tới bản động (`OFF`: bản tĩnh). Cả hai bản luôn được build và cài. |
+| `TBLOG_CXX_STANDARD` | `17` | Chuẩn C++ dùng để build thư viện: 11, 14 hoặc 17. Ứng dụng dùng thư viện không bị ràng buộc theo chuẩn này. |
+| `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
+| `TBLOG_BUILD_TESTS` | `OFF` | Build test và đăng ký với CTest (mỗi file `tests/unit/*.cpp` là một test, thêm `check_symbols`) |
+| `TBLOG_BUILD_EXAMPLES` | `OFF` | Build `examples/basic.c` và `examples/cpp_api.cpp` |
+| `TBLOG_BUILD_BENCH` | `OFF` | Build `bench/bench_latency` (chạy từ thư mục gốc của repo) |
+| `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` hoặc `address,undefined`. Áp dụng cho thư viện, test, ví dụ và bench. Với `thread`, CTest tự chạy test qua `setarch -R`, vì TSan không chạy được khi ASLR bật trên kernel mới. |
+| `TBLOG_WERROR` | `OFF` | Coi warning là lỗi (CI bật option này) |
+
+Mỗi cấu hình nên dùng một thư mục build riêng, ví dụ:
+
+```bash
+cmake -S . -B build-tsan -DTBLOG_BUILD_TESTS=ON -DTBLOG_SANITIZE=thread
+cmake --build build-tsan -j8 && (cd build-tsan && ctest --output-on-failure)
+```
+
+Cross-compile: dùng toolchain file của CMake như thường lệ (`-DCMAKE_TOOLCHAIN_FILE=...`).
+
+### Makefile (lối tắt trên Linux)
+
+Makefile làm được cùng việc với CMake, tiện khi làm việc nhanh trên Linux (cần GNU make).
 
 | Lệnh | Kết quả |
 |---|---|
@@ -75,8 +110,8 @@ Biến build:
 
 | Biến | Ý nghĩa |
 |---|---|
-| `STD=c++11` \| `c++14` \| `c++17` | Chuẩn C++ dùng để build thư viện (mặc định `c++17`). Ứng dụng dùng thư viện không bị ràng buộc theo chuẩn này. |
-| `SAN=address` \| `thread` | Build với ASan hoặc TSan. Với TSan, `make test` tự chạy test qua `setarch -R`, vì TSan không chạy được khi ASLR bật trên kernel mới. |
+| `STD=c++11` \| `c++14` \| `c++17` | Chuẩn C++ dùng để build thư viện (mặc định `c++17`) |
+| `SAN=address` \| `thread` | Build với ASan hoặc TSan. Với TSan, `make test` tự chạy test qua `setarch -R`. |
 | `CXX`, `CC`, `AR` | Đổi compiler, dùng cho cross-compile |
 | `HAVE_ZLIB=0` \| `1` | Ép tắt/bật zlib. Mặc định tự dò. |
 
@@ -87,24 +122,6 @@ Cross-compile ví dụ:
 ```bash
 make CXX=aarch64-linux-gnu-g++ CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
 ```
-
-### CMake
-
-```bash
-cmake -S . -B build-cmake -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON
-cmake --build build-cmake -j8
-cd build-cmake && ctest --output-on-failure
-cmake --install build-cmake --prefix /usr/local
-```
-
-| Option | Mặc định | Ý nghĩa |
-|---|---|---|
-| `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` trỏ tới bản động (`OFF`: bản tĩnh) |
-| `TBLOG_CXX_STANDARD` | `17` | 11, 14 hoặc 17 |
-| `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
-| `TBLOG_BUILD_TESTS`, `TBLOG_BUILD_EXAMPLES` | `OFF` | Build test (đăng ký với CTest) và ví dụ |
-
-> `CMakeLists.txt` chưa được chạy thử vì máy phát triển không có cmake. Makefile là cách build đã được kiểm chứng.
 
 ## Cài đặt và tích hợp vào project
 
@@ -307,6 +324,15 @@ tblog_lite_process();
 ## Kiểm thử
 
 ```bash
+cmake -S . -B build-cmake -DTBLOG_BUILD_TESTS=ON
+cmake --build build-cmake -j8
+cd build-cmake && ctest --output-on-failure
+ctest -R test_config              # chỉ chạy một test
+```
+
+Với sanitizer, cấu hình thêm `-DTBLOG_SANITIZE=address,undefined` hoặc `-DTBLOG_SANITIZE=thread` trong một thư mục build riêng. Bằng Makefile:
+
+```bash
 make test
 make STD=c++11 test
 make SAN=address test
@@ -314,6 +340,13 @@ make SAN=thread test
 make check-install
 make -C lite test
 ```
+
+**CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) chạy trên GitHub Actions với mỗi push và pull request vào `main`:
+
+- CMake + CTest trên Linux: GCC C++17, GCC C++11, Clang C++17, ASan+UBSan, TSan, build không có zlib (tất cả với `-Werror`).
+- Cài đặt bằng `cmake --install` rồi build ví dụ từ bản đã cài qua pkg-config (tĩnh và động) và qua `find_package(tblog)` ([packaging/consumer](packaging/consumer/CMakeLists.txt)).
+- Makefile: `make test`, `make check-symbols`, `make check-install`.
+- tblog-lite: `make -C lite test`, `make -C lite test-asan`.
 
 Bộ test gồm:
 
@@ -327,7 +360,7 @@ Bộ test gồm:
 ## Giới hạn đã biết
 
 - **Nền tảng:** chỉ Linux. Chưa hỗ trợ Windows/macOS.
-- **Chưa chạy thử:** `CMakeLists.txt` và pkg-config thật chưa được chạy trên máy phát triển (không cài cmake/pkg-config). Port FreeRTOS/Cortex-M của tblog-lite chưa chạy trên phần cứng.
+- **Chưa chạy thử:** port FreeRTOS/Cortex-M của tblog-lite chưa chạy trên phần cứng.
 - **Init một lần:** mỗi cặp `tblog_init`/`tblog_shutdown` giữ lại buffer của lần đó, nên ứng dụng chỉ nên init một lần.
 - **Buffer theo thread:** mỗi thread chỉ dùng phần buffer của mình, nên khi một thread bắn log dồn dập, chính sách `drop` sẽ bỏ dòng sớm hơn.
 - **`kill -9`:** mất phần log còn trong buffer (xem [Độ bền của log](#độ-bền-của-log)).

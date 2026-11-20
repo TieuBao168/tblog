@@ -15,7 +15,18 @@
 #include <string>
 #include <type_traits>
 #include <utility>
-#if __cplusplus >= 201703L
+
+// The language level: MSVC keeps __cplusplus at 199711L unless /Zc:__cplusplus
+// is given, but always reports it in _MSVC_LANG.
+#ifndef TBLOG_CPLUSPLUS_
+#if defined(_MSVC_LANG) && _MSVC_LANG > __cplusplus
+#define TBLOG_CPLUSPLUS_ _MSVC_LANG
+#else
+#define TBLOG_CPLUSPLUS_ __cplusplus
+#endif
+#endif
+
+#if TBLOG_CPLUSPLUS_ >= 201703L
 #include <string_view>
 #endif
 
@@ -128,6 +139,21 @@ struct Arg {
     };
     Arg() : type(None), u(0) {}
 };
+
+// Integer argument; signedness picked by tag dispatch (not `if` on a constant,
+// which MSVC /W4 reports as C4127).
+template <class T> inline Arg int_arg(T v, std::true_type /*signed*/) {
+    Arg a;
+    a.type = Arg::Int;
+    a.i = static_cast<long long>(v);
+    return a;
+}
+template <class T> inline Arg int_arg(T v, std::false_type /*signed*/) {
+    Arg a;
+    a.type = Arg::UInt;
+    a.u = static_cast<unsigned long long>(v);
+    return a;
+}
 
 // ---------------------------------------------------------------- padding --
 // Pads the bytes written since `start` to spec.width. `zero_at` >= 0 means
@@ -555,10 +581,7 @@ auto pick(const T &v, rank<3>) -> decltype(tblog_format(std::declval<Sink &>(), 
 template <class T>
 auto pick(const T &v, rank<2>) -> typename std::enable_if<std::is_enum<T>::value, detail::Arg>::type {
     typedef typename std::underlying_type<T>::type U;
-    detail::Arg a;
-    if (std::is_signed<U>::value) { a.type = detail::Arg::Int; a.i = static_cast<long long>(v); }
-    else { a.type = detail::Arg::UInt; a.u = static_cast<unsigned long long>(v); }
-    return a;
+    return detail::int_arg(static_cast<U>(v), std::is_signed<U>());
 }
 template <class T>
 auto pick(const T &v, rank<1>) -> typename std::enable_if<
@@ -584,7 +607,7 @@ inline Arg builtin(long double v) { Arg a = mk(Arg::LongDouble); a.ld = v; retur
 inline Arg builtin(const char *v) { Arg a = mk(Arg::CStr); a.cs = v; return a; }
 inline Arg builtin(char *v) { return builtin(static_cast<const char *>(v)); }
 inline Arg builtin(const std::string &v) { Arg a = mk(Arg::Str); a.s.p = v.data(); a.s.n = v.size(); return a; }
-#if __cplusplus >= 201703L
+#if TBLOG_CPLUSPLUS_ >= 201703L
 inline Arg builtin(std::string_view v) { Arg a = mk(Arg::Str); a.s.p = v.data(); a.s.n = v.size(); return a; }
 #endif
 inline Arg builtin(std::nullptr_t) { Arg a = mk(Arg::Ptr); a.ptr = nullptr; return a; }
@@ -596,7 +619,7 @@ template <std::size_t N> struct is_char_array<const char[N]> : std::true_type {}
 template <class T>
 struct is_builtin
     : std::integral_constant<bool, std::is_arithmetic<T>::value || std::is_same<T, std::string>::value ||
-#if __cplusplus >= 201703L
+#if TBLOG_CPLUSPLUS_ >= 201703L
                                        std::is_same<T, std::string_view>::value ||
 #endif
                                        std::is_same<T, std::nullptr_t>::value || is_char_array<T>::value ||
@@ -625,10 +648,7 @@ template <class T>
 typename std::enable_if<std::is_integral<T>::value && !std::is_same<T, bool>::value && !std::is_same<T, char>::value,
                         Arg>::type
 builtin_any(const T &v) {
-    Arg a;
-    if (std::is_signed<T>::value) { a.type = Arg::Int; a.i = static_cast<long long>(v); }
-    else { a.type = Arg::UInt; a.u = static_cast<unsigned long long>(v); }
-    return a;
+    return int_arg(v, std::is_signed<T>());
 }
 template <class T>
 typename std::enable_if<!std::is_integral<T>::value || std::is_same<T, bool>::value || std::is_same<T, char>::value,

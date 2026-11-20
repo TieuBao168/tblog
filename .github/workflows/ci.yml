@@ -16,9 +16,13 @@ concurrency:
 permissions:
   contents: read
 
-# Linux only for now. macOS and Windows jobs (a `cmake-macos` and a
-# `cmake-windows` job next to `cmake-linux`) are added once the library builds
-# there: roadmap steps 5 (Windows) and 6 (macOS).
+# The library is built and tested on Linux only for now (cmake-linux, install,
+# make, lite; cmake-linux also compiles tests/header_check via
+# TBLOG_BUILD_TESTS=ON). On Windows (MSVC x64/ARM64, MinGW-w64) and macOS
+# (AppleClang) the `headers` job compiles only the public headers
+# (TBLOG_HEADERS_ONLY_CHECK=ON). Full `cmake-windows` and `cmake-macos` jobs
+# replace it there once the library builds: roadmap steps 5 (Windows) and 6
+# (macOS).
 
 jobs:
   cmake-linux:
@@ -87,6 +91,92 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+
+  # Public headers only (tests/header_check, plain and with TBLOG_DLL): strict
+  # warnings as errors (/W4 /WX /permissive-, or -Wall -Wextra -Wpedantic
+  # -Werror). The library itself is not built here.
+  headers:
+    name: headers / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: msvc x64 / C++14
+            os: windows-latest
+            kind: msvc
+            shell: pwsh
+            generator: -A x64
+            std: 14
+          - name: msvc x64 / C++17
+            os: windows-latest
+            kind: msvc
+            shell: pwsh
+            generator: -A x64
+            std: 17
+          - name: msvc x64 / C++20
+            os: windows-latest
+            kind: msvc
+            shell: pwsh
+            generator: -A x64
+            std: 20
+          # Cross-compiled, compile only: covers the ARM64 atomics in log.h.
+          - name: msvc arm64 / C++17
+            os: windows-latest
+            kind: msvc
+            shell: pwsh
+            generator: -A ARM64
+            std: 17
+          - name: mingw-w64 gcc / C++11
+            os: windows-latest
+            kind: mingw
+            shell: msys2 {0}
+            generator: -G Ninja
+            std: 11
+          - name: mingw-w64 gcc / C++20
+            os: windows-latest
+            kind: mingw
+            shell: msys2 {0}
+            generator: -G Ninja
+            std: 20
+          - name: macos appleclang / C++11
+            os: macos-latest
+            kind: macos
+            shell: bash
+            generator: ''
+            std: 11
+          - name: macos appleclang / C++20
+            os: macos-latest
+            kind: macos
+            shell: bash
+            generator: ''
+            std: 20
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSYS2 MinGW-w64 toolchain
+        if: matrix.kind == 'mingw'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      # C++: CMAKE_CXX_STANDARD; C: C99 (C11 on MSVC), set in CMakeLists.txt.
+      - name: Configure
+        run: >
+          cmake -S . -B build ${{ matrix.generator }}
+          -DTBLOG_HEADERS_ONLY_CHECK=ON
+          -DCMAKE_CXX_STANDARD=${{ matrix.std }}
+
+      - name: Build
+        run: cmake --build build --config Release --verbose
 
   install:
     name: install / pkg-config + find_package

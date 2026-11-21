@@ -69,6 +69,13 @@ public:
         console_write_to(pf::stderr_handle(), data, len, color_);
     }
 
+    // Crash path: plain bytes (no colour), pf::stderr_write is a raw write(2).
+    bool crash_safe() const noexcept override { return true; }
+    void crash_write(const char *data, size_t len) noexcept override {
+        pf::stderr_write(data, len);
+    }
+    bool writes_stderr() const noexcept override { return true; }
+
 private:
     bool color_;
 };

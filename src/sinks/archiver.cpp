@@ -1,6 +1,6 @@
 // Rotated-file set: naming, retention, crash-safe background gzip.
 // See archiver.h for the protocol.
-#include "backend/archiver.h"
+#include "sinks/archiver.h"
 
 #include <algorithm>
 #include <cerrno>

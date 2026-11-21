@@ -1,7 +1,9 @@
-// Tests for src/crash/crash_handler.cpp, src/sinks/console.cpp, src/sinks/syslog.cpp
-#include "backend/backend.h"
+// Tests for src/crash/crash_handler.cpp (through a real Pipeline and Queue),
+// src/sinks/console.cpp, src/sinks/syslog.cpp
 #include "crash/crash_handler.h"
+#include "logger/pipeline.h"
 #include "platform/platform.h"
+#include "queue/queue.h"
 #include "sinks/sink.h"
 #include "tiny_test.h"
 
@@ -68,21 +70,16 @@ void null_deref() {
     *p = 42;
 }
 
-// Fake backend: async-signal-safe recording of crash calls, mirrored to a fd.
-class FakeBackend final : public tblog::Backend {
+// Crash-safe fake sink: async-signal-safe recording of crash_write calls,
+// mirrored to a fd (prefixed with `tag`).
+class FakeSink final : public tblog::Sink {
 public:
-    explicit FakeBackend(int fd, const char *tag = "") : fd_(fd), tag_(tag) {}
+    explicit FakeSink(int fd, const char *tag = "") : fd_(fd), tag_(tag) {}
 
-    bool append(const char *, uint32_t, tblog_level) noexcept override { return true; }
-    void wait_for_work(std::chrono::milliseconds) override {}
-    void flush() override {}
-    void sync() override {}
-    bool consume_urgent() noexcept override { return false; }
-    void wake() noexcept override {}
-    void shutdown() override {}
-    uint64_t dropped() const noexcept override { return 0; }
-
+    void write(const char *, size_t) override {}
+    bool crash_safe() const noexcept override { return true; }
     void crash_write(const char *data, size_t len) noexcept override {
+        crash_writes.fetch_add(1);
         size_t room = sizeof(buf) - buf_len;
         size_t n = len < room ? len : room;
         std::memcpy(buf + buf_len, data, n);
@@ -91,25 +88,40 @@ public:
             raw_write(fd_, tag_);
             raw_write(fd_, data, len);
         }
-    }
-    void on_crash() noexcept override {
-        on_crash_count.fetch_add(1);
-        if (fd_ >= 0) {
-            raw_write(fd_, tag_);
-            raw_write(fd_, "ON_CRASH\n");
+        if (segv_in_crash_write) null_deref();
+        if (report_on_marker && len > 4 && std::memcmp(data, "*** ", 4) == 0) {
+            // The marker is the last crash_write: report what was recorded.
+            raw_write(g_report_fd, buf, buf_len);
+            raw_write(g_report_fd, crash_writes.load() == 2 ? "count=2\n" : "count?\n");
         }
-        if (segv_in_on_crash) null_deref();
     }
 
     char buf[4096];
     size_t buf_len = 0;
-    std::atomic<int> on_crash_count{0};
-    bool segv_in_on_crash = false;
+    std::atomic<int> crash_writes{0};
+    bool segv_in_crash_write = false;
+    bool report_on_marker = false;
 
 private:
     int fd_;
     const char *tag_;
 };
+
+const char kPending[] = "PENDING\n";  // the one line buffered in a fake pipeline
+
+// A Pipeline (never freed: the child dies) whose queue holds kPending and
+// whose only sink is a FakeSink. The handler drains kPending into the sink,
+// then writes the marker to it.
+tblog::Pipeline *fake_pipeline(int fd, const char *tag = "", FakeSink **out = nullptr) {
+    tblog::QueueOptions qo;
+    qo.buffer_size = 64u << 10;
+    tblog::Pipeline *p = new tblog::Pipeline(tblog::Queue::create(qo));
+    FakeSink *s = new FakeSink(fd, tag);
+    p->add_sink(std::unique_ptr<tblog::Sink>(s));
+    p->queue().append(kPending, sizeof kPending - 1, TBLOG_LV_INFO);
+    if (out) *out = s;
+    return p;
+}
 
 const int kCrashSignals[] = {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL};
 
@@ -190,56 +202,50 @@ std::string expected_msg(int sig, const char *name) {
 
 TEST(crash_segv_reported_and_dies_with_sigsegv) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         null_deref();
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n") + expected_msg(SIGSEGV, "SIGSEGV"));
+    EXPECT_EQ(r.report, std::string(kPending) + expected_msg(SIGSEGV, "SIGSEGV"));
     EXPECT_TRUE(contains(r.err, expected_msg(SIGSEGV, "SIGSEGV")));
 }
 
 TEST(crash_abort_reported_and_dies_with_sigabrt) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         std::abort();
     });
     EXPECT_TRUE(died_with(r, SIGABRT));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n") + expected_msg(SIGABRT, "SIGABRT"));
+    EXPECT_EQ(r.report, std::string(kPending) + expected_msg(SIGABRT, "SIGABRT"));
 }
 
 TEST(crash_sigfpe_raise_reported_and_dies_with_sigfpe) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         raise(SIGFPE);
     });
     EXPECT_TRUE(died_with(r, SIGFPE));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n") + expected_msg(SIGFPE, "SIGFPE"));
+    EXPECT_EQ(r.report, std::string(kPending) + expected_msg(SIGFPE, "SIGFPE"));
 }
 
 TEST(crash_sigbus_and_sigill_raise) {
     ChildResult r1 = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         raise(SIGBUS);
     });
     EXPECT_TRUE(died_with(r1, SIGBUS));
-    EXPECT_EQ(r1.report, std::string("ON_CRASH\n") + expected_msg(SIGBUS, "SIGBUS"));
+    EXPECT_EQ(r1.report, std::string(kPending) + expected_msg(SIGBUS, "SIGBUS"));
     ChildResult r2 = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         raise(SIGILL);
     });
     EXPECT_TRUE(died_with(r2, SIGILL));
-    EXPECT_EQ(r2.report, std::string("ON_CRASH\n") + expected_msg(SIGILL, "SIGILL"));
+    EXPECT_EQ(r2.report, std::string(kPending) + expected_msg(SIGILL, "SIGILL"));
 }
 
 TEST(crash_backtrace_goes_to_stderr) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         null_deref();
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
@@ -254,28 +260,30 @@ TEST(crash_backtrace_goes_to_stderr) {
 #endif
 }
 
-TEST(crash_reentrant_fault_in_on_crash_during_abort) {
-    // on_crash segfaults while handling SIGABRT -> our handler is re-entered
-    // for SIGSEGV and must go straight to dying with SIGSEGV.
+TEST(crash_reentrant_fault_in_crash_write_during_abort) {
+    // The sink segfaults while draining for SIGABRT -> our handler is
+    // re-entered for SIGSEGV and must go straight to dying with SIGSEGV.
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        fb.segv_in_on_crash = true;
-        tblog::install_crash_handler(&fb);
+        FakeSink *s = nullptr;
+        tblog::Pipeline *p = fake_pipeline(g_report_fd, "", &s);
+        s->segv_in_crash_write = true;
+        tblog::install_crash_handler(p);
         std::abort();
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n"));  // on_crash faulted before the marker
+    EXPECT_EQ(r.report, std::string(kPending));  // faulted before the marker
 }
 
-TEST(crash_reentrant_fault_in_on_crash_during_segv) {
+TEST(crash_reentrant_fault_in_crash_write_during_segv) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        fb.segv_in_on_crash = true;
-        tblog::install_crash_handler(&fb);
+        FakeSink *s = nullptr;
+        tblog::Pipeline *p = fake_pipeline(g_report_fd, "", &s);
+        s->segv_in_crash_write = true;
+        tblog::install_crash_handler(p);
         null_deref();
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n"));  // on_crash faulted before the marker
+    EXPECT_EQ(r.report, std::string(kPending));  // faulted before the marker
 }
 
 namespace {
@@ -297,21 +305,19 @@ TEST(crash_chains_to_previous_app_handler) {
         sa.sa_flags = SA_SIGINFO;
         sigemptyset(&sa.sa_mask);
         sigaction(SIGSEGV, &sa, nullptr);
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         null_deref();  // hardware fault: chained via re-execution
     });
     EXPECT_TRUE(WIFEXITED(r.status) && WEXITSTATUS(r.status) == 42);
-    EXPECT_EQ(r.report, "ON_CRASH\n" + expected_msg(SIGSEGV, "SIGSEGV") + "APP\n");
+    EXPECT_EQ(r.report, kPending + expected_msg(SIGSEGV, "SIGSEGV") + "APP\n");
 
     ChildResult r2 = run_child([] {
         signal(SIGFPE, app_plain_handler);
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         raise(SIGFPE);  // user-sent: chained via re-raise
     });
     EXPECT_TRUE(WIFEXITED(r2.status) && WEXITSTATUS(r2.status) == 43);
-    EXPECT_EQ(r2.report, "ON_CRASH\n" + expected_msg(SIGFPE, "SIGFPE") + "APP_PLAIN\n");
+    EXPECT_EQ(r2.report, kPending + expected_msg(SIGFPE, "SIGFPE") + "APP_PLAIN\n");
 }
 
 TEST(crash_uninstall_restores_previous_actions) {
@@ -319,8 +325,7 @@ TEST(crash_uninstall_restores_previous_actions) {
         signal(SIGFPE, app_plain_handler);  // others: SIG_DFL
         struct sigaction before[5], during, after;
         for (int i = 0; i < 5; ++i) sigaction(kCrashSignals[i], nullptr, &before[i]);
-        static FakeBackend fb(-1);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(-1));
         bool ok = true;
         for (int i = 0; i < 5; ++i) {
             sigaction(kCrashSignals[i], nullptr, &during);
@@ -343,8 +348,7 @@ TEST(crash_uninstall_restores_previous_actions) {
 
 TEST(crash_after_uninstall_not_reported) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         tblog::uninstall_crash_handler();
         null_deref();
     });
@@ -352,16 +356,14 @@ TEST(crash_after_uninstall_not_reported) {
     EXPECT_EQ(r.report, std::string(""));
 }
 
-TEST(crash_backend_replace_and_null) {
+TEST(crash_pipeline_replace_and_null) {
     ChildResult r = run_child([] {
-        static FakeBackend a(g_report_fd, "A:");
-        static FakeBackend b(g_report_fd, "B:");
-        tblog::install_crash_handler(&a);
-        tblog::install_crash_handler(&b);  // replace, must not self-chain
+        tblog::install_crash_handler(fake_pipeline(g_report_fd, "A:"));
+        tblog::install_crash_handler(fake_pipeline(g_report_fd, "B:"));  // replace, no self-chain
         null_deref();
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, "B:ON_CRASH\nB:" + expected_msg(SIGSEGV, "SIGSEGV"));
+    EXPECT_EQ(r.report, std::string("B:") + kPending + "B:" + expected_msg(SIGSEGV, "SIGSEGV"));
 
     ChildResult r2 = run_child([] {
         tblog::install_crash_handler(nullptr);
@@ -372,34 +374,65 @@ TEST(crash_backend_replace_and_null) {
     EXPECT_TRUE(contains(r2.err, expected_msg(SIGABRT, "SIGABRT")));
 }
 
-TEST(crash_fake_backend_records_into_buffer) {
-    // Check FakeBackend's fixed buffer + counter: the child reports them to
-    // the pipe from inside on_crash.
+TEST(crash_fake_sink_records_into_buffer) {
+    // Check FakeSink's fixed buffer + counter: the child reports them to the
+    // pipe from inside the handler, once the marker (2nd crash_write) is in.
     ChildResult r = run_child([] {
-        static FakeBackend fb(-1);
-        struct Reporter final : public tblog::Backend {
-            bool append(const char *, uint32_t, tblog_level) noexcept override { return true; }
-            void wait_for_work(std::chrono::milliseconds) override {}
-            void flush() override {}
-            void sync() override {}
-            bool consume_urgent() noexcept override { return false; }
-            void wake() noexcept override {}
-            void shutdown() override {}
-            uint64_t dropped() const noexcept override { return 0; }
-            // on_crash runs first, then crash_write: report once the marker is recorded.
-            void on_crash() noexcept override { fb.on_crash(); }
-            void crash_write(const char *d, size_t n) noexcept override {
-                fb.crash_write(d, n);
-                raw_write(g_report_fd, fb.buf, fb.buf_len);
-                raw_write(g_report_fd, fb.on_crash_count.load() == 1 ? "count=1\n" : "count?\n");
-            }
-        };
-        static Reporter rep;
-        tblog::install_crash_handler(&rep);
+        FakeSink *s = nullptr;
+        tblog::Pipeline *p = fake_pipeline(-1, "", &s);
+        s->report_on_marker = true;
+        tblog::install_crash_handler(p);
         raise(SIGFPE);
     });
     EXPECT_TRUE(died_with(r, SIGFPE));
-    EXPECT_EQ(r.report, expected_msg(SIGFPE, "SIGFPE") + "count=1\n");
+    EXPECT_EQ(r.report, kPending + expected_msg(SIGFPE, "SIGFPE") + "count=2\n");
+}
+
+TEST(crash_drains_into_every_crash_safe_sink_in_order) {
+    // Two crash-safe sinks and a non-crash-safe one: both crash-safe sinks
+    // get every buffered line (in order, whole) and then the marker; the
+    // other sink gets nothing from the handler.
+    ChildResult r = run_child([] {
+        tblog::QueueOptions qo;
+        tblog::Pipeline *p = new tblog::Pipeline(tblog::Queue::create(qo));
+        p->add_sink(std::unique_ptr<tblog::Sink>(new FakeSink(g_report_fd, "1:")));
+        struct Plain final : tblog::Sink {
+            void write(const char *, size_t) override {}
+            void crash_write(const char *, size_t) noexcept override {
+                raw_write(g_report_fd, "PLAIN?\n");
+            }
+        };
+        p->add_sink(std::unique_ptr<tblog::Sink>(new Plain));
+        p->add_sink(std::unique_ptr<tblog::Sink>(new FakeSink(g_report_fd, "2:")));
+        p->queue().append("one\n", 4, TBLOG_LV_INFO);
+        p->queue().append("two\n", 4, TBLOG_LV_INFO);
+        tblog::install_crash_handler(p);
+        null_deref();
+    });
+    EXPECT_TRUE(died_with(r, SIGSEGV));
+    const std::string m = expected_msg(SIGSEGV, "SIGSEGV");
+    EXPECT_EQ(r.report, "1:one\ntwo\n2:one\ntwo\n1:" + m + "2:" + m);
+}
+
+TEST(crash_console_sink_gets_lines_then_marker_once) {
+    // The console sink is crash-safe: buffered lines reach stderr, followed by
+    // the marker, which is then not printed a second time.
+    ChildResult r = run_child([] {
+        tblog::QueueOptions qo;
+        tblog::Pipeline *p = new tblog::Pipeline(tblog::Queue::create(qo));
+        p->add_sink(tblog::make_console_sink(true));  // stderr is a file: no colour
+        p->queue().append("a [INFO] one\n", 13, TBLOG_LV_INFO);
+        p->queue().append("b [ERROR] two\n", 14, TBLOG_LV_ERROR);
+        tblog::install_crash_handler(p);
+        null_deref();
+    });
+    EXPECT_TRUE(died_with(r, SIGSEGV));
+    const std::string m = expected_msg(SIGSEGV, "SIGSEGV");
+    EXPECT_EQ(r.err.substr(0, 27 + m.size()), "a [INFO] one\nb [ERROR] two\n" + m);
+    size_t count = 0;
+    for (size_t pos = 0; (pos = r.err.find("caught signal", pos)) != std::string::npos; ++pos)
+        ++count;
+    EXPECT_EQ(count, size_t(1));
 }
 
 namespace {
@@ -423,20 +456,18 @@ void *segv_thread(void *) {
 
 TEST(crash_in_other_thread_reported) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         pthread_t t;
         pthread_create(&t, nullptr, segv_thread, nullptr);
         pthread_join(t, nullptr);
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n") + expected_msg(SIGSEGV, "SIGSEGV"));
+    EXPECT_EQ(r.report, std::string(kPending) + expected_msg(SIGSEGV, "SIGSEGV"));
 }
 
 TEST(crash_stack_overflow_in_thread_with_altstack) {
     ChildResult r = run_child([] {
-        static FakeBackend fb(g_report_fd);
-        tblog::install_crash_handler(&fb);
+        tblog::install_crash_handler(fake_pipeline(g_report_fd));
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 256 * 1024);
@@ -445,7 +476,7 @@ TEST(crash_stack_overflow_in_thread_with_altstack) {
         pthread_join(t, nullptr);
     });
     EXPECT_TRUE(died_with(r, SIGSEGV));
-    EXPECT_EQ(r.report, std::string("ON_CRASH\n") + expected_msg(SIGSEGV, "SIGSEGV"));
+    EXPECT_EQ(r.report, std::string(kPending) + expected_msg(SIGSEGV, "SIGSEGV"));
 }
 
 // ============================================================ console sink

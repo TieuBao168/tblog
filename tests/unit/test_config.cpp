@@ -65,7 +65,7 @@ TEST(full_example) {
     c.level = TBLOG_LV_TRACE;  // make sure values are actually assigned
     c.console = true;
     c.reload_watch = false;
-    c.file.urgent_level = TBLOG_LV_FATAL;
+    c.urgent_level = TBLOG_LV_FATAL;
     std::vector<std::string> w;
     EXPECT_TRUE(parse_config_string(kExample, c, &w));
     EXPECT_EQ(w.size(), size_t(0));
@@ -78,7 +78,7 @@ TEST(full_example) {
     EXPECT_TRUE(c.full_policy == FullPolicy::Drop);
     EXPECT_EQ(c.flush_interval_ms, 200u);
     EXPECT_EQ(c.sync_interval_ms, 1000u);
-    EXPECT_EQ(int(c.file.urgent_level), int(TBLOG_LV_ERROR));
+    EXPECT_EQ(int(c.urgent_level), int(TBLOG_LV_ERROR));
     EXPECT_FALSE(c.console);
     ASSERT_TRUE(c.module_levels.size() == 1);
     EXPECT_EQ(c.module_levels[0].first, std::string("network"));
@@ -239,7 +239,7 @@ TEST(invalid_values_keep_previous) {
     EXPECT_TRUE(c.full_policy == before.full_policy);
     EXPECT_EQ(c.flush_interval_ms, before.flush_interval_ms);
     EXPECT_EQ(c.sync_interval_ms, before.sync_interval_ms);
-    EXPECT_EQ(int(c.file.urgent_level), int(before.file.urgent_level));
+    EXPECT_EQ(int(c.urgent_level), int(before.urgent_level));
     EXPECT_EQ(c.console, before.console);
     EXPECT_EQ(c.console_color, before.console_color);
     EXPECT_EQ(c.syslog, before.syslog);
@@ -522,6 +522,40 @@ TEST(validate_normalises_out_of_range_fields) {
     w.clear();
     EXPECT_TRUE(validate_config(c, &w));
     EXPECT_EQ(c.sync_interval_ms, 0u);
+}
+
+TEST(file_key) {
+    Config c;
+    EXPECT_TRUE(c.file_enabled);  // default: log file on
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string("file = false\n", c, &w));
+    EXPECT_FALSE(c.file_enabled);
+    EXPECT_TRUE(parse_config_string("file = on\n", c, &w));
+    EXPECT_TRUE(c.file_enabled);
+    EXPECT_FALSE(parse_config_string("file = maybe\n", c, &w));  // keeps previous
+    EXPECT_TRUE(c.file_enabled);
+    EXPECT_TRUE(any_contains(w, "invalid boolean"));
+}
+
+TEST(validate_file_false_needs_another_sink) {
+    std::vector<std::string> w;
+    Config c;
+    c.file_enabled = false;  // and no console / syslog / user sink
+    EXPECT_FALSE(validate_config(c, &w));
+    EXPECT_TRUE(c.console);
+    EXPECT_EQ(w.size(), size_t(1));
+    EXPECT_TRUE(any_contains(w, "enabling console"));
+
+    for (int k = 0; k < 3; ++k) {  // console, syslog or a user sink: fine
+        Config d;
+        d.file_enabled = false;
+        if (k == 0) d.console = true;
+        if (k == 1) d.syslog = true;
+        w.clear();
+        EXPECT_TRUE(validate_config(d, &w, k == 2 ? 1 : 0));
+        EXPECT_EQ(w.size(), size_t(0));
+        EXPECT_EQ(d.console, k == 0);
+    }
 }
 
 TINY_TEST_MAIN()

@@ -88,7 +88,7 @@ $(BUILD)/libtblog.so: $(BUILD)/$(SONAME)
 # Public headers are prerequisites so header-only changes rebuild the tests.
 PUBLIC_HDRS := $(wildcard include/tblog/*.h include/tblog/*.hpp include/tblog/detail/*.hpp)
 
-$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) tests/tiny_test.h $(PUBLIC_HDRS) $(LIB_HDRS)
+$(BUILD)/tests/%: tests/unit/%.cpp $(LIB) $(wildcard tests/*.h) $(PUBLIC_HDRS) $(LIB_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -Itests $< $(LIB) $(LDFLAGS) -o $@
 

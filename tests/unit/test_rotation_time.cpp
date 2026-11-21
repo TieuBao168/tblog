@@ -1,11 +1,11 @@
 // Tests for time-based rotation (file.rotate = daily|hourly), retention and
-// gzip compression of rotated files (src/backend/archiver.*), for RotatingFile
-// and the double-buffer backend. Compression tests need a zlib build
+// gzip compression of rotated files (src/sinks/archiver.*), for RotatingFile
+// and the Queue + FileSink pipeline. Compression tests need a zlib build
 // (TBLOG_HAVE_ZLIB). Time is injected through FileOptions::now_fn; TZ is
 // forced to UTC so expected names are fixed.
-#include "backend/archiver.h"
-#include "backend/backend.h"
-#include "backend/rotating_file.h"
+#include "pipeline_util.h"
+#include "sinks/archiver.h"
+#include "sinks/rotating_file.h"
 #include "tiny_test.h"
 
 #include <algorithm>
@@ -192,17 +192,17 @@ FileOptions file_opts(const std::string &dir, RotateMode mode, CompressMode cm,
     return o;
 }
 
-// Backend worker stand-in that counts its cycles.
+// Worker loop stand-in (wait -> drain) that counts its cycles.
 struct Worker {
-    Backend *b;
+    Pipeline *b;
     std::atomic<bool> stop{false};
     std::atomic<uint64_t> cycles{0};
     std::thread th;
-    explicit Worker(Backend *be) : b(be) {
+    explicit Worker(Pipeline *be) : b(be) {
         th = std::thread([this] {
             while (!stop.load()) {
-                b->wait_for_work(std::chrono::milliseconds(2));
-                b->flush();
+                b->queue().wait_for_work(std::chrono::milliseconds(2));
+                b->drain();
                 cycles.fetch_add(1);
             }
         });
@@ -215,7 +215,7 @@ struct Worker {
     void halt() {
         if (!th.joinable()) return;
         stop = true;
-        b->wake();
+        b->queue().wake();
         th.join();
     }
 };
@@ -226,13 +226,13 @@ struct Writers {
     std::vector<std::thread> ths;
     std::vector<int> count;
     std::atomic<bool> stop{false};
-    Writers(Backend *b, int T, int max_lines) : count((size_t)T, 0) {
+    Writers(Pipeline *b, int T, int max_lines) : count((size_t)T, 0) {
         for (int t = 0; t < T; ++t)
             ths.emplace_back([this, b, t, max_lines] {
                 for (int s = 0; s < max_lines && !stop.load(); ++s) {
                     int p = (int)((g_now.load() - kBase) / kDay);
                     std::string l = make_line(t, s, p);
-                    if (!b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO)) break;
+                    if (!b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO)) break;
                     count[(size_t)t] = s + 1;
                     if (s % 64 == 63) std::this_thread::sleep_for(std::chrono::microseconds(50));
                 }
@@ -572,38 +572,38 @@ TEST(compress_without_zlib_is_disabled) {
 }
 #endif
 
-// ------------------------------------------------------------ double buffer backend
-TEST(dbuf_time_rotation) {
-    std::string d = fresh_dir("dbuf_time");
+// ------------------------------------------------------------ Queue + FileSink pipeline
+TEST(pipeline_time_rotation) {
+    std::string d = fresh_dir("pl_time");
     g_now = kBase + 100;
-    BufferOptions o;
+    PipeOptions o;
     o.file = file_opts(d, RotateMode::Daily, CompressMode::None);
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     std::string a = make_line(0, 0, 0), c = make_line(0, 1, 1);
-    b->append(a.data(), (uint32_t)a.size(), TBLOG_LV_INFO);
-    b->flush();  // written during day 0
+    b->queue().append(a.data(), (uint32_t)a.size(), TBLOG_LV_INFO);
+    b->drain();  // written during day 0
     g_now = kBase + kDay + 1;
-    b->flush();  // the worker notices the new day
-    b->append(c.data(), (uint32_t)c.size(), TBLOG_LV_INFO);
+    b->drain();  // the worker notices the new day
+    b->queue().append(c.data(), (uint32_t)c.size(), TBLOG_LV_INFO);
     b->shutdown();
     EXPECT_EQ(read_file(d + "/app.2030-01-01.log"), a);
     EXPECT_EQ(read_file(d + "/app.log"), c);
 }
 
 namespace {
-std::unique_ptr<Backend> make_v1(const std::string &d, CompressMode cm, uint64_t max_size) {
-    BufferOptions o;
+std::unique_ptr<Pipeline> make_daily(const std::string &d, CompressMode cm, uint64_t max_size) {
+    PipeOptions o;
     o.file = file_opts(d, RotateMode::Daily, cm, max_size);
     o.buffer_size = 256u << 10;
     o.policy = FullPolicy::Block;
-    return make_double_buffer_backend(o);
+    return make_pipe(o);
 }
 
 // Quiesced phases: lines of day k are all appended (by T threads) and taken
 // by the worker before the clock moves to day k + 1, so every file must hold
 // exactly its own day's lines.
-void run_exact(Backend *b, const std::string &d, int days, int S = 1500 / kScale) {
+void run_exact(Pipeline *b, const std::string &d, int days, int S = 1500 / kScale) {
     const int T = 4;
     std::vector<int> count((size_t)T, 0);
     {
@@ -617,7 +617,7 @@ void run_exact(Backend *b, const std::string &d, int days, int S = 1500 / kScale
                 ths.emplace_back([&, t] {
                     for (int s = s0; s < s0 + S; ++s) {
                         std::string l = make_line(t, s, day);
-                        b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+                        b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
                     }
                 });
             for (auto &th : ths) th.join();
@@ -628,12 +628,12 @@ void run_exact(Backend *b, const std::string &d, int days, int S = 1500 / kScale
         for (auto &c : count) c = s0;
     }
     b->shutdown();
-    EXPECT_EQ(b->dropped(), 0ull);
+    EXPECT_EQ(b->queue().dropped(), 0ull);
     EXPECT_EQ(check_rollover(d, count, days - 1, true), days);
 }
 
 // Writers run continuously while the day changes several times.
-void run_concurrent(Backend *b, const std::string &d) {
+void run_concurrent(Pipeline *b, const std::string &d) {
     const int T = 4, days = 4;
     {
         Worker w(b);
@@ -648,7 +648,7 @@ void run_concurrent(Backend *b, const std::string &d) {
         writers.join();
         w.halt();
         b->shutdown();
-        EXPECT_EQ(b->dropped(), 0ull);
+        EXPECT_EQ(b->queue().dropped(), 0ull);
         int total = 0;
         for (int c : writers.count) total += c;
         std::printf("  %d lines over %d days\n", total, days);
@@ -657,28 +657,28 @@ void run_concurrent(Backend *b, const std::string &d) {
 }
 }  // namespace
 
-TEST(v1_rollover_exact) {
-    std::string d = fresh_dir("v1_exact");
+TEST(pipeline_rollover_exact) {
+    std::string d = fresh_dir("pl_exact");
     g_now = kBase;
-    auto b = make_v1(d, CompressMode::None, 1ull << 30);
+    auto b = make_daily(d, CompressMode::None, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     run_exact(b.get(), d, 3);
 }
 
-TEST(v1_rollover_concurrent) {
-    std::string d = fresh_dir("v1_conc");
+TEST(pipeline_rollover_concurrent) {
+    std::string d = fresh_dir("pl_conc");
     g_now = kBase;
-    auto b = make_v1(d, CompressMode::None, 1ull << 30);
+    auto b = make_daily(d, CompressMode::None, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     run_concurrent(b.get(), d);
 }
 
 // max_size (64 KB) caps files inside a day: app.<day>.log, app.<day>.1.log,
 // ... with only that day's lines.
-TEST(v1_size_and_time_naming) {
-    std::string d = fresh_dir("v1_size_time");
+TEST(pipeline_size_and_time_naming) {
+    std::string d = fresh_dir("pl_size_time");
     g_now = kBase;
-    auto b = make_v1(d, CompressMode::None, 64u << 10);
+    auto b = make_daily(d, CompressMode::None, 64u << 10);
     ASSERT_TRUE(b != nullptr);
     run_exact(b.get(), d, 2, 1500);  // ~270 KB a day
     auto files = list_dir(d);
@@ -693,10 +693,10 @@ TEST(v1_size_and_time_naming) {
 }
 
 #ifdef TBLOG_HAVE_ZLIB
-TEST(v1_size_and_time_compressed) {
-    std::string d = fresh_dir("v1_size_time_gz");
+TEST(pipeline_size_and_time_compressed) {
+    std::string d = fresh_dir("pl_size_time_gz");
     g_now = kBase;
-    auto b = make_v1(d, CompressMode::Gzip, 64u << 10);
+    auto b = make_daily(d, CompressMode::Gzip, 64u << 10);
     ASSERT_TRUE(b != nullptr);
     const int T = 2, S = 2000;  // ~160 KB
     std::string day0;
@@ -705,13 +705,13 @@ TEST(v1_size_and_time_compressed) {
         for (int s = 0; s < S; ++s)
             for (int t = 0; t < T; ++t) {
                 std::string l = make_line(t, s, 0);
-                b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+                b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
             }
         w.wait_cycles(2);
         g_now = kBase + kDay;
         w.wait_cycles(2);
         std::string l = make_line(0, S, 1);
-        b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+        b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
         w.halt();
     }
     b->shutdown();  // waits for the compressions
@@ -737,10 +737,10 @@ TEST(v1_size_and_time_compressed) {
     EXPECT_TRUE(std::find(files.begin(), files.end(), "app.2030-01-01.1.log.gz") != files.end());
 }
 
-TEST(v1_compress_roundtrip) {
-    std::string d = fresh_dir("v1_gz");
+TEST(pipeline_compress_roundtrip) {
+    std::string d = fresh_dir("pl_gz");
     g_now = kBase + 77;
-    auto b = make_v1(d, CompressMode::Gzip, 1ull << 30);
+    auto b = make_daily(d, CompressMode::Gzip, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     std::string day0, day1;
     {
@@ -748,7 +748,7 @@ TEST(v1_compress_roundtrip) {
         for (int s = 0; s < 3000 / kScale; ++s) {
             std::string l = make_line(1, s, 0);
             day0 += l;
-            b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+            b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
         }
         w.wait_cycles(2);
         g_now = kBase + kDay + 3;
@@ -756,7 +756,7 @@ TEST(v1_compress_roundtrip) {
         for (int s = 0; s < 100; ++s) {
             std::string l = make_line(2, s, 1);
             day1 += l;
-            b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+            b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
         }
         w.halt();
     }
@@ -767,15 +767,15 @@ TEST(v1_compress_roundtrip) {
     EXPECT_TRUE(read_file(d + "/app.log") == day1);
 }
 
-TEST(v1_restart_rotates_stale_live_file) {
-    std::string d = fresh_dir("v1_restart");
+TEST(pipeline_restart_rotates_stale_live_file) {
+    std::string d = fresh_dir("pl_restart");
     write_file(d + "/app.log", fixed_line(1));
     set_mtime(d + "/app.log", kBase - kDay + 5);  // 2029-12-31
     g_now = kBase + 50;
-    auto b = make_v1(d, CompressMode::Gzip, 1ull << 30);
+    auto b = make_daily(d, CompressMode::Gzip, 1ull << 30);
     ASSERT_TRUE(b != nullptr);
     std::string l = fixed_line(2);
-    b->append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
+    b->queue().append(l.data(), (uint32_t)l.size(), TBLOG_LV_INFO);
     b->shutdown();
     std::vector<std::string> expect = {"app.2029-12-31.log.gz", "app.log"};
     EXPECT_TRUE(list_dir(d) == expect);

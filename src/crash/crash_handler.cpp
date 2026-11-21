@@ -3,12 +3,13 @@
 // re-raise are the platform's (pf::crash_install, src/platform/<os>/crash.cpp).
 //
 // report_crash() runs inside the fatal-signal handler: everything reachable
-// from it must be async-signal-safe (atomics, pf::stderr_write, the
-// backend's on_crash/crash_write). No malloc, no locks, no stdio.
+// from it must be async-signal-safe (atomics, pf::stderr_write,
+// Pipeline::crash -> Queue::crash_drain + Sink::crash_write). No malloc, no
+// locks, no stdio.
 #include "crash/crash_handler.h"
 
-#include "backend/backend.h"
 #include "core/compat.h"
+#include "logger/pipeline.h"
 #include "platform/platform.h"
 
 #include <atomic>
@@ -19,9 +20,9 @@ namespace tblog {
 
 namespace {
 
-TBLOG_ASSERT_LOCK_FREE(Backend *);
+TBLOG_ASSERT_LOCK_FREE(Pipeline *);
 
-std::atomic<Backend *> g_backend{nullptr};
+std::atomic<Pipeline *> g_pipeline{nullptr};
 std::atomic<bool> g_installed{false};
 std::mutex g_mu;  // install/uninstall only (never in the handler)
 
@@ -52,22 +53,22 @@ void report_crash(int sig, const char *name) {
     n = append_str(msg, n, sizeof(msg), name);
     n = append_str(msg, n, sizeof(msg), ") ***\n");
 
-    pf::stderr_write(msg, n);
-    if (Backend *b = g_backend.load(std::memory_order_acquire)) {
-        // Drain buffered lines first so the marker lands after them in the file.
-        b->on_crash();
-        b->crash_write(msg, n);
-    }
+    Pipeline *p = g_pipeline.load(std::memory_order_acquire);
+    // With a crash-safe console sink the marker reaches stderr through it,
+    // after the drained lines; otherwise print it first.
+    if (!p || !p->crash_covers_stderr()) pf::stderr_write(msg, n);
+    // Drain buffered lines first so the marker lands after them in each sink.
+    if (p) p->crash(msg, n);
 }
 
 }  // namespace
 
 bool crash_altstack_for_this_thread() { return pf::crash_thread_init(); }
 
-void install_crash_handler(Backend *backend) {
+void install_crash_handler(Pipeline *pipeline) {
     std::lock_guard<std::mutex> lk(g_mu);
-    g_backend.store(backend, std::memory_order_release);
-    if (g_installed.load(std::memory_order_relaxed)) return;  // just swap backend
+    g_pipeline.store(pipeline, std::memory_order_release);
+    if (g_installed.load(std::memory_order_relaxed)) return;  // just swap pipeline
     pf::crash_install(&report_crash);
     g_installed.store(true, std::memory_order_release);
 }
@@ -75,11 +76,11 @@ void install_crash_handler(Backend *backend) {
 void uninstall_crash_handler() {
     std::lock_guard<std::mutex> lk(g_mu);
     if (!g_installed.load(std::memory_order_relaxed)) {
-        g_backend.store(nullptr, std::memory_order_release);
+        g_pipeline.store(nullptr, std::memory_order_release);
         return;
     }
     pf::crash_uninstall();
-    g_backend.store(nullptr, std::memory_order_release);
+    g_pipeline.store(nullptr, std::memory_order_release);
     g_installed.store(false, std::memory_order_release);
 }
 

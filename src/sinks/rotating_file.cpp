@@ -1,4 +1,4 @@
-#include "backend/rotating_file.h"
+#include "sinks/rotating_file.h"
 
 #include "core/compat.h"
 

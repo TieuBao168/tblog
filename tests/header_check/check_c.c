@@ -9,12 +9,26 @@
 
 int tblog_header_check_c(const char *conf, size_t n);
 
+static void check_sink_write(void *ctx, const char *data, size_t len) {
+    size_t *total = (size_t *)ctx;
+    *total += len;
+    (void)data;
+}
+
+static void check_sink_flush(void *ctx) { (void)ctx; }
+
+static size_t g_check_sink_bytes;
+
 int tblog_header_check_c(const char *conf, size_t n) {
     tblog_module *net;
     tblog_level lv;
     uint64_t dropped;
     long long big = -1;
+    tblog_sink_write_fn wfn = check_sink_write;
+    tblog_sink_flush_fn ffn = check_sink_flush;
 
+    if (tblog_add_sink(wfn, ffn, &g_check_sink_bytes) != 0) return 3;
+    if (tblog_add_sink(check_sink_write, NULL, &g_check_sink_bytes) != 0) return 4;
     if (tblog_init(conf) != 0) return 1;
     tblog_set_level(NULL, TBLOG_LV_INFO);
     tblog_set_level("net", TBLOG_LV_DEBUG);

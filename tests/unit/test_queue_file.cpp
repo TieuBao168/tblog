@@ -1,6 +1,11 @@
-// Tests for the file storage: RotatingFile and the double-buffer backend.
-#include "backend/backend.h"
-#include "backend/rotating_file.h"
+// Tests for the queue and the file output: RotatingFile, Queue (sharded double
+// buffers: ordering, drop / block, urgent wake-up, take / release, crash
+// drain) and the Pipeline that feeds the FileSink and other sinks from it.
+#include "logger/pipeline.h"
+#include "pipeline_util.h"
+#include "queue/queue.h"
+#include "sinks/file_sink.h"
+#include "sinks/rotating_file.h"
 #include "sinks/sink.h"
 #include "tiny_test.h"
 
@@ -10,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -64,7 +70,7 @@ static std::string base_dir() {
 struct TempDir {
     std::string path;
     explicit TempDir(const char *name) {
-        path = base_dir() + "/backend_v1_" + std::to_string(getpid()) + "_" + name;
+        path = base_dir() + "/queue_file_" + std::to_string(getpid()) + "_" + name;
         std::error_code ec;
         fs::remove_all(path, ec);
     }
@@ -130,22 +136,22 @@ static bool parse_line(const std::string &l, int *t, int *seq) {
 
 // Worker loop as the logger would run it.
 struct Worker {
-    Backend *b;
+    Pipeline *b;
     std::atomic<bool> stop{false};
     std::thread th;
-    explicit Worker(Backend *be, int delay_ms = 0) : b(be) {
+    explicit Worker(Pipeline *be, int delay_ms = 0) : b(be) {
         th = std::thread([this, delay_ms] {
             if (delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             while (!stop.load()) {
-                b->wait_for_work(std::chrono::milliseconds(20));
-                b->flush();
-                if (b->consume_urgent()) b->sync();
+                b->queue().wait_for_work(std::chrono::milliseconds(20));
+                b->drain();
+                if (b->queue().consume_urgent()) b->sync();
             }
         });
     }
     void join() {
         stop = true;
-        b->wake();
+        b->queue().wake();
         th.join();
     }
 };
@@ -291,9 +297,10 @@ TEST(rotating_open_failure) {
     o.path = d.file("blocker/app.log");  // parent is a regular file
     std::fprintf(stderr, "(expected error follows)\n");
     EXPECT_FALSE(rf.open(o));
-    BufferOptions bo;
-    bo.file = o;
-    EXPECT_TRUE(make_double_buffer_backend(bo) == nullptr);
+    EXPECT_TRUE(make_file_sink(o) == nullptr);
+    PipeOptions po;
+    po.file = o;
+    EXPECT_TRUE(make_pipe(po) == nullptr);
 }
 
 TEST(rotating_write_error_counts_loss) {
@@ -310,12 +317,12 @@ TEST(rotating_write_error_counts_loss) {
 // ---------------------------------------------------------------- double buffer
 static void run_mt_test(FullPolicy policy, size_t bufsize, int T, int N, bool expect_all) {
     TempDir d(policy == FullPolicy::Block ? "mt_block" : "mt_drop");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.file.max_size = 1ull << 40;
     o.buffer_size = bufsize;
     o.policy = policy;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     Worker w(b.get());
     std::atomic<long> ok{0};
@@ -326,7 +333,7 @@ static void run_mt_test(FullPolicy policy, size_t bufsize, int T, int N, bool ex
             long mine = 0;
             for (int i = 0; i < N; ++i) {
                 int n = make_line(line, t, i);
-                if (b->append(line, n, TBLOG_LV_INFO)) ++mine;
+                if (b->queue().append(line, n, TBLOG_LV_INFO)) ++mine;
             }
             ok += mine;
         });
@@ -336,63 +343,63 @@ static void run_mt_test(FullPolicy policy, size_t bufsize, int T, int N, bool ex
     uint64_t reported = 0;
     long good = verify_lines(read_file(o.file.path), T, N, expect_all, &reported);
     EXPECT_EQ(good, ok.load());
-    EXPECT_EQ(static_cast<uint64_t>(good) + b->dropped(), static_cast<uint64_t>(T) * N);
-    EXPECT_EQ(reported, b->dropped());
-    if (expect_all) EXPECT_EQ(b->dropped(), 0ull);
+    EXPECT_EQ(static_cast<uint64_t>(good) + b->queue().dropped(), static_cast<uint64_t>(T) * N);
+    EXPECT_EQ(reported, b->queue().dropped());
+    if (expect_all) EXPECT_EQ(b->queue().dropped(), 0ull);
     std::printf("  policy=%s buf=%zu: %ld lines written, %llu dropped\n",
                 policy == FullPolicy::Block ? "block" : "drop", bufsize, good,
-                static_cast<unsigned long long>(b->dropped()));
+                static_cast<unsigned long long>(b->queue().dropped()));
 }
 
-TEST(dbuf_8_threads_all_lines_intact_block) {
+TEST(queue_8_threads_all_lines_intact_block) {
     run_mt_test(FullPolicy::Block, 256 << 10, 8, 50000 / kScale, true);
 }
 
-TEST(dbuf_8_threads_drop_accounting) {
+TEST(queue_8_threads_drop_accounting) {
     // Small buffer so drops are likely; every surviving line must be intact and
     // survivors + dropped == total, and the "N lines dropped" notes must add up.
     run_mt_test(FullPolicy::Drop, 16 << 10, 8, 50000 / kScale, false);
 }
 
-TEST(dbuf_drop_policy_stalled_worker) {
+TEST(queue_drop_policy_stalled_worker) {
     TempDir d("drop");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.buffer_size = 4096;
     o.policy = FullPolicy::Drop;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     // Sharded: a single thread always uses one shard, whose capacity is
     // max(64 KB, 4096 / N) = 64 KB = 1024 lines of 64 bytes.
     std::string line(63, 'z');
     line.push_back('\n');
     int ok = 0;
-    for (int i = 0; i < 3000; ++i) ok += b->append(line.data(), 64, TBLOG_LV_INFO);
+    for (int i = 0; i < 3000; ++i) ok += b->queue().append(line.data(), 64, TBLOG_LV_INFO);
     EXPECT_EQ(ok, 1024);
-    EXPECT_EQ(b->dropped(), 1976ull);
+    EXPECT_EQ(b->queue().dropped(), 1976ull);
     // Too long to ever fit -> dropped even under Block.
     std::string huge(70000, 'h');
-    EXPECT_FALSE(b->append(huge.data(), static_cast<uint32_t>(huge.size()), TBLOG_LV_INFO));
-    EXPECT_EQ(b->dropped(), 1977ull);
-    b->flush();
+    EXPECT_FALSE(b->queue().append(huge.data(), static_cast<uint32_t>(huge.size()), TBLOG_LV_INFO));
+    EXPECT_EQ(b->queue().dropped(), 1977ull);
+    b->drain();
     std::string expect;
     for (int i = 0; i < 1024; ++i) expect += line;
     expect += "tblog: 1977 lines dropped\n";
     EXPECT_TRUE(read_file(o.file.path) == expect);
-    b->flush();  // nothing new: no second drop note
+    b->drain();  // nothing new: no second drop note
     EXPECT_TRUE(read_file(o.file.path) == expect);
-    EXPECT_TRUE(b->append(line.data(), 64, TBLOG_LV_INFO));
+    EXPECT_TRUE(b->queue().append(line.data(), 64, TBLOG_LV_INFO));
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == expect + line);
 }
 
-TEST(dbuf_block_policy_loses_nothing) {
+TEST(queue_block_policy_loses_nothing) {
     TempDir d("block");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.buffer_size = 4096;
     o.policy = FullPolicy::Block;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     Worker w(b.get(), 200);  // stalled at first: producers must block
     const int T = 4, N = 20000 / kScale;
@@ -402,23 +409,23 @@ TEST(dbuf_block_policy_loses_nothing) {
             char line[128];
             for (int i = 0; i < N; ++i) {
                 int n = make_line(line, t, i);
-                EXPECT_TRUE(b->append(line, n, TBLOG_LV_INFO));
+                EXPECT_TRUE(b->queue().append(line, n, TBLOG_LV_INFO));
             }
         });
     for (auto &x : th) x.join();
     w.join();
     b->shutdown();
-    EXPECT_EQ(b->dropped(), 0ull);
+    EXPECT_EQ(b->queue().dropped(), 0ull);
     EXPECT_EQ(verify_lines(read_file(o.file.path), T, N, true), static_cast<long>(T * N));
 }
 
-TEST(dbuf_block_released_by_shutdown) {
+TEST(queue_block_released_by_shutdown) {
     TempDir d("blockshut");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.buffer_size = 128;
     o.policy = FullPolicy::Block;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     std::string line(63, 'q');
     line.push_back('\n');
@@ -427,9 +434,9 @@ TEST(dbuf_block_released_by_shutdown) {
     std::atomic<int> res{-1};
     std::thread t([&] {
         int n = 0;
-        for (int i = 0; i < 1024; ++i) n += b->append(line.data(), 64, TBLOG_LV_INFO);
+        for (int i = 0; i < 1024; ++i) n += b->queue().append(line.data(), 64, TBLOG_LV_INFO);
         filled = n;
-        res = b->append(line.data(), 64, TBLOG_LV_INFO);  // blocks
+        res = b->queue().append(line.data(), 64, TBLOG_LV_INFO);  // blocks
     });
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     EXPECT_EQ(filled.load(), 1024);
@@ -440,65 +447,65 @@ TEST(dbuf_block_released_by_shutdown) {
     EXPECT_EQ(fs::file_size(o.file.path), 65536u);
 }
 
-TEST(dbuf_urgent_and_notify) {
+TEST(queue_urgent_and_notify) {
     TempDir d("urgent");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.buffer_size = 1000;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     using clk = std::chrono::steady_clock;
     std::string line(99, 'u');
     line.push_back('\n');
 
     // Below 75%: no notification, wait_for_work times out.
-    EXPECT_TRUE(b->append(line.data(), 100, TBLOG_LV_INFO));
+    EXPECT_TRUE(b->queue().append(line.data(), 100, TBLOG_LV_INFO));
     auto t0 = clk::now();
-    b->wait_for_work(std::chrono::milliseconds(100));
+    b->queue().wait_for_work(std::chrono::milliseconds(100));
     EXPECT_TRUE(clk::now() - t0 >= std::chrono::milliseconds(90));
-    EXPECT_FALSE(b->consume_urgent());
+    EXPECT_FALSE(b->queue().consume_urgent());
 
     // Urgent line: flag + immediate wake.
-    EXPECT_TRUE(b->append(line.data(), 100, TBLOG_LV_ERROR));
+    EXPECT_TRUE(b->queue().append(line.data(), 100, TBLOG_LV_ERROR));
     t0 = clk::now();
-    b->wait_for_work(std::chrono::seconds(5));
+    b->queue().wait_for_work(std::chrono::seconds(5));
     EXPECT_TRUE(clk::now() - t0 < std::chrono::seconds(1));
-    EXPECT_TRUE(b->consume_urgent());
-    EXPECT_FALSE(b->consume_urgent());
-    b->flush();
+    EXPECT_TRUE(b->queue().consume_urgent());
+    EXPECT_FALSE(b->queue().consume_urgent());
+    b->drain();
 
     // >= 75% of the (64 KB) shard: wake without urgency.
-    for (int i = 0; i < 500; ++i) EXPECT_TRUE(b->append(line.data(), 100, TBLOG_LV_DEBUG));
+    for (int i = 0; i < 500; ++i) EXPECT_TRUE(b->queue().append(line.data(), 100, TBLOG_LV_DEBUG));
     t0 = clk::now();
-    b->wait_for_work(std::chrono::seconds(5));
+    b->queue().wait_for_work(std::chrono::seconds(5));
     EXPECT_TRUE(clk::now() - t0 < std::chrono::seconds(1));
-    EXPECT_FALSE(b->consume_urgent());
+    EXPECT_FALSE(b->queue().consume_urgent());
 
     // Notify from another thread while the worker sleeps.
-    b->flush();
+    b->drain();
     std::thread p([&] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        b->append(line.data(), 100, TBLOG_LV_FATAL);
+        b->queue().append(line.data(), 100, TBLOG_LV_FATAL);
     });
     t0 = clk::now();
-    b->wait_for_work(std::chrono::seconds(5));
+    b->queue().wait_for_work(std::chrono::seconds(5));
     EXPECT_TRUE(clk::now() - t0 < std::chrono::seconds(1));
     p.join();
     b->shutdown();
     EXPECT_EQ(fs::file_size(o.file.path), 50300u);
 }
 
-TEST(dbuf_rotation) {
-    TempDir d("dbuf_rot");
-    BufferOptions o;
+TEST(queue_rotation) {
+    TempDir d("queue_rot");
+    PipeOptions o;
     o.file.path = d.file("rot.log");
     o.file.max_size = 1000;
     o.file.max_files = 2;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     for (int i = 0; i < 25; ++i) {
         std::string l = fixed_line(i);
-        EXPECT_TRUE(b->append(l.data(), static_cast<uint32_t>(l.size()), TBLOG_LV_INFO));
+        EXPECT_TRUE(b->queue().append(l.data(), static_cast<uint32_t>(l.size()), TBLOG_LV_INFO));
     }
     b->shutdown();
     EXPECT_EQ(fs::file_size(d.file("rot.log")), 500u);
@@ -507,125 +514,360 @@ TEST(dbuf_rotation) {
     EXPECT_EQ(read_file(d.file("rot.log")).substr(0, 5), std::string("L0020"));
 }
 
-TEST(dbuf_shutdown_idempotent) {
+TEST(queue_shutdown_idempotent) {
     TempDir d("shutdown");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
-    EXPECT_TRUE(b->append("last words\n", 11, TBLOG_LV_INFO));
+    EXPECT_TRUE(b->queue().append("last words\n", 11, TBLOG_LV_INFO));
     b->shutdown();
     b->shutdown();
-    EXPECT_FALSE(b->append("too late\n", 9, TBLOG_LV_INFO));
-    b->flush();
+    EXPECT_FALSE(b->queue().append("too late\n", 9, TBLOG_LV_INFO));
+    b->drain();
+    b->drain(true);
     b->sync();
-    b->wake();
-    b->wait_for_work(std::chrono::milliseconds(1));
-    b->on_crash();  // fd closed: no-op
-    b->crash_write("x\n", 2);
+    b->queue().wake();
+    b->queue().wait_for_work(std::chrono::milliseconds(1));
+    b->queue().close();
+    b->crash("x\n", 2);  // file closed: no-op
+    b->crash(nullptr, 0);
     b.reset();  // destructor after shutdown
     EXPECT_EQ(read_file(o.file.path), std::string("last words\n"));
 }
 
-struct CaptureSink : Sink {
+// What a CaptureSink saw. Owned by the test (the pipeline owns the sink).
+struct Capture {
     std::string data;
+    std::string events;  // B = begin_batch, W = write, E = end_batch, F = flush, S = shutdown
     int flushes = 0;
-    Backend *crash_from_write = nullptr;
-    void write(const char *d, size_t n) override {
-        data.append(d, n);
-        if (crash_from_write) crash_from_write->on_crash();
-    }
-    void flush() override { ++flushes; }
+    Pipeline *crash_from_write = nullptr;  // "signal" during the first write
 };
 
-TEST(dbuf_sinks_receive_everything) {
+struct CaptureSink : Sink {
+    explicit CaptureSink(Capture *c) : c_(c) {}
+    void write(const char *d, size_t n) override {
+        c_->data.append(d, n);
+        c_->events += 'W';
+        if (Pipeline *p = c_->crash_from_write) {
+            c_->crash_from_write = nullptr;
+            p->crash(nullptr, 0);
+        }
+    }
+    void begin_batch() override { c_->events += 'B'; }
+    void end_batch() override { c_->events += 'E'; }
+    void flush() override {
+        ++c_->flushes;
+        c_->events += 'F';
+    }
+    void shutdown() override { c_->events += 'S'; }
+    Capture *c_;
+};
+
+static std::unique_ptr<Sink> capture_sink(Capture *c) {
+    return std::unique_ptr<Sink>(new CaptureSink(c));
+}
+
+TEST(pipeline_sinks_receive_everything) {
     TempDir d("sinks");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.buffer_size = 4096;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
-    CaptureSink s1, s2;
-    b->add_sink(&s1);
-    b->add_sink(&s2);
+    Capture s1, s2;
+    b->add_sink(capture_sink(&s1));
+    b->add_sink(capture_sink(&s2));
+    b->add_sink(nullptr);  // ignored (e.g. syslog unsupported)
+    EXPECT_EQ(b->sink_count(), size_t(3));
     char line[128];
     for (int i = 0; i < 500; ++i) {
         int n = make_line(line, 0, i);
-        b->append(line, n, TBLOG_LV_INFO);
-        if (i % 50 == 0) b->flush();
+        b->queue().append(line, n, TBLOG_LV_INFO);
+        if (i % 50 == 0) b->drain();
     }
     b->shutdown();
     std::string f = read_file(o.file.path);
     EXPECT_TRUE(s1.data == f);
     EXPECT_TRUE(s2.data == f);
     EXPECT_TRUE(s1.flushes > 0);
+    EXPECT_EQ(s1.events.back(), 'S');
 }
 
-TEST(dbuf_on_crash_writes_buffered) {
-    TempDir d("crash");
-    BufferOptions o;
+TEST(pipeline_batch_hooks_order) {
+    TempDir d("hooks");
+    PipeOptions o;
     o.file.path = d.file("app.log");
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
+    ASSERT_TRUE(b != nullptr);
+    Capture c;
+    b->add_sink(capture_sink(&c));
+    b->drain();  // nothing taken: hooks run (time rotation check), no flush
+    EXPECT_EQ(c.events, std::string("BE"));
+    c.events.clear();
+    b->drain(true);  // tblog_flush: flush even when nothing was written
+    EXPECT_EQ(c.events, std::string("BEF"));
+    c.events.clear();
+    EXPECT_TRUE(b->queue().append("one\n", 4, TBLOG_LV_INFO));
+    b->drain();
+    EXPECT_EQ(c.events, std::string("BWEF"));
+    c.events.clear();
+    b->shutdown();  // final drain (flush forced) + Sink::shutdown
+    EXPECT_EQ(c.events, std::string("BEFS"));
+    EXPECT_EQ(c.data, std::string("one\n"));
+    EXPECT_EQ(read_file(o.file.path), std::string("one\n"));
+}
+
+TEST(pipeline_crash_writes_buffered_then_marker) {
+    TempDir d("crash");
+    PipeOptions o;
+    o.file.path = d.file("app.log");
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     char line[128];
     std::string expect;
     for (int i = 0; i < 100; ++i) {
         int n = make_line(line, 1, i);
-        b->append(line, n, TBLOG_LV_INFO);
+        b->queue().append(line, n, TBLOG_LV_INFO);
         expect.append(line, n);
     }
-    b->flush();  // first 100 already on disk
+    b->drain();  // first 100 already on disk
     for (int i = 100; i < 200; ++i) {
         int n = make_line(line, 1, i);
-        b->append(line, n, TBLOG_LV_INFO);
+        b->queue().append(line, n, TBLOG_LV_INFO);
         expect.append(line, n);
     }
     EXPECT_TRUE(read_file(o.file.path).size() < expect.size());
+    EXPECT_FALSE(b->queue().crashed());
     const char m[] = "*** tblog: caught signal 11 (SIGSEGV) ***\n";
-    b->crash_write(m, sizeof m - 1);
-    b->on_crash();
+    b->crash(m, sizeof m - 1);
+    EXPECT_TRUE(b->queue().crashed());
     std::string got = read_file(o.file.path);
-    EXPECT_TRUE(got.find(m) != std::string::npos);
-    std::string without = got;
-    without.erase(without.find(m), sizeof m - 1);
-    EXPECT_TRUE(without == expect);
-    // Dead after crash: nothing more written, no duplicates at shutdown.
-    EXPECT_FALSE(b->append("after\n", 6, TBLOG_LV_INFO));
-    b->on_crash();
+    EXPECT_TRUE(got == expect + m);  // drained lines first, then the marker
+    // Dead after crash: nothing more written, no duplicates at shutdown; a
+    // second crash() drains nothing (only its marker).
+    EXPECT_FALSE(b->queue().append("after\n", 6, TBLOG_LV_INFO));
+    b->crash(nullptr, 0);
+    b->drain(true);
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == got);
 }
 
-TEST(dbuf_on_crash_during_flush_no_duplicates) {
+TEST(pipeline_crash_during_flush_no_duplicates) {
     TempDir d("crash2");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
-    CaptureSink s;
+    Capture s;
     s.crash_from_write = b.get();  // "signal" arrives while the worker is mid-flush
-    b->add_sink(&s);
+    b->add_sink(capture_sink(&s));  // not crash-safe: written after the file
     char line[128];
     std::string expect;
     for (int i = 0; i < 50; ++i) {
         int n = make_line(line, 2, i);
-        b->append(line, n, TBLOG_LV_INFO);
+        b->queue().append(line, n, TBLOG_LV_INFO);
         expect.append(line, n);
     }
-    b->flush();
+    b->drain();
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == expect);
+    EXPECT_TRUE(s.data == expect);
 }
 
-TEST(dbuf_sharded_8x50k_complete_and_ordered) {
+// Queue alone: take() hands over whole lines in per-thread order, release()
+// recycles the buffers, mark_written() / crash_drain() agree on what is left.
+struct Visited {
+    std::string data;
+    int calls = 0;
+};
+static void visit_into(void *ctx, const char *data, size_t len) {
+    Visited *v = static_cast<Visited *>(ctx);
+    v->data.append(data, len);
+    ++v->calls;
+}
+
+TEST(queue_take_release_chunks) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    Queue::Batch b;
+    EXPECT_EQ(q->take(b), size_t(0));
+    // 4 threads x 2000 lines; take() repeatedly while they run.
+    const int T = 4, N = 2000;
+    std::atomic<int> done{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < T; ++t)
+        th.emplace_back([&, t] {
+            char line[128];
+            for (int i = 0; i < N; ++i) {
+                int n = make_line(line, t, i);
+                EXPECT_TRUE(q->append(line, n, TBLOG_LV_INFO));
+            }
+            done.fetch_add(1);
+        });
+    std::string all;
+    size_t chunks = 0;
+    bool whole = true, shard_order = true;
+    for (;;) {
+        const bool last = done.load() == T;  // read before take: nothing after
+        q->take(b);
+        int prev_shard = -1;
+        for (size_t i = 0; i < b.size; ++i) {
+            const Queue::Chunk &c = b.chunks[i];
+            whole = whole && c.len > 0 && c.data[c.len - 1] == '\n';
+            shard_order = shard_order && static_cast<int>(b.shard[i]) > prev_shard;
+            prev_shard = b.shard[i];
+            all.append(c.data, c.len);
+            q->mark_written(b, i);
+            ++chunks;
+        }
+        q->release(b);
+        EXPECT_EQ(b.size, size_t(0));
+        if (last) break;
+        std::this_thread::yield();
+    }
+    for (auto &x : th) x.join();
+    EXPECT_TRUE(whole);
+    EXPECT_TRUE(shard_order);
+    EXPECT_TRUE(chunks > 0);
+    EXPECT_EQ(verify_lines(all, T, N, true), static_cast<long>(T) * N);
+    EXPECT_EQ(q->take(b), size_t(0));
+    EXPECT_EQ(q->dropped(), 0ull);
+}
+
+TEST(queue_crash_drain_pending_then_active) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    EXPECT_TRUE(q->append("A1\n", 3, TBLOG_LV_INFO));
+    EXPECT_TRUE(q->append("A2\n", 3, TBLOG_LV_INFO));
+    Queue::Batch b;
+    EXPECT_EQ(q->take(b), size_t(1));  // A1 A2 pending (the worker is "writing" them)
+    EXPECT_TRUE(q->append("B1\n", 3, TBLOG_LV_INFO));  // active
+    Visited v;
+    EXPECT_TRUE(q->crash_drain(&visit_into, &v));
+    EXPECT_EQ(v.data, std::string("A1\nA2\nB1\n"));  // older (pending) data first
+    EXPECT_EQ(v.calls, 2);
+    Visited v2;
+    EXPECT_FALSE(q->crash_drain(&visit_into, &v2));  // once only
+    EXPECT_EQ(v2.calls, 0);
+    EXPECT_FALSE(q->append("C\n", 2, TBLOG_LV_INFO));  // dead
+    q->release(b);
+
+    // mark_written(): the pending chunk reached the crash-safe sinks, so the
+    // crash handler must not write it again.
+    auto q2 = Queue::create(qo);
+    ASSERT_TRUE(q2 != nullptr);
+    EXPECT_TRUE(q2->append("A1\n", 3, TBLOG_LV_INFO));
+    EXPECT_EQ(q2->take(b), size_t(1));
+    q2->mark_written(b, 0);
+    EXPECT_TRUE(q2->append("B1\n", 3, TBLOG_LV_INFO));
+    Visited v3;
+    EXPECT_TRUE(q2->crash_drain(&visit_into, &v3));
+    EXPECT_EQ(v3.data, std::string("B1\n"));
+    q2->release(b);
+}
+
+// The worker stops at a crash and releases its batch while the crash handler
+// is still walking the shards (another thread): chunks it never wrote must
+// stay visible to the handler.
+struct ReleasingVisitor {
+    Queue *q;
+    Queue::Batch *b;
+    std::string data;
+};
+static void visit_and_release(void *ctx, const char *data, size_t len) {
+    ReleasingVisitor *v = static_cast<ReleasingVisitor *>(ctx);
+    v->data.append(data, len);
+    v->q->release(*v->b);  // the worker, between two shards of the handler
+}
+
+TEST(queue_release_after_crash_keeps_unwritten) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    // Two new threads get consecutive ids, i.e. two different shards
+    // (unless the machine has a single shard).
+    std::thread([&] { EXPECT_TRUE(q->append("A\n", 2, TBLOG_LV_INFO)); }).join();
+    std::thread([&] { EXPECT_TRUE(q->append("B\n", 2, TBLOG_LV_INFO)); }).join();
+    Queue::Batch b;
+    const size_t n = q->take(b);
+    ReleasingVisitor v{q.get(), &b, std::string()};
+    EXPECT_TRUE(q->crash_drain(&visit_and_release, &v));
+    if (n != 2) std::printf("  (single shard: the two-shard race is not exercised)\n");
+    EXPECT_EQ(v.data, std::string("A\nB\n"));
+    q->release(b);
+}
+
+TEST(queue_close_rejects_and_keeps_accepted) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    EXPECT_TRUE(q->append("kept\n", 5, TBLOG_LV_INFO));
+    q->close();
+    q->close();  // idempotent
+    EXPECT_FALSE(q->append("late\n", 5, TBLOG_LV_INFO));
+    Queue::Batch b;
+    ASSERT_TRUE(q->take(b) == 1);
+    EXPECT_EQ(std::string(b.chunks[0].data, b.chunks[0].len), std::string("kept\n"));
+    q->release(b);
+    EXPECT_EQ(q->take(b), size_t(0));
+}
+
+// User sink (tblog_add_sink's CallbackSink) behind a multi-threaded queue:
+// receives exactly the bytes of the file, each thread's lines in order.
+struct UserCapture {
+    std::string data;
+    int flushes = 0;
+};
+static void user_write(void *ctx, const char *d, size_t n) {
+    static_cast<UserCapture *>(ctx)->data.append(d, n);
+}
+static void user_flush(void *ctx) { ++static_cast<UserCapture *>(ctx)->flushes; }
+
+TEST(pipeline_callback_sink_multithread_order) {
+    TempDir d("callback");
+    PipeOptions o;
+    o.file.path = d.file("app.log");
+    o.file.max_size = 1ull << 40;
+    o.buffer_size = 64u << 10;
+    o.policy = FullPolicy::Block;
+    auto b = make_pipe(o);
+    ASSERT_TRUE(b != nullptr);
+    EXPECT_TRUE(make_callback_sink(nullptr, nullptr, nullptr) == nullptr);
+    UserCapture u, u_noflush;
+    b->add_sink(make_callback_sink(&user_write, &user_flush, &u));
+    b->add_sink(make_callback_sink(&user_write, nullptr, &u_noflush));
+    Worker w(b.get());
+    const int T = 8, N = 20000 / kScale;
+    std::vector<std::thread> th;
+    for (int t = 0; t < T; ++t)
+        th.emplace_back([&, t] {
+            char line[128];
+            for (int i = 0; i < N; ++i) {
+                int n = make_line(line, t, i);
+                EXPECT_TRUE(b->queue().append(line, n, TBLOG_LV_INFO));
+            }
+        });
+    for (auto &x : th) x.join();
+    w.join();
+    b->shutdown();
+    EXPECT_EQ(verify_lines(u.data, T, N, true), static_cast<long>(T) * N);
+    EXPECT_TRUE(u.data == read_file(o.file.path));
+    EXPECT_TRUE(u_noflush.data == u.data);
+    EXPECT_TRUE(u.flushes > 0);
+}
+
+TEST(queue_sharded_8x50k_complete_and_ordered) {
     // Block: every line exactly once, each thread's lines in increasing order.
     // Default-sized buffer (several shards in use, one per thread).
     TempDir d("sharded");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.file.max_size = 1ull << 40;
     o.policy = FullPolicy::Block;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     Worker w(b.get());
     const int T = 8, N = 50000 / kScale;
@@ -635,23 +877,23 @@ TEST(dbuf_sharded_8x50k_complete_and_ordered) {
             char line[128];
             for (int i = 0; i < N; ++i) {
                 int n = make_line(line, t, i);
-                EXPECT_TRUE(b->append(line, n, TBLOG_LV_INFO));
+                EXPECT_TRUE(b->queue().append(line, n, TBLOG_LV_INFO));
             }
         });
     for (auto &x : th) x.join();
     w.join();
     b->shutdown();
-    EXPECT_EQ(b->dropped(), 0ull);
+    EXPECT_EQ(b->queue().dropped(), 0ull);
     // expect_all: per thread seq must be exactly 0,1,2,... (once, in order).
     EXPECT_EQ(verify_lines(read_file(o.file.path), T, N, true), static_cast<long>(T) * N);
 }
 
-TEST(dbuf_on_crash_drains_all_shards) {
+TEST(queue_crash_drains_all_shards) {
     TempDir d("crash_shards");
-    BufferOptions o;
+    PipeOptions o;
     o.file.path = d.file("app.log");
     o.file.max_size = 1ull << 40;
-    auto b = make_double_buffer_backend(o);
+    auto b = make_pipe(o);
     ASSERT_TRUE(b != nullptr);
     const int T = 8, N = 300;
     std::atomic<int> phase{0};
@@ -662,34 +904,34 @@ TEST(dbuf_on_crash_drains_all_shards) {
             char line[128];
             for (int i = 0; i < N; ++i) {
                 int n = make_line(line, t, i);
-                EXPECT_TRUE(b->append(line, n, TBLOG_LV_INFO));
+                EXPECT_TRUE(b->queue().append(line, n, TBLOG_LV_INFO));
             }
             phase.fetch_add(1);
             while (phase.load() < 2 * T) std::this_thread::yield();
             for (int i = N; i < 2 * N; ++i) {
                 int n = make_line(line, t, i);
-                EXPECT_TRUE(b->append(line, n, TBLOG_LV_INFO));
+                EXPECT_TRUE(b->queue().append(line, n, TBLOG_LV_INFO));
             }
             phase.fetch_add(1);
         });
     while (phase.load() < T) std::this_thread::yield();
-    b->flush();  // first half on disk
+    b->drain();  // first half on disk
     phase.fetch_add(T);
     while (phase.load() < 3 * T) std::this_thread::yield();
     for (auto &x : th) x.join();
     size_t before = read_file(o.file.path).size();
     EXPECT_TRUE(before > 0);
-    b->on_crash();  // lock-free drain of every shard
+    b->crash(nullptr, 0);  // lock-free drain of every shard
     std::string got = read_file(o.file.path);
     EXPECT_TRUE(got.size() > before);
     EXPECT_EQ(verify_lines(got, T, 2 * N, true), static_cast<long>(T) * 2 * N);
-    EXPECT_FALSE(b->append("after\n", 6, TBLOG_LV_INFO));
+    EXPECT_FALSE(b->queue().append("after\n", 6, TBLOG_LV_INFO));
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == got);
 }
 
 // ---------------------------------------------------------------- benchmark
-static void bench(const char *name, Backend *b, int T, int N) {
+static void bench(const char *name, Pipeline *b, int T, int N) {
     Worker w(b);
     std::vector<std::vector<uint32_t>> lat(T);
     auto t0 = std::chrono::steady_clock::now();
@@ -704,7 +946,7 @@ static void bench(const char *name, Backend *b, int T, int N) {
             v.reserve(N);
             for (int i = 0; i < N; ++i) {
                 auto a = std::chrono::steady_clock::now();
-                b->append(line, n, TBLOG_LV_INFO);
+                b->queue().append(line, n, TBLOG_LV_INFO);
                 auto z = std::chrono::steady_clock::now();
                 v.push_back(static_cast<uint32_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(z - a).count()));
@@ -721,36 +963,36 @@ static void bench(const char *name, Backend *b, int T, int N) {
                 "%.2f M lines/s, dropped %llu\n",
                 name, T, N, all[all.size() / 2], all[all.size() * 99 / 100],
                 all[all.size() * 999 / 1000], all.size() / secs / 1e6,
-                static_cast<unsigned long long>(b->dropped()));
+                static_cast<unsigned long long>(b->queue().dropped()));
 }
 
-TEST(bench_dbuf_threads_scaling) {
+TEST(bench_queue_threads_scaling) {
     TempDir d("bench_scale");
     for (int T : {1, 4, 8}) {
-        BufferOptions o;
+        PipeOptions o;
         o.file.path = d.file("scale.log");
         o.file.max_size = 1ull << 40;
         o.policy = FullPolicy::Drop;
-        auto db = make_double_buffer_backend(o);
+        auto db = make_pipe(o);
         ASSERT_TRUE(db != nullptr);
-        bench("dbuf(sharded)", db.get(), T, 200000 / kScale);
+        bench("queue(sharded)", db.get(), T, 200000 / kScale);
     }
 }
 
 TEST(bench_append_latency) {
     TempDir d("bench");
-    BufferOptions o;
-    o.file.path = d.file("dbuf.log");
+    PipeOptions o;
+    o.file.path = d.file("drop.log");
     o.file.max_size = 1ull << 40;
     o.policy = FullPolicy::Drop;
-    auto db = make_double_buffer_backend(o);
+    auto db = make_pipe(o);
     ASSERT_TRUE(db != nullptr);
-    bench("double_buffer", db.get(), 4, 250000 / kScale);
-    o.file.path = d.file("dbuf_block.log");
+    bench("queue(drop)", db.get(), 4, 250000 / kScale);
+    o.file.path = d.file("block.log");
     o.policy = FullPolicy::Block;
-    auto dbb = make_double_buffer_backend(o);
+    auto dbb = make_pipe(o);
     ASSERT_TRUE(dbb != nullptr);
-    bench("dbuf(block)", dbb.get(), 4, 250000 / kScale);
+    bench("queue(block)", dbb.get(), 4, 250000 / kScale);
 }
 
 TINY_TEST_MAIN()

@@ -212,6 +212,8 @@ private:
             // Options of removed features (sync/mmap backends, deferred
             // formatting): accepted so old config files keep working.
             warn(key + ": option removed, ignored", text);
+        } else if (key == "file") {
+            set_bool(v, text, &cfg_.file_enabled);
         } else if (key == "file.path") {
             if (v.empty()) warn("empty file.path", text);
             else cfg_.file.path = v;
@@ -256,7 +258,7 @@ private:
             get_interval(v, text, 0, kSyncIntervalMaxMs, &cfg_.sync_interval_ms);
         } else if (key == "sync.on_level") {
             tblog_level lv;
-            if (parse_level_local(v, &lv)) cfg_.file.urgent_level = lv;
+            if (parse_level_local(v, &lv)) cfg_.urgent_level = lv;
             else warn("invalid level", text);
         } else if (key == "console") {
             set_bool(v, text, &cfg_.console);

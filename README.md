@@ -170,6 +170,9 @@ void tblog_flush(void);                    /* chờ worker ghi và fdatasync */
 void tblog_set_level(const char *module, tblog_level lv);  /* module NULL = gốc */
 tblog_level tblog_get_level(const char *module);
 uint64_t tblog_dropped_count(void);        /* số dòng bị bỏ do buffer đầy */
+
+/* Sink của người dùng: gọi TRƯỚC tblog_init; 0 = thành công, -1 nếu logger đang chạy hoặc write == NULL */
+int  tblog_add_sink(tblog_sink_write_fn write, tblog_sink_flush_fn flush, void *ctx);
 ```
 
 Macro: `TBLOG_TRACE/DEBUG/INFO/WARN/ERROR/FATAL(fmt, ...)` và các biến thể theo module `TBLOG_MTRACE ... TBLOG_MFATAL(module, fmt, ...)`.
@@ -179,6 +182,7 @@ Macro: `TBLOG_TRACE/DEBUG/INFO/WARN/ERROR/FATAL(fmt, ...)` và các biến thể
 - **Loại bỏ lúc biên dịch:** `-DTBLOG_COMPILE_LEVEL=TBLOG_LV_INFO` xóa hẳn các lệnh TRACE/DEBUG khỏi binary.
 - **`TBLOG_FATAL`:** ghi log, flush, rồi gọi `abort()`.
 - **Log trước `tblog_init`:** được ghi thẳng ra stderr.
+- **Sink riêng (`tblog_add_sink`):** `write(ctx, data, len)` nhận một hoặc nhiều dòng hoàn chỉnh (kết thúc bằng `\n`, không có NUL), dòng của mỗi thread giữ đúng thứ tự; `flush(ctx)` (có thể NULL) được gọi sau mỗi lô, khi `tblog_flush()` và khi `tblog_shutdown()`. Cả hai chạy trên worker thread, không bao giờ trong signal handler. Sink đã đăng ký giữ nguyên qua các lần init/shutdown. Khi crash, phần còn trong buffer chỉ được xả vào file và console.
 
 ### C++ (`<tblog/tblog.hpp>`, header-only, C++11)
 
@@ -213,6 +217,7 @@ File `key = value`; `#` bắt đầu comment. Riêng `pattern` lấy nguyên ph�
 | `level` | `INFO` | `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL`, `OFF` |
 | `module.<tên>` | (theo gốc) | Level riêng cho một module, ví dụ `module.network = DEBUG` |
 | `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Xem bảng token bên dưới |
+| `file` | `true` | `false` = không ghi file (chỉ console / syslog / `tblog_add_sink`); nếu không còn sink nào thì bật `console` kèm cảnh báo |
 | `file.path` | `./logs/app.log` | Thư mục cha được tự tạo |
 | `file.max_size` | `256MB` | Xoay file khi vượt; nhận hậu tố `B/KB/MB/GB` |
 | `file.max_files` | `5` | File đang ghi + tối đa N−1 file đã xoay |
@@ -373,11 +378,11 @@ Bộ test gồm:
 ```
 include/tblog/        log.h (API C), tblog.hpp + detail/ (API C++)
 src/core/             level, module, thread context, formatter
-src/backend/          double buffer, rotating file, archiver (xoay + nén)
+src/queue/            Queue: double buffer theo shard (đường nóng của tblog_write)
 src/config/           parser, validate_config và watcher của log.conf
-src/logger/           C API, worker thread, sync thread
+src/logger/           C API, worker thread, sync thread, Pipeline (Queue -> các sink)
 src/crash/            crash handler
-src/sinks/            console, syslog
+src/sinks/            file (rotating file, archiver: xoay + nén), console, syslog, sink của người dùng
 src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/; mọi lời gọi OS nằm ở đây
 tests/unit/           test (tests/tiny_test.h, không cần thư viện ngoài)
 bench/                benchmark latency/throughput

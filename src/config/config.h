@@ -2,8 +2,9 @@
 // src/config/config_watcher.cpp
 #pragma once
 
-#include "backend/backend.h"
 #include "platform/platform.h"
+#include "queue/queue.h"
+#include "sinks/file_sink.h"
 #include "tblog/log.h"
 
 #include <cstddef>
@@ -21,11 +22,13 @@ constexpr uint32_t kSyncIntervalMaxMs = 3600000;
 struct Config {
     tblog_level level = TBLOG_LV_INFO;
     std::string pattern = "%D %T.%us [%L] [%t] %f:%l - %m";
+    bool file_enabled = true;  // `file`: false = no log file (console / syslog / user sinks only)
     FileOptions file;
     size_t buffer_size = 4u << 20;
     FullPolicy full_policy = FullPolicy::Drop;
     uint32_t flush_interval_ms = 200;
     uint32_t sync_interval_ms = 1000;
+    tblog_level urgent_level = TBLOG_LV_ERROR;  // sync.on_level: wake worker + sync at >= this
     bool console = false;
     bool console_color = true;
     bool syslog = false;
@@ -33,7 +36,7 @@ struct Config {
     bool reload_watch = true;
 };
 
-// Keys: level, pattern, file.path, file.max_size, file.max_files,
+// Keys: level, pattern, file, file.path, file.max_size, file.max_files,
 // file.rotate (size|daily|hourly), file.compress (none|gzip; gzip needs a
 // zlib build), buffer.size, full_policy (drop|block),
 // flush.interval_ms, sync.interval_ms, sync.on_level, console, console.color,
@@ -62,7 +65,10 @@ bool load_config(const char *path, Config &out, std::vector<std::string> *warnin
 //     sync.interval_ms to [0, kSyncIntervalMaxMs] (programmatic configs; the
 //     parser clamps already)
 //   * empty file.path / pattern -> the default (programmatic configs)
-bool validate_config(Config &cfg, std::vector<std::string> *warnings);
+//   * file = false with no console, no syslog and no user sink
+//     (user_sinks == 0, the number of tblog_add_sink() sinks) -> console on,
+//     so the lines still go somewhere
+bool validate_config(Config &cfg, std::vector<std::string> *warnings, size_t user_sinks = 0);
 
 class ConfigWatcher {
 public:

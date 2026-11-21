@@ -21,13 +21,13 @@
 // All file system access goes through the platform layer (pf::); zlib is
 // used through its stream API (deflate), so no OS file descriptor reaches it.
 //
-// Threading: archive()/mark_ready() run on the backend worker and only take
+// Threading: archive()/mark_ready() run on the worker (FileSink) and only take
 // mu_ for a few rename/unlink/stat syscalls; the compressor thread holds mu_
 // only around open/rename/unlink, never while compressing. Callers' hot path
 // never touches this class.
 #pragma once
 
-#include "backend/backend.h"
+#include "sinks/file_sink.h"
 #include "platform/platform.h"
 
 #include <atomic>

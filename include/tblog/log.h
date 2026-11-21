@@ -3,6 +3,7 @@
 #ifndef TBLOG_LOG_H
 #define TBLOG_LOG_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_MSC_VER)
@@ -179,6 +180,25 @@ TBLOG_API void tblog_write(tblog_module *m, tblog_level lv, const char *file, in
 
 /* Number of lines dropped because the buffer was full. */
 TBLOG_API uint64_t tblog_dropped_count(void);
+
+/* User sinks: send every formatted line to your own code as well (in
+ * addition to the log file, console and syslog sinks of the config; with
+ * `file = false` in the config they can be the only output).
+ *
+ * write(ctx, data, len) receives one or more complete lines ('\n'-terminated,
+ * not NUL-terminated), each thread's lines in order. flush(ctx), which may be
+ * NULL, is called after a batch of writes, by tblog_flush() and at
+ * tblog_shutdown(). Both run on tblog's worker thread (never concurrently with
+ * each other, never from a signal handler); they must not call tblog_init,
+ * tblog_shutdown or tblog_flush. Lines still buffered when the process
+ * crashes reach only the file and console sinks.
+ *
+ * Call BEFORE tblog_init: returns 0 on success, -1 if the logger is running
+ * or write is NULL. Registered sinks stay registered for later
+ * tblog_init/tblog_shutdown cycles (there is no removal). */
+typedef void (*tblog_sink_write_fn)(void *ctx, const char *data, size_t len);
+typedef void (*tblog_sink_flush_fn)(void *ctx); /* may be NULL */
+TBLOG_API int tblog_add_sink(tblog_sink_write_fn write, tblog_sink_flush_fn flush, void *ctx);
 
 #ifndef TBLOG_COMPILE_LEVEL
 #define TBLOG_COMPILE_LEVEL TBLOG_LV_TRACE

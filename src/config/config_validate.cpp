@@ -13,7 +13,7 @@ void add(std::vector<std::string> *w, int *n, const std::string &msg) {
 
 }  // namespace
 
-bool validate_config(Config &c, std::vector<std::string> *warnings) {
+bool validate_config(Config &c, std::vector<std::string> *warnings, size_t user_sinks) {
     int n = 0;
 
 #ifndef TBLOG_HAVE_ZLIB
@@ -47,6 +47,11 @@ bool validate_config(Config &c, std::vector<std::string> *warnings) {
     if (c.sync_interval_ms > kSyncIntervalMaxMs) {
         c.sync_interval_ms = kSyncIntervalMaxMs;
         add(warnings, &n, "sync.interval_ms clamped to " + std::to_string(c.sync_interval_ms));
+    }
+    if (!c.file_enabled && !c.console && !c.syslog && user_sinks == 0) {
+        c.console = true;
+        add(warnings, &n, "file = false and no other sink (console, syslog, tblog_add_sink); "
+                          "enabling console");
     }
     return n == 0;
 }

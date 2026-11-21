@@ -1,12 +1,23 @@
-// Public C API + worker thread. Glues config, formatter, backend, sinks and
-// the crash handler together.
-#include "backend/backend.h"
+// Public C API + worker thread. Glues config, formatter, queue, sinks and
+// the crash handler together:
+//
+//   caller -- tblog_write: level check -> format into the thread's scratch
+//             buffer -> Queue::append (src/queue/queue.h)
+//   worker -- worker_main: wait -> Pipeline::drain (take the queue, write the
+//             chunks to every sink, release, flush) -> urgent line? request a
+//             sync -> tblog_flush handshake (src/logger/pipeline.h)
+//   syncer -- syncer_main: Pipeline::sync (fdatasync) every sync.interval_ms
+//             and on urgent lines
+//   crash  -- Pipeline::crash from the signal handler (src/crash/)
 #include "config/config.h"
 #include "core/compat.h"
 #include "core/formatter.h"
 #include "core/thread_context.h"
 #include "crash/crash_handler.h"
+#include "logger/pipeline.h"
 #include "platform/platform.h"
+#include "queue/queue.h"
+#include "sinks/file_sink.h"
 #include "sinks/sink.h"
 #include "tblog/log.h"
 
@@ -17,6 +28,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace tblog {
 namespace {
@@ -26,8 +38,9 @@ using Clock = std::chrono::steady_clock;
 struct Runtime {
     Config cfg;
     std::string config_path;
-    std::unique_ptr<Backend> backend;
-    std::vector<std::unique_ptr<Sink>> sinks;
+    std::unique_ptr<Pipeline> pipeline;
+    Queue *queue = nullptr;  // &pipeline->queue(), for the hot path
+    size_t user_sinks = 0;   // tblog_add_sink() sinks in this runtime
 
     // Formatter can be swapped by hot-reload. Old ones are retired, never
     // freed while the runtime lives, because a caller thread may still use one.
@@ -58,14 +71,23 @@ struct Runtime {
 
 // The runtime is published here. It is intentionally never deleted: a caller
 // thread may have loaded the pointer just before shutdown. After shutdown the
-// backend rejects appends, so a stale pointer is harmless.
+// queue rejects appends, so a stale pointer is harmless.
 std::atomic<Runtime *> g_rt{nullptr};
 std::mutex g_life_mu;  // serialises init/shutdown
 // Shut-down runtimes stay reachable here (so leak checkers stay quiet). Each
-// init/shutdown cycle keeps its backend's buffers: apps should init once.
+// init/shutdown cycle keeps its queue's buffers: apps should init once.
 // Heap-allocated and never destroyed, so it outlives static destructors.
 std::vector<Runtime *> *const g_retired = new std::vector<Runtime *>;  // guarded by g_life_mu
 std::atomic<uint64_t> g_dropped_after_shutdown{0};
+
+// tblog_add_sink() registrations: kept across init/shutdown cycles; each
+// tblog_init wraps them in CallbackSinks. Guarded by g_life_mu.
+struct UserSink {
+    tblog_sink_write_fn write;
+    tblog_sink_flush_fn flush;
+    void *ctx;
+};
+std::vector<UserSink> *const g_user_sinks = new std::vector<UserSink>;  // never destroyed
 
 const Formatter &default_formatter() {
     static Formatter f(Config().pattern);
@@ -86,7 +108,7 @@ void reload(Runtime *rt) {
     Config next = rt->cfg;
     std::vector<std::string> warnings;
     if (!load_config(rt->config_path.c_str(), next, &warnings)) return;  // keep old
-    validate_config(next, &warnings);
+    validate_config(next, &warnings, rt->user_sinks);
     print_warnings(warnings);
 
     apply_levels(next);
@@ -97,12 +119,15 @@ void reload(Runtime *rt) {
     rt->flush_interval_ms.store(next.flush_interval_ms, std::memory_order_relaxed);
     rt->sync_interval_ms.store(next.sync_interval_ms, std::memory_order_relaxed);
 
-    if (next.file.path != rt->cfg.file.path || next.buffer_size != rt->cfg.buffer_size ||
-        next.console != rt->cfg.console || next.syslog != rt->cfg.syslog) {
+    if (next.file_enabled != rt->cfg.file_enabled || next.file.path != rt->cfg.file.path ||
+        next.buffer_size != rt->cfg.buffer_size || next.console != rt->cfg.console ||
+        next.syslog != rt->cfg.syslog) {
         std::fprintf(stderr, "tblog: config: file/buffer/sink changes need a restart\n");
     }
     // Keep the restart-only fields as they are actually running.
+    next.file_enabled = rt->cfg.file_enabled;
     next.file = rt->cfg.file;
+    next.urgent_level = rt->cfg.urgent_level;
     next.buffer_size = rt->cfg.buffer_size;
     next.full_policy = rt->cfg.full_policy;
     next.console = rt->cfg.console;
@@ -132,7 +157,7 @@ void syncer_main(Runtime *rt) {
         if (rt->sync_stop) return;
         rt->sync_req = false;
         lk.unlock();
-        rt->backend->sync();
+        rt->pipeline->sync();
         lk.lock();
     }
 }
@@ -153,16 +178,18 @@ void worker_main(Runtime *rt) {
         }();
 
         if (!stopping && !flush_wanted)
-            rt->backend->wait_for_work(
+            rt->queue->wait_for_work(
                 std::chrono::milliseconds(rt->flush_interval_ms.load(std::memory_order_relaxed)));
 
-        rt->backend->flush();
-        for (auto &s : rt->sinks) s->flush();
+        // take -> every sink: begin_batch, write the chunks, end_batch ->
+        // release -> flush the sinks (always on tblog_flush, so a user sink's
+        // flush callback runs even when nothing new was written).
+        rt->pipeline->drain(flush_wanted);
 
         const auto now = Clock::now();
-        if (rt->backend->consume_urgent()) request_sync(rt);
+        if (rt->queue->consume_urgent()) request_sync(rt);
         // tblog_flush() promises durability on return: sync inline (rare).
-        if (flush_wanted) rt->backend->sync();
+        if (flush_wanted) rt->pipeline->sync();
 
         if (req) {
             std::lock_guard<std::mutex> lk(rt->flush_mu);
@@ -181,12 +208,29 @@ void worker_main(Runtime *rt) {
     }
 }
 
-std::unique_ptr<Backend> make_backend(const Config &c) {
-    BufferOptions o;
-    o.file = c.file;
-    o.buffer_size = c.buffer_size;
-    o.policy = c.full_policy;
-    return make_double_buffer_backend(o);
+// The queue and the sinks in their write order: file, console, syslog, user
+// sinks. nullptr if the queue or the file cannot be set up (already reported).
+std::unique_ptr<Pipeline> make_pipeline(const Config &c, const std::vector<UserSink> &user) {
+    QueueOptions qo;
+    qo.buffer_size = c.buffer_size;
+    qo.policy = c.full_policy;
+    qo.urgent_level = c.urgent_level;
+    std::unique_ptr<Queue> q = Queue::create(qo);
+    if (!q) return nullptr;
+    std::unique_ptr<Pipeline> p = tblog::make_unique<Pipeline>(std::move(q));
+    if (c.file_enabled) {
+        std::unique_ptr<Sink> f = make_file_sink(c.file);
+        if (!f) return nullptr;
+        p->add_sink(std::move(f));
+    }
+    if (c.console) p->add_sink(make_console_sink(c.console_color));
+    if (c.syslog) p->add_sink(make_syslog_sink("tblog"));  // nullptr where unsupported
+    for (const UserSink &u : user) p->add_sink(make_callback_sink(u.write, u.flush, u.ctx));
+    if (p->sink_count() == 0) {  // file = false + syslog on a platform without one
+        std::fprintf(stderr, "tblog: no usable sink, logging to the console\n");
+        p->add_sink(make_console_sink(c.console_color));
+    }
+    return p;
 }
 
 }  // namespace
@@ -205,17 +249,13 @@ extern "C" int tblog_init(const char *config_path) {
         if (!load_config(config_path, rt->cfg, &warnings))
             std::fprintf(stderr, "tblog: cannot read %s, using defaults\n", config_path);
     }
-    validate_config(rt->cfg, &warnings);
+    rt->user_sinks = g_user_sinks->size();
+    validate_config(rt->cfg, &warnings, rt->user_sinks);
     print_warnings(warnings);
 
-    rt->backend = make_backend(rt->cfg);
-    if (!rt->backend) return -1;
-
-    if (rt->cfg.console) rt->sinks.push_back(make_console_sink(rt->cfg.console_color));
-    if (rt->cfg.syslog) {
-        if (std::unique_ptr<Sink> s = make_syslog_sink("tblog")) rt->sinks.push_back(std::move(s));
-    }
-    for (auto &s : rt->sinks) rt->backend->add_sink(s.get());
+    rt->pipeline = make_pipeline(rt->cfg, *g_user_sinks);
+    if (!rt->pipeline) return -1;
+    rt->queue = &rt->pipeline->queue();
 
     rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern));
     rt->formatter.store(rt->formatters.back().get(), std::memory_order_release);
@@ -229,7 +269,7 @@ extern "C" int tblog_init(const char *config_path) {
     Runtime *raw = rt.release();
     raw->worker = std::thread(worker_main, raw);
     raw->syncer = std::thread(syncer_main, raw);
-    install_crash_handler(raw->backend.get());
+    install_crash_handler(raw->pipeline.get());
     g_rt.store(raw, std::memory_order_release);
 
     static bool atexit_done = false;
@@ -246,7 +286,7 @@ extern "C" void tblog_shutdown(void) {
     if (!rt) return;
     uninstall_crash_handler();
     rt->stop.store(true, std::memory_order_release);
-    rt->backend->wake();
+    rt->queue->wake();
     if (rt->worker.joinable()) rt->worker.join();
     {
         std::lock_guard<std::mutex> lk(rt->sync_mu);
@@ -254,9 +294,9 @@ extern "C" void tblog_shutdown(void) {
     }
     rt->sync_cv.notify_one();
     if (rt->syncer.joinable()) rt->syncer.join();
-    rt->backend->shutdown();  // final flush + fdatasync
-    for (auto &s : rt->sinks) s->flush();
-    g_dropped_after_shutdown.fetch_add(rt->backend->dropped(), std::memory_order_relaxed);
+    // Close the queue, final drain + flush, Sink::shutdown (fdatasync + close).
+    rt->pipeline->shutdown();
+    g_dropped_after_shutdown.fetch_add(rt->queue->dropped(), std::memory_order_relaxed);
     g_retired->push_back(rt);  // never deleted (see g_rt)
 }
 
@@ -265,14 +305,26 @@ extern "C" void tblog_flush(void) {
     if (!rt) return;
     std::unique_lock<std::mutex> lk(rt->flush_mu);
     const uint64_t ticket = ++rt->flush_req;
-    rt->backend->wake();
+    rt->queue->wake();
     rt->flush_cv.wait_for(lk, std::chrono::seconds(2), [&] { return rt->flush_done >= ticket; });
 }
 
 extern "C" uint64_t tblog_dropped_count(void) {
     uint64_t n = g_dropped_after_shutdown.load(std::memory_order_relaxed);
-    if (Runtime *rt = g_rt.load(std::memory_order_acquire)) n += rt->backend->dropped();
+    if (Runtime *rt = g_rt.load(std::memory_order_acquire)) n += rt->queue->dropped();
     return n;
+}
+
+extern "C" int tblog_add_sink(tblog_sink_write_fn write, tblog_sink_flush_fn flush, void *ctx) {
+    if (!write) return -1;
+    std::lock_guard<std::mutex> life(g_life_mu);
+    if (g_rt.load(std::memory_order_acquire)) return -1;  // running: add before tblog_init
+    try {
+        g_user_sinks->push_back(UserSink{write, flush, ctx});
+    } catch (...) {
+        return -1;
+    }
+    return 0;
 }
 
 extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, int line,
@@ -288,9 +340,9 @@ extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, i
     const size_t n = f->format(tc.scratch, kScratchSize, rec, fmt, ap);
     va_end(ap);
 
-    if (!rt || !rt->backend->append(tc.scratch, static_cast<uint32_t>(n), lv)) {
+    if (!rt || !rt->queue->append(tc.scratch, static_cast<uint32_t>(n), lv)) {
         // Not initialised / already shut down -> stderr. (A full buffer under
-        // the Drop policy also lands here only when the backend is stopped.)
+        // the Drop policy also lands here only when the queue is stopped.)
         if (!rt || rt->stop.load(std::memory_order_relaxed)) pf::stderr_write(tc.scratch, n);
     }
 

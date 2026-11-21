@@ -1,12 +1,12 @@
 // RotatingFile — append-only log file with size- and time-based rotation.
-// Internal to the backends (not thread-safe: callers serialise
+// Internal to FileSink (not thread-safe: callers serialise
 // write_all/rotate/check_time/open/close; handle() may be used concurrently,
 // e.g. from a signal handler, with pf::file_write_crash()). Naming, retention and gzip of the
 // rotated files live in Archiver (archiver.h).
 #pragma once
 
-#include "backend/archiver.h"
-#include "backend/backend.h"
+#include "sinks/archiver.h"
+#include "sinks/file_sink.h"
 #include "platform/platform.h"
 
 #include <atomic>

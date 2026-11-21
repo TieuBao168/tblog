@@ -46,7 +46,7 @@ option(TBLOG_HEADERS_ONLY_CHECK "Configure only the public-header compile check 
 option(TBLOG_BUILD_SHARED   "tblog::tblog refers to the shared library (OFF: static)" ON)
 option(TBLOG_BUILD_TESTS    "Build tests/unit/*.cpp and register them with CTest" OFF)
 option(TBLOG_BUILD_EXAMPLES "Build examples/*.c and examples/*.cpp" OFF)
-option(TBLOG_BUILD_BENCH    "Build bench/bench_latency.cpp" OFF)
+option(TBLOG_BUILD_BENCH    "Build bench/bench_vs_printf.cpp and bench/bench_crash_loss.cpp" OFF)
 option(TBLOG_WERROR         "Treat compiler warnings as errors" OFF)
 set(TBLOG_CXX_STANDARD 17 CACHE STRING "C++ standard used to build tblog (11, 14 or 17)")
 set_property(CACHE TBLOG_CXX_STANDARD PROPERTY STRINGS 11 14 17)
@@ -469,27 +469,31 @@ if(TBLOG_BUILD_EXAMPLES)
 endif()
 
 # ---- bench -------------------------------------------------------------------
-# Run from the source directory: it writes under build/bench_tmp/.
+# bench/bench_vs_printf.cpp: tblog vs fprintf, throughput and per-call latency.
+# bench/bench_crash_loss.cpp: log lines lost on crash, kill and exit (runs
+# itself as child processes). Both write JSON (bench/report.py renders it);
+# see docs/benchmarks.md. With TBLOG_BUILD_TESTS each gets a smoke test on
+# every platform: a --quick run must complete (not a measurement).
 if(TBLOG_BUILD_BENCH)
-  add_executable(bench_latency "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_latency.cpp")
-  target_link_libraries(bench_latency PRIVATE tblog_static)
-  tblog_target_flags(bench_latency)
-  tblog_enable_exports(bench_latency)
-  tblog_runtime_dir(bench_latency bench)
-  set_target_properties(bench_latency PROPERTIES
-    CXX_STANDARD ${TBLOG_CXX_STANDARD}
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF)
-  if(TBLOG_BUILD_TESTS AND NOT WIN32)
-    # Smoke test (not a measurement): a short run must succeed. POSIX only:
-    # the bench prepares its directories with `rm -rf` / `mkdir -p`.
-    set(_dir "${TBLOG_TEST_DIR}/bench_latency")
-    file(MAKE_DIRECTORY "${_dir}")
-    add_test(NAME bench_latency_smoke
-      COMMAND ${TBLOG_TEST_RUNNER} $<TARGET_FILE:bench_latency> 2000
-      WORKING_DIRECTORY "${_dir}")
-    set_tests_properties(bench_latency_smoke PROPERTIES TIMEOUT 300)
-  endif()
+  foreach(_bench bench_vs_printf bench_crash_loss)
+    add_executable(${_bench} "${CMAKE_CURRENT_SOURCE_DIR}/bench/${_bench}.cpp")
+    target_link_libraries(${_bench} PRIVATE tblog_static)
+    tblog_target_flags(${_bench})
+    tblog_enable_exports(${_bench})
+    tblog_runtime_dir(${_bench} bench)
+    set_target_properties(${_bench} PROPERTIES
+      CXX_STANDARD ${TBLOG_CXX_STANDARD}
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+    if(TBLOG_BUILD_TESTS)
+      set(_dir "${TBLOG_TEST_DIR}/${_bench}")
+      file(MAKE_DIRECTORY "${_dir}")
+      add_test(NAME ${_bench}_smoke
+        COMMAND ${TBLOG_TEST_RUNNER} $<TARGET_FILE:${_bench}> --quick
+                --dir "${_dir}/scratch" --out "${_dir}/smoke.json")
+      set_tests_properties(${_bench}_smoke PROPERTIES TIMEOUT 600)
+    endif()
+  endforeach()
 endif()
 
 # ---- install + package config -------------------------------------------------

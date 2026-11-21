@@ -1,0 +1,88 @@
+name: bench
+
+# Manual only (Actions tab -> bench -> Run workflow). Builds the two bench
+# programs (Release, static tblog) and runs them on GitHub's hosted runners:
+#   bench/bench_vs_printf   tblog vs plain fprintf: throughput, per-call latency
+#   bench/bench_crash_loss  log lines lost on crash / kill / exit
+# The JSON results are uploaded as artifacts and rendered into the job
+# summary by bench/report.py. Shared CI VMs are noisy: compare the variants
+# within one runner, do not read the numbers as absolute figures
+# (docs/benchmarks.md).
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'bench_vs_printf --runs (measured runs per cell)'
+        default: '5'
+      trials:
+        description: 'bench_crash_loss --trials (trials per scenario and variant)'
+        default: '20'
+      quick:
+        description: 'Smoke run only (--quick)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Windows: the default Visual Studio generator (MSVC, multi-config).
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTBLOG_BUILD_BENCH=ON -DTBLOG_WITH_ZLIB=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target bench_vs_printf bench_crash_loss
+
+      - name: Run bench_vs_printf and bench_crash_loss
+        env:
+          RUNS: ${{ inputs.runs }}
+          TRIALS: ${{ inputs.trials }}
+          QUICK: ${{ inputs.quick }}
+        run: |
+          set -eu
+          bin=build/bench
+          if [ -d build/bin/Release ]; then bin=build/bin/Release; fi   # Windows (MSVC)
+          perf_opts="--runs $RUNS"; crash_opts="--trials $TRIALS"
+          if [ "$QUICK" = true ]; then perf_opts=--quick; crash_opts=--quick; fi
+          info="CMake Release, $(cmake --version | head -n 1), GitHub-hosted $RUNNER_OS runner (${ImageOS:-?} ${ImageVersion:-?})"
+          label="shared CI VM - noisy, for relative comparison"
+          mkdir -p results
+          "$bin/bench_vs_printf" $perf_opts --out-dir results \
+            --commit "$GITHUB_SHA" --label "$label" --build-info "$info"
+          "$bin/bench_crash_loss" $crash_opts --out-dir results \
+            --commit "$GITHUB_SHA" --label "$label" --build-info "$info"
+          ls -l results
+
+      - name: Job summary (bench/report.py)
+        if: always()
+        run: |
+          {
+            echo "> **shared CI VM — noisy, for relative comparison** between the variants of one runner;"
+            echo "> not absolute figures. Method: docs/benchmarks.md."
+            echo
+            python -I bench/report.py --title "bench / $RUNNER_OS" results/*.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results-${{ matrix.os }}
+          path: results/
+          if-no-files-found: warn

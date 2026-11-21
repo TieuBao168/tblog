@@ -294,8 +294,9 @@ jobs:
   # macOS (AppleClang): static library + dylib, every test (tests/unit against
   # the static library, tests/shared against the dylib), the examples (CTest
   # smoke tests, against the dylib), check_symbols (the dylib exports exactly
-  # the tblog_* functions; not in sanitizer builds) and the bench (build
-  # only). zlib from the SDK, except in the no-zlib entry.
+  # the tblog_* functions; not in sanitizer builds) and the bench smoke tests
+  # (bench_vs_printf / bench_crash_loss --quick). zlib from the SDK, except in
+  # the no-zlib entry.
   # x86_64: macos-15-intel (the macos-13 image was retired in December 2025).
   cmake-macos:
     name: cmake-macos / ${{ matrix.name }}

@@ -47,7 +47,7 @@ Worker và thread sync có alternate signal stack riêng (POSIX) / `SetThreadSta
 | `tblog_flush()` trả về | Mọi dòng đã có trước lời gọi đã nằm trong sink và đã fsync |
 | Crash: SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL; Windows: SEH exception, `abort()` | Signal handler xả buffer vào file và console, rồi ghi dòng `*** tblog: caught signal 11 (SIGSEGV) ***`. Có thể mất dòng đang được chép đúng lúc crash và dòng của thread khác ghi sau khi handler đã đọc buffer; một chunk đang ghi dở có thể bị lặp lại. Syslog và sink riêng không nhận phần xả này. |
 | `TBLOG_FATAL` | Dòng FATAL được ghi và fsync, rồi `abort()` (như trên) |
-| `kill -9`, OOM killer, `TerminateProcess`, `_exit()` | **Mất** phần còn trong buffer: tối đa khoảng một `flush.interval_ms` (hoặc tới khi shard đầy 75%). Dữ liệu đã ghi xuống file thì nằm trong page cache của OS và không mất. |
+| `kill -9`, OOM killer, `TerminateProcess`, `_exit()` | **Mất** phần còn trong buffer: tối đa khoảng một `flush.interval_ms` (hoặc tới khi shard đầy 75%). Dữ liệu đã ghi xuống file thì nằm trong page cache của OS và không mất. Số đo: [benchmarks.md](benchmarks.md#kết-quả-mất-log). |
 | Mất điện, kernel panic | Mất phần chưa được fsync: tối đa khoảng một `sync.interval_ms` cộng một `flush.interval_ms`. Dòng ≥ `sync.on_level` kích hoạt fsync ngay sau khi được ghi. `sync.interval_ms = 0`: chỉ sync theo `sync.on_level`, `tblog_flush` và lúc shutdown. |
 
 macOS dùng `fcntl(F_FULLFSYNC)` cho fsync (xem [platforms.md](platforms.md#macos)), nên "đã fsync" ở đây nghĩa là đã ra khỏi cache của ổ đĩa, như `fdatasync` trên Linux.
@@ -87,24 +87,7 @@ Hàm lỗi trả `false` / handle không hợp lệ / `-1` và đặt `errno` (b
 
 ## Hiệu năng
 
-Đo bằng `bench/bench_latency` (Linux, macOS: nó chuẩn bị thư mục bằng `rm -rf` / `mkdir -p`). Build với `-DTBLOG_BUILD_BENCH=ON` (hoặc `make bench`), chạy từ thư mục gốc của repo, vì nó ghi vào `build/bench_tmp/`:
-
-```bash
-./build/bench/bench_latency 200000                       # số dòng mỗi thread; chạy với 1, 4, 8 thread
-TBLOG_BENCH_RATE=100000 ./build/bench/bench_latency      # giới hạn mỗi thread 100k dòng/giây
-TBLOG_BENCH_POLICY=block ./build/bench/bench_latency     # full_policy = block (mặc định drop)
-```
-
-Kết quả: p50/p99/p99.9/max latency của mỗi lệnh `TBLOG_INFO` (đã gồm thời gian đọc đồng hồ, in ở dòng đầu), số dòng/giây và số dòng bị bỏ.
-
-Số đo cũ, **chưa đo lại** sau khi tách lớp nền tảng, Pipeline và port sang Windows/macOS (các thay đổi trong [CHANGELOG.md](../CHANGELOG.md)): `bench_latency 200000`, Linux, i5-14600K (20 luồng), NVMe ext4, flood, chính sách `drop`, dòng khoảng 90 byte có `%f`.
-
-| Thread | p50 | p99 | Dòng/giây | Dòng mất |
-|---|---|---|---|---|
-| 1 | 260 ns | 391 ns | 2,8 triệu | 0 |
-| 8 | 266 ns | 960 ns | 8,0 triệu | 0 |
-
-Cùng đợt đo đó: `TBLOGF_INFO` (format `{}`) khoảng 150 ns mỗi lệnh, so với khoảng 230 ns của macro printf tương đương.
+Số đo so với `fprintf` (thông lượng, latency mỗi lệnh, lệnh bị lọc theo level) và số dòng mất khi crash / `kill -9` / `exit`, kèm máy đo, cách đo và cách chạy lại: [benchmarks.md](benchmarks.md). Chương trình đo: `bench/bench_vs_printf.cpp`, `bench/bench_crash_loss.cpp` (`-DTBLOG_BUILD_BENCH=ON`).
 
 ## Mã nguồn
 

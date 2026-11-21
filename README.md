@@ -113,10 +113,45 @@ module.network = DEBUG
 
 Mọi key, giá trị mặc định và quy tắc hot-reload: [docs/configuration.md](docs/configuration.md). File mẫu đầy đủ: [log.conf](log.conf).
 
+## Hiệu năng và độ an toàn khi crash
+
+So với `fprintf` vào một file (cùng dòng log, có timestamp). Máy: AMD Ryzen 7 8845HS (16 CPU logic), Windows 11, NVMe, MinGW-w64 g++ 15.1 `-O2`, tblog tĩnh, cấu hình mặc định chỉ ghi file; median của 5 lần chạy, 1 triệu dòng mỗi lần ([kết quả JSON](bench/results/)). End-to-end tính tới khi mọi dòng đã ghi và fsync.
+
+| Thread | Biến thể | Thread gọi log p50 / p99 | End-to-end (dòng/s) |
+|---|---|---|---|
+| 1 | `fprintf` (buffer stdio) | 1.99 µs / 7.21 µs | 394 k |
+| 1 | `fprintf` + `fflush` mỗi dòng | 4.99 µs / 9.89 µs | 173 k |
+| 1 | tblog | 321 ns / 621 ns | 1.75 M |
+| 8 | `fprintf` (buffer stdio) | 8.71 µs / 313 µs | 216 k |
+| 8 | `fprintf` + `fflush` mỗi dòng | 14.9 µs / 669 µs | 125 k |
+| 8 | tblog | 571 ns / 691 ns | 3.77 M |
+
+Số dòng mất khi process chết (trung bình / lớn nhất của 20 lần thử, 20 000 dòng/giây mỗi thread):
+
+| Kịch bản | `fprintf` | `fprintf` + `fflush` | tblog |
+|---|---|---|---|
+| SIGSEGV trên thread đang log | 22 / 39 | 0 | 0 |
+| SIGSEGV trên thread khác, 4 thread đang log | 17 / 40 | 0 | 508 / 1 098 |
+| `abort`, `assert`, exception không ai bắt, `exit` | 0 | 0 | 0 |
+| Stack overflow | 22 / 38 | 0 | 0 |
+| `kill -9` / `TerminateProcess`, 4 thread | 20 / 40 | 0 | 4 424 / 7 727 |
+| `_Exit` (không chạy `atexit`) | 0 | 0 | 953 / 1 811 |
+
+Điểm yếu, đo được ở trên:
+
+- `fprintf` của MinGW chậm bất thường; `snprintf` + `fwrite` một thread chỉ chậm hơn tblog khoảng 20% (381 so với 321 ns). Trên glibc / MSVC chưa đo ở máy này.
+- `kill -9`, `_Exit`: tblog mất phần còn trong buffer, tới khoảng 1 900 dòng mỗi thread (khoảng 100 ms log), so với tối đa 40 của `fprintf`.
+- Crash trên một thread trong khi thread khác vẫn log: các dòng ghi sau lúc handler xả buffer bị mất; một chunk có thể bị ghi lặp.
+- Trần khoảng 4–5 M dòng/s (một thread nền ghi file). Vượt trần với `full_policy = drop` (mặc định): bỏ tới 26% số dòng ở 16 thread; dùng `block` nếu cần đủ.
+- Mất điện: không biến thể nào an toàn tuyệt đối (tblog fsync mỗi giây; `fprintf` không fsync).
+
+Cách đo, bảng đầy đủ (16 thread, latency open-loop, lệnh bị lọc), giải thích và cách chạy lại: [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Tài liệu
 
 | File | Nội dung |
 |---|---|
+| [docs/benchmarks.md](docs/benchmarks.md) | So với `fprintf`: thông lượng, latency, số dòng mất khi crash / `kill -9` / `exit`; cách đo, cách chạy lại |
 | [docs/build.md](docs/build.md) | Option CMake, build trên từng nền tảng, sanitizer, cài đặt, pkg-config, Makefile, cross-compile |
 | [docs/api.md](docs/api.md) | API C và C++, sink riêng, `TBLOG_COMPILE_LEVEL`, FATAL, thread-safety |
 | [docs/configuration.md](docs/configuration.md) | Mọi key của `log.conf`, hot-reload, token của pattern, xoay file, nén |

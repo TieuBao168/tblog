@@ -13,7 +13,7 @@ Yêu cầu: CMake 3.10 trở lên; GCC hoặc Clang (Linux), AppleClang (macOS 1
 | `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu `find_package(ZLIB)` tìm thấy. Dòng `tblog: gzip compression of rotated files (zlib): ON/OFF` lúc configure cho biết kết quả. |
 | `TBLOG_BUILD_TESTS` | `OFF` | Build `tests/unit/*.cpp`, `tests/shared/*.cpp`, `tests/header_check` và đăng ký với CTest (xem [testing.md](testing.md)). |
 | `TBLOG_BUILD_EXAMPLES` | `OFF` | Build `examples/*.c`, `examples/*.cpp`. Có thêm `TBLOG_BUILD_TESTS` thì mỗi ví dụ còn là một CTest smoke test. |
-| `TBLOG_BUILD_BENCH` | `OFF` | Build `bench/bench_latency`. Có thêm `TBLOG_BUILD_TESTS` (không phải Windows) thì có test `bench_latency_smoke`. |
+| `TBLOG_BUILD_BENCH` | `OFF` | Build `bench/bench_vs_printf` (so với `fprintf`: thông lượng, latency) và `bench/bench_crash_loss` (mất log khi crash/kill/exit), xem [benchmarks.md](benchmarks.md). Có thêm `TBLOG_BUILD_TESTS` thì có test `bench_vs_printf_smoke` và `bench_crash_loss_smoke` (mọi nền tảng). |
 | `TBLOG_WERROR` | `OFF` | Coi warning là lỗi (`-Werror` / `/WX`). |
 | `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` hoặc tổ hợp như `address,undefined`. Chỉ GCC/Clang. |
 | `TBLOG_HEADERS_ONLY_CHECK` | `OFF` | Chỉ biên dịch thử các header công khai (`tests/header_check`), không build thư viện. Dùng cho MSVC ARM64 trong CI. |
@@ -133,7 +133,7 @@ Cần GNU make, GNU ld. Kết quả nằm trong `build/` (hoặc `build-<SAN>`, 
 | `make` | `libtblog.a`, `libtblog.so.0.1.0` cùng các symlink |
 | `make static` / `make shared` | Chỉ bản tĩnh / chỉ bản động |
 | `make test` | Build và chạy `tests/unit/*` |
-| `make examples`, `make bench` | `examples/basic`, `examples/cpp_api`, `bench/bench_latency` |
+| `make examples`, `make bench` | `examples/basic`, `examples/cpp_api`, `bench/bench_vs_printf`, `bench/bench_crash_loss` |
 | `make install PREFIX=/usr/local` | Cài header (cả `detail/`), `.a`, `.so`, `tblog.pc`; nhận `DESTDIR`, `LIBDIR`, `INCLUDEDIR`, `PKGCONFIGDIR` |
 | `make uninstall PREFIX=/usr/local` | Gỡ đúng các file trên |
 | `make check-symbols` | `.so` chỉ export các hàm `tblog_*` mà `.a` định nghĩa |

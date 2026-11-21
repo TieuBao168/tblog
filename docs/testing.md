@@ -42,7 +42,8 @@ Test không cần thư viện ngoài: `tests/tiny_test.h` (khung test), `tests/t
 | `test_rotation_time` | `tests/unit/test_rotation_time.cpp` | bản tĩnh | Xoay theo ngày/giờ với đồng hồ giả, giữ file, nén gzip và khôi phục sau crash |
 | `test_shared_exit` | `tests/shared/test_shared_exit.cpp` | bản động | Thoát process không gọi `tblog_shutdown` (Windows: đường DLL unload), crash trong DLL/.so |
 | `example_basic`, `example_cpp_api` | `examples/*` | `tblog::tblog` | Ví dụ chạy được với một `log.conf` trong thư mục nháp |
-| `bench_latency_smoke` | `bench/bench_latency.cpp` | bản tĩnh | Chạy ngắn (2000 dòng/thread), không phải phép đo; không có trên Windows |
+| `bench_vs_printf_smoke` | `bench/bench_vs_printf.cpp` | bản tĩnh | `--quick`: chạy ngắn mọi biến thể (fprintf, tblog), không phải phép đo; fail nếu file log thiếu dòng |
+| `bench_crash_loss_smoke` | `bench/bench_crash_loss.cpp` | bản tĩnh | `--quick`: mỗi kịch bản crash/kill/exit một lần cho mỗi biến thể; fail nếu một process con bị treo |
 | `check_symbols` | `packaging/check-symbols.sh` | | `.so`/`.dylib` export đúng các hàm `tblog_*` mà `.a` định nghĩa; không có trong build sanitizer |
 | `check_exports` | `packaging/check-exports.ps1` | | Windows: DLL export đúng các hàm `TBLOG_API` |
 
@@ -75,11 +76,13 @@ Build không có zlib: các test nén gzip không được biên dịch (`#ifdef
 | `make` | Ubuntu | `make test`, `make check-symbols`, `make check-install`, `TBLOG_TEST_NO_SKIP=1` |
 | `tblog-lite` | Ubuntu | `make -C lite test`, `test-asan`, `demo`, `size` |
 
+[.github/workflows/bench.yml](../.github/workflows/bench.yml) chỉ chạy khi bấm tay (`workflow_dispatch`): build `bench_vs_printf` và `bench_crash_loss` (Release) trên `ubuntu-latest`, `macos-latest`, `windows-latest`, chạy cả hai, upload file JSON kết quả làm artifact và ghi bảng của `bench/report.py` vào job summary. Máy ảo CI dùng chung nên số đo nhiễu: chỉ dùng để so các biến thể với nhau trên cùng một runner. Xem [benchmarks.md](benchmarks.md).
+
 ## Các chốt chặn độ phủ
 
 Để một test không thể lặng lẽ rơi khỏi CI:
 
-- **`packaging/check-test-inventory.cmake`** chạy sau `ctest` trong mọi job CMake có test (Linux, Alpine, macOS, Windows). Nó so danh sách test đã đăng ký (`ctest -N`) với danh sách phải có: mỗi `tests/unit/*.cpp` và `tests/shared/*.cpp`, `example_<tên>` cho mỗi file trong `examples/`, `bench_latency_smoke` (có bench, không phải Windows), `check_symbols` (không phải Windows, không sanitizer), `check_exports` (Windows). Thiếu hoặc thừa một test thì job fail với `check-test-inventory: FAIL`, kèm danh sách `not registered:` / `unexpected:`.
+- **`packaging/check-test-inventory.cmake`** chạy sau `ctest` trong mọi job CMake có test (Linux, Alpine, macOS, Windows). Nó so danh sách test đã đăng ký (`ctest -N`) với danh sách phải có: mỗi `tests/unit/*.cpp` và `tests/shared/*.cpp`, `example_<tên>` cho mỗi file trong `examples/`, `bench_vs_printf_smoke` và `bench_crash_loss_smoke` (có bench, mọi nền tảng), `check_symbols` (không phải Windows, không sanitizer), `check_exports` (Windows). Thiếu hoặc thừa một test thì job fail với `check-test-inventory: FAIL`, kèm danh sách `not registered:` / `unexpected:`.
 - **`TBLOG_TEST_NO_SKIP=1`** trên Linux: một test case bị bỏ qua làm test đó fail.
 - **`packaging/report-skips.sh`** chạy ở mọi job CMake (kể cả khi test fail): in mọi test case bị bỏ qua trong lần `ctest` vừa rồi, và ghi vào job summary. Chỉ để thông tin, luôn trả về 0.
 - **`lite/Makefile`**: `make -C lite test` fail với `tblog-lite: not in TESTS: ...` nếu có `lite/tests/test_*.c` không được build và chạy.

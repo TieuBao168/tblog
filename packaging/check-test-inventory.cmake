@@ -8,7 +8,8 @@
 # Expected (from the files on disk and the build's CMakeCache.txt):
 #   tests/unit/*.cpp, tests/shared/*.cpp   one test each, named after the file
 #   examples/*.c, examples/*.cpp           example_<name>  (TBLOG_BUILD_EXAMPLES)
-#   bench_latency_smoke                    TBLOG_BUILD_BENCH, not on Windows
+#   bench_vs_printf_smoke,                 TBLOG_BUILD_BENCH (every platform)
+#   bench_crash_loss_smoke
 #   check_symbols                          not on Windows, no TBLOG_SANITIZE
 #   check_exports                          Windows
 # CONFIG is passed to `ctest -C` (multi-config generators: MSVC).
@@ -56,12 +57,12 @@ if(_examples)
     list(APPEND _expected example_${_n})
   endforeach()
 endif()
+if(_bench)
+  list(APPEND _expected bench_vs_printf_smoke bench_crash_loss_smoke)
+endif()
 if(CMAKE_HOST_WIN32)
   list(APPEND _expected check_exports)
 else()
-  if(_bench)
-    list(APPEND _expected bench_latency_smoke)
-  endif()
   if(NOT _sanitize)
     list(APPEND _expected check_symbols)
   endif()

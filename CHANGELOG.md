@@ -18,6 +18,7 @@
 - **Header công khai portable:** `<tblog/log.h>` và `<tblog/tblog.hpp>` biên dịch sạch với GCC, Clang, AppleClang, MSVC (x86, x64, ARM64; C11 / C++14 trở lên) và MinGW-w64. Macro `TBLOG_API` (export/import), kiểm tra format kiểu printf trên từng compiler.
 - **CMake là cách build chính:** `find_package(tblog)` với các target `tblog::tblog`, `tblog::tblog_static`, `tblog::tblog_shared` (`TBLOG_USE_STATIC` để chọn bản tĩnh), dùng được bằng `add_subdirectory` / FetchContent, các option `TBLOG_BUILD_SHARED`, `TBLOG_CXX_STANDARD`, `TBLOG_WITH_ZLIB`, `TBLOG_SANITIZE`, `TBLOG_WERROR`... ([docs/build.md](docs/build.md)).
 - CI trên GitHub Actions: Linux (glibc, musl), macOS, Windows ([docs/testing.md](docs/testing.md#ci)).
+- **So sánh với `printf`** ([docs/benchmarks.md](docs/benchmarks.md)): `bench/bench_vs_printf` (thông lượng, latency mỗi lệnh, lệnh bị lọc theo level) và `bench/bench_crash_loss` (số dòng mất khi crash, `kill -9`, `exit`, `_Exit`), kết quả JSON + `bench/report.py`, workflow chạy tay `bench.yml`. Thay cho `bench/bench_latency` (test `bench_latency_smoke` thành `bench_vs_printf_smoke` và `bench_crash_loss_smoke`, chạy trên mọi nền tảng).
 
 ### Sửa
 

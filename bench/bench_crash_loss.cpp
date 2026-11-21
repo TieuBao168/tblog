@@ -22,8 +22,12 @@
 // Scenarios: segv_main, segv_other_thread, abort, assert, uncaught_exception,
 // stack_overflow, stack_overflow_thread, kill_hard, exit, _Exit (see
 // kScenarios). Variants: fprintf_buffered, fprintf_flush, tblog (default
-// config except file only; full_policy = drop, the default), and on request
-// tblog_block, fprintf_unbuffered.
+// config except file only; full_policy = block, the default),
+// tblog_flush_error (tblog + flush.on_level = ERROR; every 100th line of a
+// thread is an ERROR line), and on request tblog_drop, fprintf_unbuffered.
+// For variants with ERROR lines the parent also counts the INFO and the
+// ERROR lines lost, and the lines lost up to each thread's last acknowledged
+// ERROR line (flush.on_level promises 0 there, even for kill -9 / _Exit).
 #undef NDEBUG  // the `assert` scenario needs a live assert(), whatever the build type
 #include <cassert>
 
@@ -96,16 +100,24 @@ struct Variant {
     Kind kind;
     const char *policy;
     bool unbuffered;
+    const char *extra_config;  // tblog: more log.conf lines
+    long error_every;          // tblog: every Nth line of a thread is an ERROR line (0: none)
     const char *desc;
 };
 
+// Every 100th line an ERROR line: at 20 000 lines/s per thread, 200 ERROR
+// lines/s per thread, i.e. one every 5 ms.
+constexpr long kErrorEvery = 100;
+
 const Variant kVariants[] = {
-    {"fprintf_buffered", kStdio, "", false, "fprintf to one shared FILE* opened \"wb\", default stdio buffering"},
-    {"fprintf_flush", kStdioFlush, "", false, "fprintf + fflush after every line"},
-    {"fprintf_unbuffered", kStdio, "", true, "fprintf with setvbuf(_IONBF)"},
-    {"tblog", kTblog, "drop", false,
-     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB); full_policy=drop (default)"},
-    {"tblog_block", kTblog, "block", false, "as tblog, full_policy=block"},
+    {"fprintf_buffered", kStdio, "", false, "", 0, "fprintf to one shared FILE* opened \"wb\", default stdio buffering"},
+    {"fprintf_flush", kStdioFlush, "", false, "", 0, "fprintf + fflush after every line"},
+    {"fprintf_unbuffered", kStdio, "", true, "", 0, "fprintf with setvbuf(_IONBF)"},
+    {"tblog", kTblog, "block", false, "", 0,
+     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB); full_policy=block (default)"},
+    {"tblog_flush_error", kTblog, "block", false, "flush.on_level = ERROR\n", kErrorEvery,
+     "as tblog + flush.on_level=ERROR; every 100th line of each thread is TBLOG_ERROR (same text)"},
+    {"tblog_drop", kTblog, "drop", false, "", 0, "as tblog, full_policy=drop"},
 };
 
 const Variant *find_variant(const std::string &n) {
@@ -129,6 +141,7 @@ struct Shared {
     std::atomic<uint64_t> dropped;   // tblog_dropped_count() at the last acknowledgement
     std::atomic<uint64_t> trigger_ns;  // steady_clock when the fatal action started (kill_hard: the parent)
     Slot acked[kMaxThreads];         // last index whose logging call returned
+    Slot last_error[kMaxThreads];    // last ERROR index whose logging call returned
 };
 
 class Mapping {
@@ -181,6 +194,7 @@ static_assert(sizeof(Shared) <= 4096, "Shared must fit the mapping");
 Shared *g_sh = nullptr;
 FILE *g_file = nullptr;
 Kind g_kind = kStdio;
+long g_error_every = 0;
 uint64_t g_rate = 0;
 std::atomic<int> g_zero{0};
 
@@ -234,11 +248,15 @@ const char *const kNames[kMaxThreads] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6
 
 inline void log_line(int t, long i) {
     if (g_kind == kTblog) {
-        BENCH_TBLOG_LINE(i, kNames[t]);
+        const bool err = g_error_every && i % g_error_every == 0;
+        if (err) BENCH_TBLOG_ERROR_LINE(i, kNames[t]);
+        else BENCH_TBLOG_LINE(i, kNames[t]);
         g_sh->dropped.store(tblog_dropped_count(), std::memory_order_relaxed);
-    } else {
-        BENCH_FPRINTF_LINE(g_file, i, kNames[t], g_kind == kStdioFlush);
+        g_sh->acked[t].v.store(i, std::memory_order_release);  // the call returned
+        if (err) g_sh->last_error[t].v.store(i, std::memory_order_release);
+        return;
     }
+    BENCH_FPRINTF_LINE(g_file, i, kNames[t], g_kind == kStdioFlush);
     g_sh->acked[t].v.store(i, std::memory_order_release);  // the call returned
 }
 
@@ -268,6 +286,7 @@ int child_main(const Args &a) {
     g_sh = m.get();
     if (g_sh->magic != kMagic || (int)g_sh->threads != scn->threads) return 94;
     g_kind = var->kind;
+    g_error_every = var->error_every;
     if (g_kind == kTblog) {
         if (tblog_init((dir + "/log.conf").c_str()) != 0) return 92;
     } else {
@@ -517,6 +536,7 @@ private:
 // ------------------------------------------------------------------ parent: log check
 // Matches one line of the layout in bench_common.h:
 //   YYYY-MM-DD HH:MM:SS.uuuuuu [INFO] [<tid>] <file>:<line> - iteration <i> value=<v> name=t<k>
+// ([ERROR] instead of [INFO] for the ERROR lines of tblog_flush_error).
 struct Cursor {
     const char *p, *e;
     bool lit(const char *s) {
@@ -545,12 +565,16 @@ struct Cursor {
     }
 };
 
-bool parse_line(const char *b, const char *e, int *thread, long long *index) {
+bool parse_line(const char *b, const char *e, int *thread, long long *index, bool *is_error) {
     Cursor c{b, e};
     long long tid, line, i, v, t;
     if (!(c.digits(4) && c.lit("-") && c.digits(2) && c.lit("-") && c.digits(2) && c.lit(" ") && c.digits(2) &&
-          c.lit(":") && c.digits(2) && c.lit(":") && c.digits(2) && c.lit(".") && c.digits(6) &&
-          c.lit(" [INFO] [") && c.number(&tid) && c.lit("] ") && c.until(':') && c.lit(":") && c.number(&line) &&
+          c.lit(":") && c.digits(2) && c.lit(":") && c.digits(2) && c.lit(".") && c.digits(6)))
+        return false;
+    *is_error = c.lit(" [ERROR] [");
+    if (!(*is_error || c.lit(" [INFO] [")))
+        return false;
+    if (!(c.number(&tid) && c.lit("] ") && c.until(':') && c.lit(":") && c.number(&line) &&
           c.lit(" - iteration ") && c.number(&i) && c.lit(" value=") && c.number(&v) && c.lit(" name=t") &&
           c.number(&t)))
         return false;
@@ -563,17 +587,22 @@ bool parse_line(const char *b, const char *e, int *thread, long long *index) {
 struct Check {
     long long acked = 0, found = 0, lost = 0, missing = 0, duplicates = 0, corrupt = 0, torn = 0,
               beyond_ack = 0, markers = 0;
+    // error_every > 0 only: acknowledged INFO / ERROR lines missing, lines
+    // missing among 1..last acknowledged ERROR line (per thread, summed).
+    long long info_missing = 0, error_missing = 0, missing_to_last_error = 0, last_error = 0;
     std::vector<long long> lost_per_thread;
 };
 
-Check check_log(const std::string &text, const Shared &sh, int threads) {
+Check check_log(const std::string &text, const Shared &sh, int threads, long error_every) {
     Check r;
     std::vector<std::vector<uint8_t>> seen((size_t)threads);
-    std::vector<long long> acked((size_t)threads);
+    std::vector<long long> acked((size_t)threads), last_err((size_t)threads);
     for (int t = 0; t < threads; ++t) {
         acked[(size_t)t] = sh.acked[t].v.load();
+        last_err[(size_t)t] = std::min<long long>(sh.last_error[t].v.load(), acked[(size_t)t]);
         seen[(size_t)t].assign((size_t)acked[(size_t)t] + 2, 0);
         r.acked += acked[(size_t)t];
+        r.last_error += last_err[(size_t)t];
     }
     size_t pos = 0;
     while (pos < text.size()) {
@@ -595,7 +624,9 @@ Check check_log(const std::string &text, const Shared &sh, int threads) {
         }
         int t = 0;
         long long i = 0;
-        if (!parse_line(b, e, &t, &i) || t >= threads || i < 1) {
+        bool is_error = false;
+        if (!parse_line(b, e, &t, &i, &is_error) || t >= threads || i < 1 ||
+            is_error != (error_every > 0 && i % error_every == 0)) {
             ++r.corrupt;
             continue;
         }
@@ -612,7 +643,13 @@ Check check_log(const std::string &text, const Shared &sh, int threads) {
         long long k = 0;
         while (k < acked[(size_t)t] && seen[(size_t)t][(size_t)k + 1]) ++k;
         long long miss = 0;
-        for (long long i = 1; i <= acked[(size_t)t]; ++i) miss += seen[(size_t)t][(size_t)i] == 0;
+        for (long long i = 1; i <= acked[(size_t)t]; ++i) {
+            if (seen[(size_t)t][(size_t)i]) continue;
+            ++miss;
+            if (error_every > 0 && i % error_every == 0) ++r.error_missing;
+            else ++r.info_missing;
+            if (i <= last_err[(size_t)t]) ++r.missing_to_last_error;
+        }
         r.lost += acked[(size_t)t] - k;
         r.missing += miss;
         r.lost_per_thread.push_back(acked[(size_t)t] - k);
@@ -655,6 +692,10 @@ std::string trial_json(const Trial &t) {
         .num("torn", double(t.chk.torn))
         .num("beyond_ack", double(t.chk.beyond_ack))
         .num("markers", double(t.chk.markers))
+        .num("info_missing", double(t.chk.info_missing))
+        .num("error_missing", double(t.chk.error_missing))
+        .num("missing_to_last_error", double(t.chk.missing_to_last_error))
+        .num("last_error_acked", double(t.chk.last_error))
         .num("tblog_dropped", double(t.dropped))
         .num("trigger_to_exit_ms", t.trigger_to_exit_ms);
     if (!t.child_output.empty()) o.str("child_output", t.child_output);
@@ -668,7 +709,14 @@ std::string summary_json(const std::vector<Trial> &ts) {
     std::vector<double> lost;
     double sum_tte = 0, max_tte = 0;
     int n_tte = 0;
+    double sum_im = 0, max_im = 0, sum_em = 0, max_em = 0, sum_ml = 0, max_ml = 0;
     for (const Trial &t : ts) {
+        sum_im += double(t.chk.info_missing);
+        max_im = std::max(max_im, double(t.chk.info_missing));
+        sum_em += double(t.chk.error_missing);
+        max_em = std::max(max_em, double(t.chk.error_missing));
+        sum_ml += double(t.chk.missing_to_last_error);
+        max_ml = std::max(max_ml, double(t.chk.missing_to_last_error));
         if (t.trigger_to_exit_ms >= 0) {
             sum_tte += t.trigger_to_exit_ms;
             max_tte = std::max(max_tte, t.trigger_to_exit_ms);
@@ -707,6 +755,12 @@ std::string summary_json(const std::vector<Trial> &ts) {
         .num("torn", double(torn))
         .num("beyond_ack", double(beyond))
         .num("tblog_dropped", double(dropped))
+        .num("mean_info_missing", sum_im / n)
+        .num("max_info_missing", max_im)
+        .num("mean_error_missing", sum_em / n)
+        .num("max_error_missing", max_em)
+        .num("mean_missing_to_last_error", sum_ml / n)
+        .num("max_missing_to_last_error", max_ml)
         .num("mean_trigger_to_exit_ms", n_tte ? sum_tte / n_tte : -1)
         .num("max_trigger_to_exit_ms", n_tte ? max_tte : -1)
         .done();
@@ -719,8 +773,8 @@ void usage() {
         "  --trials N            trials per (scenario, variant) (default 20)\n"
         "  --scenarios LIST      default: all (segv_main,segv_other_thread,abort,assert,uncaught_exception,\n"
         "                        stack_overflow,stack_overflow_thread,kill_hard,exit,_Exit)\n"
-        "  --variants LIST       fprintf_buffered,fprintf_flush,tblog (default); also tblog_block,\n"
-        "                        fprintf_unbuffered\n"
+        "  --variants LIST       fprintf_buffered,fprintf_flush,tblog,tblog_flush_error (default);\n"
+        "                        also tblog_drop, fprintf_unbuffered\n"
         "  --rate N              lines/s per logging thread in the child (default 20000; 0 = flood)\n"
         "  --min-lines N --max-lines N   N lines before the trigger (default rate/20 .. rate/4)\n"
         "  --min-ms N --max-ms N         random delay of segv_other_thread / kill_hard (default 50 .. 250)\n"
@@ -746,7 +800,7 @@ int parent_main(const Args &args, const char *argv0) {
         for (const Scenario &s : kScenarios) snames.push_back(s.name);
     else
         snames = split(args.get("--scenarios", ""));
-    const std::vector<std::string> vnames = split(args.get("--variants", "fprintf_buffered,fprintf_flush,tblog"));
+    const std::vector<std::string> vnames = split(args.get("--variants", "fprintf_buffered,fprintf_flush,tblog,tblog_flush_error"));
     for (const auto &s : snames)
         if (!find_scenario(s)) {
             std::fprintf(stderr, "unknown scenario %s\n", s.c_str());
@@ -782,7 +836,8 @@ int parent_main(const Args &args, const char *argv0) {
                 const std::string dir = base + "/c" + std::to_string(counter++);
                 remove_tree(dir);
                 make_dirs(dir);
-                if (var.kind == kTblog) write_file(dir + "/log.conf", tblog_config(dir + "/app.log", var.policy));
+                if (var.kind == kTblog)
+                    write_file(dir + "/log.conf", tblog_config(dir + "/app.log", var.policy, var.extra_config));
                 Trial t;
                 t.param = param;
                 Mapping m;
@@ -812,7 +867,7 @@ int parent_main(const Args &args, const char *argv0) {
                 const uint64_t trig = m.get()->trigger_ns.load(), end = now_ns();
                 t.trigger_to_exit_ms = trig && end > trig ? double(end - trig) / 1e6 : -1;
                 t.outcome_ok = outcome_expected(scn.name, t.out);
-                t.chk = check_log(read_file(dir + "/app.log"), *m.get(), scn.threads);
+                t.chk = check_log(read_file(dir + "/app.log"), *m.get(), scn.threads, var.error_every);
                 t.dropped = m.get()->dropped.load();
                 if (!t.outcome_ok) {
                     t.child_output = read_file(dir + "/child.txt").substr(0, 400);
@@ -843,6 +898,7 @@ int parent_main(const Args &args, const char *argv0) {
                                 .str("scenario", scn.name)
                                 .str("variant", vnames[j])
                                 .num("threads", scn.threads)
+                                .num("error_every", double(find_variant(vnames[j])->error_every))
                                 .str("expected_outcome", expected_text(scn.name))
                                 .boolean("crash_handler_expected", scn.crash)
                                 .raw("summary", summary_json(ts))

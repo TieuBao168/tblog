@@ -1,6 +1,6 @@
 // Tests for the queue and the file output: RotatingFile, Queue (sharded double
 // buffers: ordering, drop / block, urgent wake-up, take / release, crash
-// drain) and the Pipeline that feeds the FileSink and other sinks from it.
+// drain, flush.on_level waits) and the Pipeline that feeds the FileSink and other sinks from it.
 #include "logger/pipeline.h"
 #include "pipeline_util.h"
 #include "queue/queue.h"
@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -111,11 +112,11 @@ struct Worker {
     Pipeline *b;
     std::atomic<bool> stop{false};
     std::thread th;
-    explicit Worker(Pipeline *be, int delay_ms = 0) : b(be) {
-        th = std::thread([this, delay_ms] {
+    explicit Worker(Pipeline *be, int delay_ms = 0, int cycle_ms = 20) : b(be) {
+        th = std::thread([this, delay_ms, cycle_ms] {
             if (delay_ms) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
             while (!stop.load()) {
-                b->queue().wait_for_work(std::chrono::milliseconds(20));
+                b->queue().wait_for_work(std::chrono::milliseconds(cycle_ms));
                 b->drain();
                 if (b->queue().consume_urgent()) b->sync();
             }
@@ -1116,6 +1117,203 @@ TEST(pipeline_crash_while_threads_log_loses_nothing) {
         b->shutdown();
     }
     std::printf("  %d rounds, %ld lines\n", rounds, total_lines);
+}
+
+// ---------------------------------------------------------------- flush.on_level
+// A crash-safe sink (like the file) that records, per writing thread of
+// make_line(), the highest sequence number it has received, so a caller can
+// check that its line was written before append() returned.
+struct SpySink : LogSink {
+    static constexpr int kMaxT = 16;
+    std::atomic<int> seen[kMaxT];
+    std::string data;  // worker only; read after the worker stopped
+    Queue *log_from_write = nullptr;  // a sink that logs (at ERROR) from write()
+    std::atomic<int> writes{0};
+    SpySink() {
+        for (auto &x : seen) x.store(-1);
+    }
+    void write(const char *d, size_t n) override {
+        data.append(d, n);
+        size_t pos = 0;
+        while (pos < n) {
+            const char *nl = static_cast<const char *>(std::memchr(d + pos, '\n', n - pos));
+            const size_t end = nl ? static_cast<size_t>(nl - d) : n;
+            int t, s;
+            if (parse_line(std::string(d + pos, end - pos), &t, &s) && t < kMaxT && s > seen[t].load())
+                seen[t].store(s, std::memory_order_relaxed);
+            pos = end + 1;
+        }
+        writes.fetch_add(1);
+        if (Queue *q = log_from_write) {
+            log_from_write = nullptr;
+            q->append("from the sink\n", 14, TBLOG_LV_ERROR);
+        }
+    }
+    bool crash_safe() const noexcept override { return true; }
+    void crash_write(const char *d, size_t n) noexcept override { data.append(d, n); }
+};
+
+static double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// 8 threads (8 shards on a machine with >= 8 CPUs), every 100th line ERROR
+// with flush.on_level = ERROR, a worker that otherwise sleeps 1 s per cycle,
+// small shards (full_policy = block kicks in). When an ERROR append returns,
+// the sink already has that line and every earlier line of the thread.
+TEST(queue_flush_level_caller_returns_after_write) {
+    QueueOptions qo;
+    qo.buffer_size = 4096;  // 64 KB shards: they fill, block, swap
+    qo.flush_level = TBLOG_LV_ERROR;
+    qo.flush_wait_ms = 10000;
+    Pipeline p(Queue::create(qo));
+    SpySink *spy = new SpySink;
+    p.add_sink(std::unique_ptr<LogSink>(spy));
+    Worker w(&p, 0, 1000);
+    const int T = 8, N = 4000 / kScale;
+    std::atomic<long> early{0}, errors{0};
+    std::vector<double> worst(T, 0);
+    std::vector<std::thread> th;
+    for (int t = 0; t < T; ++t)
+        th.emplace_back([&, t] {
+            char line[128];
+            for (int i = 0; i < N; ++i) {
+                const int n = make_line(line, t, i);
+                const bool err = i % 100 == 99;
+                const auto t0 = std::chrono::steady_clock::now();
+                EXPECT_TRUE(p.queue().append(line, n, err ? TBLOG_LV_ERROR : TBLOG_LV_INFO));
+                if (!err) continue;
+                worst[t] = std::max(worst[t], ms_since(t0));
+                ++errors;
+                if (spy->seen[t].load() < i) ++early;  // returned before the write
+            }
+        });
+    for (auto &x : th) x.join();
+    w.join();
+    p.shutdown();
+    EXPECT_EQ(early.load(), 0L);
+    EXPECT_EQ(errors.load(), static_cast<long>(T) * (N / 100));
+    const double max_wait = *std::max_element(worst.begin(), worst.end());
+    EXPECT_TRUE(max_wait < 900);  // the worker was woken, not waited for (1 s cycle)
+    EXPECT_EQ(verify_lines(spy->data, T, N, true), static_cast<long>(T) * N);
+    std::printf("  %ld ERROR lines, slowest %.2f ms, %d sink writes\n", errors.load(), max_wait,
+                spy->writes.load());
+}
+
+// Below the level: no wait at all. At or above it with no worker: bounded by
+// flush_wait_ms. set_flush_level() (hot-reload) takes effect at once.
+TEST(queue_flush_level_below_level_and_bounded_wait) {
+    QueueOptions qo;
+    qo.flush_level = TBLOG_LV_ERROR;
+    qo.flush_wait_ms = 300;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    char line[128];
+    const int n = make_line(line, 0, 1);
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i) EXPECT_TRUE(q->append(line, n, i % 2 ? TBLOG_LV_INFO : TBLOG_LV_WARN));
+    EXPECT_TRUE(ms_since(t0) < 200);
+    t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(q->append(line, n, TBLOG_LV_ERROR));  // nobody writes: times out
+    double waited = ms_since(t0);
+    EXPECT_TRUE(waited >= 250 && waited < 5000);
+    q->set_flush_level(TBLOG_LV_OFF);
+    EXPECT_EQ(int(q->flush_level()), int(TBLOG_LV_OFF));
+    t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(q->append(line, n, TBLOG_LV_FATAL));
+    EXPECT_TRUE(ms_since(t0) < 200);
+    q->set_flush_level(TBLOG_LV_WARN);
+    t0 = std::chrono::steady_clock::now();
+    EXPECT_TRUE(q->append(line, n, TBLOG_LV_WARN));
+    waited = ms_since(t0);
+    EXPECT_TRUE(waited >= 250 && waited < 5000);
+    std::printf("  bounded wait: %.0f ms (flush_wait_ms = 300)\n", waited);
+}
+
+// A waiting caller returns when the queue is closed (shutdown) or crashes,
+// long before flush_wait_ms; a dropped line never waits.
+TEST(queue_flush_level_no_hang_on_close_crash_drop) {
+    TempDir d("flush_nohang");
+    {
+        QueueOptions qo;
+        qo.flush_level = TBLOG_LV_ERROR;
+        qo.flush_wait_ms = 20000;
+        auto q = Queue::create(qo);
+        ASSERT_TRUE(q != nullptr);
+        std::atomic<int> res{-1};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::thread t([&] { res = q->append("err\n", 4, TBLOG_LV_ERROR); });
+        tos::sleep_ms(100);
+        EXPECT_EQ(res.load(), -1);  // still waiting
+        q->close();
+        t.join();
+        EXPECT_EQ(res.load(), 1);  // accepted before the close
+        EXPECT_TRUE(ms_since(t0) < 3000);
+    }
+    {
+        PipeOptions o;
+        o.file.path = d.file("crash.log");
+        o.flush_level = TBLOG_LV_ERROR;
+        o.flush_wait_ms = 20000;
+        auto b = make_pipe(o);
+        ASSERT_TRUE(b != nullptr);
+        std::atomic<int> res{-1};
+        const auto t0 = std::chrono::steady_clock::now();
+        std::thread t([&] { res = b->queue().append("err before crash\n", 17, TBLOG_LV_ERROR); });
+        tos::sleep_ms(100);
+        EXPECT_EQ(res.load(), -1);
+        const char m[] = "*** tblog: caught signal 11 (SIGSEGV) ***\n";
+        b->crash(m, sizeof m - 1);  // a signal handler cannot notify: the waiter polls
+        t.join();
+        EXPECT_EQ(res.load(), 1);
+        EXPECT_TRUE(ms_since(t0) < 3000);
+        // After the crash: written synchronously, no wait.
+        const auto t1 = std::chrono::steady_clock::now();
+        EXPECT_TRUE(b->queue().append("err after crash\n", 16, TBLOG_LV_ERROR));
+        EXPECT_TRUE(ms_since(t1) < 1000);
+        EXPECT_TRUE(read_file(o.file.path) == std::string("err before crash\n") + m + "err after crash\n");
+        b->shutdown();
+    }
+    {
+        QueueOptions qo;
+        qo.buffer_size = 4096;  // 64 KB shard
+        qo.policy = FullPolicy::Drop;
+        qo.flush_level = TBLOG_LV_ERROR;
+        qo.flush_wait_ms = 20000;
+        auto q = Queue::create(qo);
+        ASSERT_TRUE(q != nullptr);
+        std::string line(63, 'd');
+        line.push_back('\n');
+        for (int i = 0; i < 1024; ++i) EXPECT_TRUE(q->append(line.data(), 64, TBLOG_LV_INFO));
+        const auto t0 = std::chrono::steady_clock::now();
+        EXPECT_FALSE(q->append(line.data(), 64, TBLOG_LV_ERROR));  // full: dropped, no wait
+        EXPECT_TRUE(ms_since(t0) < 1000);
+        EXPECT_EQ(q->dropped(), 1ull);
+    }
+}
+
+// The worker never waits for itself: a sink that logs at the flush level
+// from write() (and the thread that runs drain()) returns at once.
+TEST(queue_flush_level_worker_does_not_wait_for_itself) {
+    QueueOptions qo;
+    qo.flush_level = TBLOG_LV_ERROR;
+    qo.flush_wait_ms = 20000;
+    Pipeline p(Queue::create(qo));
+    SpySink *spy = new SpySink;
+    spy->log_from_write = &p.queue();
+    p.add_sink(std::unique_ptr<LogSink>(spy));
+    char line[128];
+    const int n = make_line(line, 0, 0);
+    EXPECT_TRUE(p.queue().append(line, n, TBLOG_LV_INFO));
+    std::thread worker([&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        p.drain();  // the sink logs an ERROR line from inside write()
+        EXPECT_TRUE(ms_since(t0) < 1000);
+        p.drain();  // ... which goes out with the next cycle
+    });
+    worker.join();
+    p.shutdown();
+    EXPECT_TRUE(spy->data == std::string(line, n) + "from the sink\n");
 }
 
 // ---------------------------------------------------------------- benchmark

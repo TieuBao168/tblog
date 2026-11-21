@@ -25,10 +25,11 @@ struct Config {
     bool file_enabled = true;  // `file`: false = no log file (console / syslog / user sinks only)
     FileOptions file;
     size_t buffer_size = 4u << 20;
-    FullPolicy full_policy = FullPolicy::Drop;
+    FullPolicy full_policy = FullPolicy::Block;
     uint32_t flush_interval_ms = 200;
     uint32_t sync_interval_ms = 1000;
     tblog_level urgent_level = TBLOG_LV_ERROR;  // sync.on_level: wake worker + sync at >= this
+    tblog_level flush_level = TBLOG_LV_OFF;     // flush.on_level: caller waits for the write at >= this
     bool console = false;
     bool console_color = true;
     bool syslog = false;
@@ -39,8 +40,8 @@ struct Config {
 // Keys: level, pattern, file, file.path, file.max_size, file.max_files,
 // file.rotate (size|daily|hourly), file.compress (none|gzip; gzip needs a
 // zlib build), buffer.size, full_policy (drop|block),
-// flush.interval_ms, sync.interval_ms, sync.on_level, console, console.color,
-// syslog, module.<name>, reload.watch.
+// flush.interval_ms, flush.on_level, sync.interval_ms, sync.on_level,
+// console, console.color, syslog, module.<name>, reload.watch.
 // Sizes accept B/KB/MB/GB suffixes. Bools: true/false/1/0/yes/no/on/off.
 // '#' starts a comment (outside the value of `pattern`, see parser docs).
 // Unknown key / bad value -> a warning string, field keeps its previous value.
@@ -65,6 +66,8 @@ bool load_config(const char *path, Config &out, std::vector<std::string> *warnin
 //     sync.interval_ms to [0, kSyncIntervalMaxMs] (programmatic configs; the
 //     parser clamps already)
 //   * empty file.path / pattern -> the default (programmatic configs)
+//   * flush.on_level below INFO -> warning only (value kept): nearly every
+//     line would wait for the worker's write
 //   * file = false with no console, no syslog and no user sink
 //     (user_sinks == 0, the number of tblog_add_sink() sinks) -> console on,
 //     so the lines still go somewhere

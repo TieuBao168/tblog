@@ -2,10 +2,12 @@
 // the crash handler together:
 //
 //   caller -- tblog_write: level check -> format into the thread's scratch
-//             buffer -> Queue::append (src/queue/queue.h)
+//             buffer -> Queue::append (src/queue/queue.h; at >= flush.on_level
+//             it returns once the worker wrote the line)
 //   worker -- worker_main: wait -> Pipeline::drain (take the queue, write the
-//             chunks to every sink, release, flush) -> urgent line? request a
-//             sync -> tblog_flush handshake (src/logger/pipeline.h)
+//             chunks to every sink, release the flush.on_level callers,
+//             release, flush) -> urgent line? request a sync -> tblog_flush
+//             handshake (src/logger/pipeline.h)
 //   syncer -- syncer_main: Pipeline::sync (fdatasync) every sync.interval_ms
 //             and on urgent lines
 //   crash  -- Pipeline::crash from the signal handler (src/crash/)
@@ -120,6 +122,7 @@ void reload(Runtime *rt) {
     }
     rt->flush_interval_ms.store(next.flush_interval_ms, std::memory_order_relaxed);
     rt->sync_interval_ms.store(next.sync_interval_ms, std::memory_order_relaxed);
+    rt->queue->set_flush_level(next.flush_level);
 
     if (next.file_enabled != rt->cfg.file_enabled || next.file.path != rt->cfg.file.path ||
         next.buffer_size != rt->cfg.buffer_size || next.console != rt->cfg.console ||
@@ -217,6 +220,7 @@ std::unique_ptr<Pipeline> make_pipeline(const Config &c, const std::vector<UserS
     qo.buffer_size = c.buffer_size;
     qo.policy = c.full_policy;
     qo.urgent_level = c.urgent_level;
+    qo.flush_level = c.flush_level;
     std::unique_ptr<Queue> q = Queue::create(qo);
     if (!q) return nullptr;
     std::unique_ptr<Pipeline> p = tblog::make_unique<Pipeline>(std::move(q));

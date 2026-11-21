@@ -6,8 +6,10 @@
 // drain(), one worker cycle:
 //   take the queue -> every sink: begin_batch() -> for each chunk, in order:
 //   write it to the crash-safe sinks, mark it written (the crash handler will
-//   not write it again), write it to the other sinks -> "tblog: N lines
-//   dropped" note if the drop counter moved -> every sink: end_batch() ->
+//   not write it again), write it to the other sinks -> publish the batch as
+//   written (Queue::publish_written: callers waiting under flush.on_level
+//   return) -> "tblog: N lines dropped" note if the drop counter moved ->
+//   every sink: end_batch() ->
 //   release the buffers -> flush() every sink if anything was written (or
 //   force_flush). Every write to a crash-safe sink is bracketed by
 //   Queue::begin_write() / end_write(), so a crash handler waits for the one

@@ -97,6 +97,40 @@
 //   its cycle, so once crashed: the worker never take()s again (no buffer is
 //   handed back to producers under the handler's feet), and release() keeps
 //   every chunk that was not mark_written() published as `pending`.
+//
+// Waiting for the write (flush.on_level):
+//   Ticket: append() reads its shard's swap_gen G under the shard lock, in
+//   the same critical section as the memcpy. The line sits in the active
+//   buffer, which the next take() of that shard swaps out while raising
+//   swap_gen to G + 1 (under the same lock), so the line belongs to the
+//   batch that carries gen G + 1 for that shard (Batch::gen). After the
+//   worker has written EVERY chunk of the batch to every sink
+//   (Pipeline::drain), publish_written() stores each shard's gen into its
+//   `written_gen` (seq_cst) and, if anyone waits, notifies written_cv_.
+//   The caller waits until written_gen of ITS shard >= G + 1. A batch is
+//   written chunk by chunk in shard order and published only at its end, so
+//   when the caller returns, every line of that take (all shards) is in the
+//   sinks too. Lines of other threads that landed in a shard after the
+//   take had passed it belong to the next cycle.
+//   Lost wake-ups: the waiter increments written_waiters_ (seq_cst) under
+//   written_mu_ before it checks written_gen; the worker stores written_gen
+//   (seq_cst) before it reads written_waiters_ and locks written_mu_ to
+//   notify. Either the worker sees the waiter, or the waiter sees the gen.
+//   The waiter wakes the worker first (notify_worker), so it does not sit
+//   out flush.interval_ms; it does not set the urgent flag (that one asks
+//   for an fsync: sync.on_level).
+//   Never hangs:
+//     * bounded by flush_wait_ms (a stuck sink / disk);
+//     * returns at once when the queue is closed (shutdown: close() wakes
+//       the waiters) or crashed (crash_drain sets closed_; a signal handler
+//       cannot notify a condition variable, so the waiter re-checks every
+//       10 ms; the handler drains its line);
+//     * a dropped line (append returned false) never waits; a line written
+//       after a crash (write_after_crash) is already written on return;
+//     * the thread of the last take() (the worker, e.g. a user sink that
+//       logs) never waits for itself;
+//     * full_policy = block: the line is first admitted (wait_for_swap),
+//       then the ticket is read in the successful critical section.
 #include "queue/queue.h"
 
 #include "core/compat.h"
@@ -263,6 +297,9 @@ struct alignas(64) Queue::Shard : CacheAlignedNew {
     // Crash-handler view of the buffer being written (worker-written).
     alignas(64) std::atomic<int> pending{-1};
     std::atomic<size_t> pending_done{0};
+    // flush.on_level: swap_gen of the newest batch of this shard that has
+    // been written to every sink (publish_written).
+    std::atomic<uint64_t> written_gen{0};
 };
 
 Queue::Queue(const QueueOptions &opt)
@@ -273,7 +310,9 @@ Queue::Queue(const QueueOptions &opt)
       threshold_(cap_ - cap_ / 4),
       policy_(opt.policy),
       urgent_level_(opt.urgent_level),
-      shards_(new Shard[nshards_]) {}
+      flush_wait_ms_(opt.flush_wait_ms),
+      shards_(new Shard[nshards_]),
+      flush_level_(static_cast<int>(opt.flush_level)) {}
 
 Queue::~Queue() {
     close();
@@ -329,14 +368,19 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
                 used += len;
                 b.len.store(used, std::memory_order_release);
                 ok = true;
-            } else {
-                gen = sh.swap_gen.load(std::memory_order_relaxed);
             }
+            // Full: the swap to wait for (Block). Stored: the flush ticket
+            // (the line goes out with the take that raises this to gen + 1).
+            gen = sh.swap_gen.load(std::memory_order_relaxed);
         }
         if (ok) {
             bool urgent = lv >= urgent_level_;
             if (urgent) urgent_.store(true, std::memory_order_relaxed);
             if (used >= threshold_ || urgent) notify_worker();
+            // flush.on_level: one compare (flush_level_ shares the
+            // read-mostly cache line of closed_); OFF is above every level.
+            if (TBLOG_UNLIKELY(static_cast<int>(lv) >= flush_level_.load(std::memory_order_relaxed)))
+                wait_written(sh, gen + 1);
             return true;
         }
         // Shard full.
@@ -395,14 +439,18 @@ size_t Queue::take(Batch &out) noexcept {
         sh.pending_done.store(0, std::memory_order_relaxed);
         sh.pending.store(a, std::memory_order_release);
         sh.active.store(a ^ 1, std::memory_order_release);
-        sh.swap_gen.fetch_add(1, std::memory_order_seq_cst);
+        const uint64_t gen = sh.swap_gen.fetch_add(1, std::memory_order_seq_cst) + 1;
         // No producer writes this buffer any more: n is final.
         out.chunks[out.size].data = sh.bufs[a].data;
         out.chunks[out.size].len = n;
         out.shard[out.size] = static_cast<unsigned char>(i);
+        out.gen[out.size] = gen;
         ++out.size;
     }
-    if (out.size) wake_blocked();
+    if (out.size) {
+        worker_id_.store(pf::current_thread_id(), std::memory_order_relaxed);
+        wake_blocked();
+    }
     return out.size;
 }
 
@@ -427,6 +475,13 @@ void Queue::end_write() noexcept { writer_.store(0, std::memory_order_release); 
 
 void Queue::mark_written(const Batch &b, size_t i) noexcept {
     shards_[b.shard[i]].pending_done.store(b.chunks[i].len, std::memory_order_release);
+}
+
+void Queue::publish_written(const Batch &b) noexcept {
+    if (b.size == 0) return;
+    for (size_t i = 0; i < b.size; ++i)
+        shards_[b.shard[i]].written_gen.store(b.gen[i], std::memory_order_seq_cst);
+    wake_flush_waiters();
 }
 
 void Queue::release(Batch &b) noexcept {
@@ -462,6 +517,7 @@ void Queue::close() noexcept {
     // later ones see closed_ (the lock orders them after this store).
     for (size_t i = 0; i < nshards_; ++i) SpinGuard g(shards_[i].spin);
     wake_blocked();
+    wake_flush_waiters();
     wake();
 }
 
@@ -587,6 +643,42 @@ void Queue::notify_worker_force() noexcept {
     } catch (...) {
     }
     wait_cv_.notify_one();
+}
+
+// flush.on_level: wait until the batch holding the caller's line (ticket
+// `want` of shard `sh`) was written to every sink. See "Waiting for the
+// write" at the top. Cold: only lines at or above the flush level get here.
+TBLOG_COLD void Queue::wait_written(Shard &sh, uint64_t want) noexcept {
+    // The worker (a sink that logs, or the thread that ran the last drain)
+    // would wait for itself.
+    if (worker_id_.load(std::memory_order_relaxed) == pf::current_thread_id()) return;
+    notify_worker();
+    try {
+        using clk = std::chrono::steady_clock;
+        const clk::time_point deadline = clk::now() + std::chrono::milliseconds(flush_wait_ms_);
+        std::unique_lock<std::mutex> lk(written_mu_);
+        written_waiters_.fetch_add(1, std::memory_order_seq_cst);
+        while (sh.written_gen.load(std::memory_order_seq_cst) < want &&
+               !closed_.load(std::memory_order_seq_cst)) {
+            const clk::time_point now = clk::now();
+            if (now >= deadline) break;
+            // Slices: a crash handler sets closed_ but cannot notify.
+            const clk::duration slice = std::chrono::milliseconds(10);
+            written_cv_.wait_for(lk, deadline - now < slice ? deadline - now : slice);
+        }
+        written_waiters_.fetch_sub(1, std::memory_order_seq_cst);
+    } catch (...) {
+        // std::system_error from the mutex: stop waiting, the line is queued.
+    }
+}
+
+void Queue::wake_flush_waiters() noexcept {
+    if (written_waiters_.load(std::memory_order_seq_cst) == 0) return;
+    try {
+        std::lock_guard<std::mutex> lk(written_mu_);
+    } catch (...) {
+    }
+    written_cv_.notify_all();
 }
 
 void Queue::wake_blocked() noexcept {

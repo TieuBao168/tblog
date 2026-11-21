@@ -115,6 +115,28 @@ def perf_full(doc):
             + " (%s/s)" % si(med(g[(v, t)]["summary"], "achieved_lines_per_s"))
             if (v, t) in g else "-" for v in vs] for t in ts]))
         out.append("")
+    fl = flush_rows(doc)
+    if fl:
+        out += ["**flush.on_level = ERROR** (flood; %s lines per run split over the threads, at most %s ERROR "
+                "lines per thread; the ERROR lines evenly spread). sync.on_level: ERROR = the default (each batch "
+                "with an ERROR line is also fsynced, on the sync thread), OFF = periodic sync only. Latency "
+                "p50 / p99 / p99.9 / max:" % (si(cfg.get("flush_lines_per_run")),
+                                              si(cfg.get("flush_max_errors_per_thread"))), ""]
+        rows = []
+        for t, pct, nosync, c in fl:
+            m = c["summary"]
+            rows.append([t, "%d%%" % pct, "OFF" if nosync else "ERROR", rng(m, "e2e_lines_per_s", si),
+                         si(med(m, "loop_lines_per_s")),
+                         " / ".join(ns(med(m, k)) for k in ("info_p50_ns", "info_p99_ns", "info_p999_ns", "info_max_ns"))
+                         if "info_p50_ns" in m else "-",
+                         " / ".join(ns(med(m, k)) for k in ("error_p50_ns", "error_p99_ns", "error_p999_ns", "error_max_ns"))
+                         if "error_p50_ns" in m else "-"])
+        out.append(table(["threads", "ERROR lines", "sync.on_level", "end-to-end lines/s", "logging threads lines/s",
+                          "INFO call", "ERROR call"], rows))
+        bad = [c["variant"] + "/%d" % t for t, _, _, c in fl if not c["all_runs_ok"]]
+        if bad:
+            out += ["", "**Incomplete log files in:** " + ", ".join(bad)]
+        out.append("")
     d = cells(doc, "disabled")
     if d:
         out += ["**Disabled level** (one call that is filtered out, %s calls per run):" % si(cfg["disabled_calls"]), ""]
@@ -122,6 +144,33 @@ def perf_full(doc):
                                                                           lambda x: "%.2f" % x)] for c in d]))
         out.append("")
     return "\n".join(out)
+
+
+def flush_rows(doc):
+    """flush_level cells as (threads, error pct, nosync, cell), sorted."""
+    rows = []
+    for c in cells(doc, "flush_level"):
+        v = c["variant"]
+        nosync = "_nosync_" in v
+        try:
+            pct = int(v.rsplit("_", 1)[1].replace("pct", ""))
+        except ValueError:
+            continue
+        rows.append((c["threads"], pct, nosync, c))
+    return sorted(rows, key=lambda r: (r[0], r[2], r[1]))
+
+
+def flush_compact(doc, threads):
+    rows = []
+    for t, pct, nosync, c in flush_rows(doc):
+        if t not in threads or pct == 0:
+            continue
+        m = c["summary"]
+        rows.append([t, "%d%%" % pct, "OFF" if nosync else "ERROR", si(med(m, "e2e_lines_per_s")),
+                     "%s / %s" % (ns(med(m, "error_p50_ns")), ns(med(m, "error_p99_ns"))),
+                     "%s / %s" % (ns(med(m, "info_p50_ns")), ns(med(m, "info_p99_ns"))) if "info_p50_ns" in m else "-"])
+    return table(["threads", "ERROR lines", "sync.on_level", "end-to-end lines/s", "ERROR call p50 / p99",
+                  "INFO call p50 / p99"], rows)
 
 
 def crash_full(doc):
@@ -170,6 +219,21 @@ def crash_full(doc):
                                                   m["duplicates"], m["corrupt"], m["torn"], tte))
         rows.append(row)
     out.append(table(["scenario", "expected outcome"] + vs, rows))
+    ev = [v for v in vs if any(r["variant"] == v and r.get("error_every") for r in res)]
+    for v in ev:
+        every = next(r["error_every"] for r in res if r["variant"] == v)
+        out += ["", "**%s** (every %dth line of each thread is an ERROR line): acknowledged INFO lines lost / "
+                "acknowledged ERROR lines lost / lines lost up to each thread's last acknowledged ERROR line "
+                "(mean / max over the trials):" % (v, every), ""]
+        rows = []
+        for s in ss:
+            c = g.get((s, v))
+            if not c:
+                continue
+            m = c["summary"]
+            rows.append([s, g[(s, v)]["threads"]] + ["%.1f / %d" % (m["mean_" + k], m["max_" + k])
+                                                     for k in ("info_missing", "error_missing", "missing_to_last_error")])
+        out.append(table(["scenario", "threads", "INFO lost", "ERROR lost", "lost up to the last ERROR"], rows))
     out.append("")
     return "\n".join(out)
 
@@ -208,9 +272,9 @@ def main():
     ap.add_argument("files", nargs="+")
     ap.add_argument("--compact", action="store_true", help="README-sized tables")
     ap.add_argument("--title", default="")
-    ap.add_argument("--variants", default="fprintf_buffered,fprintf_flush,tblog_drop",
+    ap.add_argument("--variants", default="fprintf_buffered,fprintf_flush,tblog_block,tblog_drop",
                     help="compact perf table variants")
-    ap.add_argument("--crash-variants", default="fprintf_buffered,fprintf_flush,tblog")
+    ap.add_argument("--crash-variants", default="fprintf_buffered,fprintf_flush,tblog,tblog_flush_error")
     ap.add_argument("--threads", default="1,8", help="compact perf table thread counts")
     a = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
@@ -226,6 +290,8 @@ def main():
             parts.append("Machine: " + machine_line(doc["env"]) + "\n")
             if schema.startswith("tblog-bench-vs-printf"):
                 parts.append(perf_compact(doc, a.variants.split(","), [int(x) for x in a.threads.split(",")]))
+                if flush_rows(doc):
+                    parts += ["", flush_compact(doc, [int(x) for x in a.threads.split(",")])]
             elif schema.startswith("tblog-bench-crash-loss"):
                 parts.append(crash_compact(doc, a.crash_variants.split(",")))
             parts.append("")

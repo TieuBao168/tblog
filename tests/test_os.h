@@ -4,7 +4,7 @@
 //
 // Child processes re-execute the test binary itself on a TINY_CHILD scenario
 // (tiny_test.h) instead of fork()ing a copy, so the same test code runs on
-// both OSes. The child gets `arg` in the TINY_CHILD_ARG environment variable
+// both OSes (run_child(), or ChildProcess to kill a running child hard). The child gets `arg` in the TINY_CHILD_ARG environment variable
 // (tos::child_arg()), its stderr in `err_path` (optional), and runs
 // tos::child_setup() first: crash handlers reset to the defaults, no core
 // dumps / error dialogs, a 30 s self-destruct timer on POSIX.
@@ -620,93 +620,164 @@ struct ChildSetupReg {
 static ChildSetupReg g_child_setup_reg;
 }  // namespace detail
 
-// Runs TINY_CHILD(`scenario`) of this binary in a new process and waits for
-// it (at most `timeout_s`; then it is killed and timed_out is set).
-inline ChildResult run_child(const char *scenario, const std::string &arg = std::string(),
-                             const std::string &err_path = std::string(), int timeout_s = 60) {
-    ChildResult r;
-    set_env("TINY_CHILD_ARG", arg.c_str());
-    const std::string exe = self_exe();
-    const std::string flag = std::string("--tiny-child=") + scenario;
-    std::fflush(stdout);
-    std::fflush(stderr);
-#if defined(_WIN32)
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof sa;
-    sa.lpSecurityDescriptor = nullptr;
-    sa.bInheritHandle = TRUE;
-    HANDLE self = GetCurrentProcess();
-    HANDLE out = nullptr, err = nullptr;
-    HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (so && so != INVALID_HANDLE_VALUE) DuplicateHandle(self, so, self, &out, 0, TRUE, DUPLICATE_SAME_ACCESS);
-    if (!err_path.empty()) {
-        err = CreateFileW(wide(err_path).c_str(), GENERIC_WRITE,
-                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_ALWAYS,
-                          FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (err == INVALID_HANDLE_VALUE) err = nullptr;
-    } else {
-        HANDLE se = GetStdHandle(STD_ERROR_HANDLE);
-        if (se && se != INVALID_HANDLE_VALUE) DuplicateHandle(self, se, self, &err, 0, TRUE, DUPLICATE_SAME_ACCESS);
+// A child process running TINY_CHILD(`scenario`) of this binary, started
+// without waiting for it: start(), then optionally kill_hard() (SIGKILL /
+// TerminateProcess: no code of the child runs any more, like kill -9), then
+// wait(). run_child() below is start() + wait().
+class ChildProcess {
+public:
+    ChildProcess() = default;
+    ChildProcess(const ChildProcess &) = delete;
+    ChildProcess &operator=(const ChildProcess &) = delete;
+    ~ChildProcess() {
+        if (running_) {
+            kill_hard();
+            wait(10);
+        }
     }
-    std::wstring cmd = L"\"" + wide(exe) + L"\" " + wide(flag);
-    STARTUPINFOW si;
-    std::memset(&si, 0, sizeof si);
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = nullptr;
-    si.hStdOutput = out;
-    si.hStdError = err;
-    PROCESS_INFORMATION pi;
-    std::memset(&pi, 0, sizeof pi);
-    if (CreateProcessW(wide(exe).c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+
+    bool start(const char *scenario, const std::string &arg = std::string(),
+               const std::string &err_path = std::string()) {
+        err_path_ = err_path;
+        set_env("TINY_CHILD_ARG", arg.c_str());
+        const std::string exe = self_exe();
+        const std::string flag = std::string("--tiny-child=") + scenario;
+        std::fflush(stdout);
+        std::fflush(stderr);
+#if defined(_WIN32)
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof sa;
+        sa.lpSecurityDescriptor = nullptr;
+        sa.bInheritHandle = TRUE;
+        HANDLE self = GetCurrentProcess();
+        HANDLE out = nullptr, err = nullptr;
+        HANDLE so = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (so && so != INVALID_HANDLE_VALUE) DuplicateHandle(self, so, self, &out, 0, TRUE, DUPLICATE_SAME_ACCESS);
+        if (!err_path.empty()) {
+            err = CreateFileW(wide(err_path).c_str(), GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (err == INVALID_HANDLE_VALUE) err = nullptr;
+        } else {
+            HANDLE se = GetStdHandle(STD_ERROR_HANDLE);
+            if (se && se != INVALID_HANDLE_VALUE) DuplicateHandle(self, se, self, &err, 0, TRUE, DUPLICATE_SAME_ACCESS);
+        }
+        std::wstring cmd = L"\"" + wide(exe) + L"\" " + wide(flag);
+        STARTUPINFOW si;
+        std::memset(&si, 0, sizeof si);
+        si.cb = sizeof si;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = nullptr;
+        si.hStdOutput = out;
+        si.hStdError = err;
+        std::memset(&pi_, 0, sizeof pi_);
+        running_ = CreateProcessW(wide(exe).c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si,
+                                  &pi_) != FALSE;
+        if (out) CloseHandle(out);
+        if (err) CloseHandle(err);
+#else
+        pid_ = ::fork();
+        if (pid_ == 0) {
+            if (!err_path.empty()) {
+                int fd = ::open(err_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+                if (fd >= 0) {
+                    ::dup2(fd, STDERR_FILENO);
+                    ::close(fd);
+                }
+            }
+            ::execl(exe.c_str(), exe.c_str(), flag.c_str(), (char *)nullptr);
+            _exit(127);
+        }
+        running_ = pid_ > 0;
+#endif
+        return running_;
+    }
+
+    // SIGKILL / TerminateProcess (exit code 137 on Windows).
+    void kill_hard() {
+        if (!running_) return;
+#if defined(_WIN32)
+        TerminateProcess(pi_.hProcess, 137u);
+#else
+        ::kill(pid_, SIGKILL);
+#endif
+    }
+
+    // Waits at most `timeout_s` (then kills the child: timed_out).
+    ChildResult wait(int timeout_s = 60) {
+        ChildResult r;
+        if (!running_) return r;
+        running_ = false;
         r.started = true;
-        if (WaitForSingleObject(pi.hProcess, (DWORD)timeout_s * 1000u) == WAIT_TIMEOUT) {
+#if defined(_WIN32)
+        if (WaitForSingleObject(pi_.hProcess, (DWORD)timeout_s * 1000u) == WAIT_TIMEOUT) {
             r.timed_out = true;
-            TerminateProcess(pi.hProcess, 0xDEADu);
-            WaitForSingleObject(pi.hProcess, INFINITE);
+            TerminateProcess(pi_.hProcess, 0xDEADu);
+            WaitForSingleObject(pi_.hProcess, INFINITE);
         }
         DWORD code = 0;
-        GetExitCodeProcess(pi.hProcess, &code);
+        GetExitCodeProcess(pi_.hProcess, &code);
         r.exited = true;
         r.exit_code = (int)code;
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-    }
-    if (out) CloseHandle(out);
-    if (err) CloseHandle(err);
+        CloseHandle(pi_.hThread);
+        CloseHandle(pi_.hProcess);
 #else
-    pid_t pid = ::fork();
-    if (pid == 0) {
-        if (!err_path.empty()) {
-            int fd = ::open(err_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-            if (fd >= 0) {
-                ::dup2(fd, STDERR_FILENO);
-                ::close(fd);
-            }
-        }
-        ::execl(exe.c_str(), exe.c_str(), flag.c_str(), (char *)nullptr);
-        _exit(127);
-    }
-    if (pid > 0) {
-        r.started = true;
         int st = 0;
-        while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+        const uint64_t deadline = mono_ns() + (uint64_t)timeout_s * 1000000000ull;
+        for (;;) {
+            const pid_t w = ::waitpid(pid_, &st, WNOHANG);
+            if (w == pid_) break;
+            if (w < 0 && errno != EINTR) break;
+            if (mono_ns() > deadline) {  // the child's alarm() should have fired first
+                r.timed_out = true;
+                ::kill(pid_, SIGKILL);
+                while (::waitpid(pid_, &st, 0) < 0 && errno == EINTR) {
+                }
+                break;
+            }
+            sleep_ms(1);
         }
         if (WIFEXITED(st)) {
             r.exited = true;
             r.exit_code = WEXITSTATUS(st);
         } else if (WIFSIGNALED(st)) {
             r.signal = WTERMSIG(st);
-            r.timed_out = r.signal == SIGALRM;
+            r.timed_out = r.timed_out || r.signal == SIGALRM;
         }
-    }
-    (void)timeout_s;  // the child's alarm() (child_setup) bounds it
 #endif
-    if (!err_path.empty()) {
-        r.err = read_file(err_path);
-        remove_file(err_path);
+        if (!err_path_.empty()) {
+            r.err = read_file(err_path_);
+            remove_file(err_path_);
+        }
+        return r;
     }
-    return r;
+
+private:
+    bool running_ = false;
+    std::string err_path_;
+#if defined(_WIN32)
+    PROCESS_INFORMATION pi_;
+#else
+    pid_t pid_ = -1;
+#endif
+};
+
+// Runs TINY_CHILD(`scenario`) of this binary in a new process and waits for
+// it (at most `timeout_s`; then it is killed and timed_out is set).
+inline ChildResult run_child(const char *scenario, const std::string &arg = std::string(),
+                             const std::string &err_path = std::string(), int timeout_s = 60) {
+    ChildProcess c;
+    if (!c.start(scenario, arg, err_path)) return ChildResult();
+    return c.wait(timeout_s);
+}
+
+// True if the child was ended by ChildProcess::kill_hard().
+inline bool killed_hard(const ChildResult &r) {
+#if defined(_WIN32)
+    return !r.timed_out && r.exited && r.exit_code == 137;
+#else
+    return !r.timed_out && !r.exited && r.signal == SIGKILL;
+#endif
 }
 
 // Printable outcome, for failure messages.

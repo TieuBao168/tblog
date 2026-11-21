@@ -48,6 +48,10 @@ bool validate_config(Config &c, std::vector<std::string> *warnings, size_t user_
         c.sync_interval_ms = kSyncIntervalMaxMs;
         add(warnings, &n, "sync.interval_ms clamped to " + std::to_string(c.sync_interval_ms));
     }
+    if (c.flush_level < TBLOG_LV_INFO) {
+        add(warnings, &n, "flush.on_level below INFO: nearly every line waits for the worker's "
+                          "write (slow); ERROR is the usual choice");
+    }
     if (!c.file_enabled && !c.console && !c.syslog && user_sinks == 0) {
         c.console = true;
         add(warnings, &n, "file = false and no other sink (console, syslog, tblog_add_sink); "

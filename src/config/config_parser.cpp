@@ -256,6 +256,10 @@ private:
             get_interval(v, text, kFlushIntervalMinMs, kFlushIntervalMaxMs, &cfg_.flush_interval_ms);
         } else if (key == "sync.interval_ms") {
             get_interval(v, text, 0, kSyncIntervalMaxMs, &cfg_.sync_interval_ms);
+        } else if (key == "flush.on_level") {
+            tblog_level lv;
+            if (parse_level_local(v, &lv)) cfg_.flush_level = lv;
+            else warn("invalid level", text);
         } else if (key == "sync.on_level") {
             tblog_level lv;
             if (parse_level_local(v, &lv)) cfg_.urgent_level = lv;

@@ -9,8 +9,11 @@ TBLOG_INFO(...)
   level check (lọc thì dừng ở đây)
   format vào buffer thread_local
   Queue::append  ── memcpy ──> shard của thread
-                                     chờ: shard đầy 75%, dòng >= sync.on_level,
-                                          tblog_flush, hoặc flush.interval_ms
+  (dòng >= flush.on_level: chờ tới
+   khi thread nền báo "đã ghi")
+                                     chờ: shard đầy 75%, dòng >= sync.on_level
+                                          hoặc >= flush.on_level, tblog_flush,
+                                          hoặc flush.interval_ms
                                      Pipeline::drain:
                                        take: đổi buffer A/B của mọi shard
                                        begin_batch (kiểm tra xoay theo giờ)
@@ -18,12 +21,14 @@ TBLOG_INFO(...)
                                                                               console (stderr)
                                                                               syslog
                                                                               sink riêng (tblog_add_sink)
-                                       release, flush các sink
+                                       báo "đã ghi" (thả các lệnh đang chờ
+                                         theo flush.on_level), release,
+                                         flush các sink
 thread sync                          fsync file mỗi sync.interval_ms và khi có dòng >= sync.on_level
 thread nén (khi file.compress=gzip)  nén file đã xoay thành .gz
 ```
 
-- **Thread gọi log** chỉ làm: so level, format bằng `vsnprintf` vào buffer 1024 byte của thread, rồi chép vào shard của nó dưới một spinlock rất ngắn. Trường hợp thường không có system call, không cấp phát, không gọi hàm ảo. Chỉ thread đầu tiên làm shard vượt 75% (hoặc dòng khẩn) trả giá một lần đánh thức worker.
+- **Thread gọi log** chỉ làm: so level, format bằng `vsnprintf` vào buffer 1024 byte của thread, rồi chép vào shard của nó dưới một spinlock rất ngắn. Trường hợp thường không có system call, không cấp phát, không gọi hàm ảo. Chỉ thread đầu tiên làm shard vượt 75% (hoặc dòng khẩn) trả giá một lần đánh thức worker. Hai trường hợp thread gọi log chờ: shard đầy với `full_policy = block` (mặc định), và dòng ≥ `flush.on_level` ([bên dưới](#chờ-ghi-flushon_level)).
 - **Queue** (`src/queue/`): N shard (lũy thừa của 2, ≥ số CPU, tối đa 16), mỗi shard hai buffer. Mỗi thread được gán một shard cố định (round-robin) nên dòng của nó luôn đúng thứ tự. Worker trả các shard theo thứ tự shard, nên dòng của các thread khác nhau trong một lô có thể lệch thứ tự thời gian tối đa khoảng một `flush.interval_ms`.
 - **Pipeline** (`src/logger/pipeline.*`): một Queue và danh sách sink theo thứ tự file, console, syslog, sink riêng. Mỗi chunk được ghi vào các sink "crash-safe" (file, console) trước, đánh dấu đã ghi, rồi mới tới các sink còn lại. Worker chỉ ghi vào sink crash-safe khi đang giữ "quyền ghi" của Queue (một biến atomic, không phải khóa), để crash handler biết lần ghi nào đang dở.
 - **Sink** (`src/sinks/`): `FileSink` (file + `RotatingFile` xoay theo dung lượng/giờ + `Archiver` đặt tên, giữ file, nén), console, syslog, `CallbackSink` cho `tblog_add_sink`.
@@ -47,10 +52,22 @@ Worker và thread sync có alternate signal stack riêng (POSIX) / `SetThreadSta
 | `tblog_flush()` trả về | Mọi dòng đã có trước lời gọi đã nằm trong sink và đã fsync |
 | Crash: SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL; Windows: SEH exception, `abort()` | Signal handler xả buffer vào file và console, rồi ghi dòng `*** tblog: caught signal 11 (SIGSEGV) ***`. Mọi dòng mà lệnh log đã trả về trước khi process chết đều có trong file và console, nguyên vẹn, đúng một lần, kể cả dòng của các thread khác vẫn đang log trong lúc process chết: sau khi handler bắt đầu xả, lệnh log không đưa dòng vào buffer nữa mà chờ handler xong rồi tự ghi dòng thẳng vào file / console trước khi trả về (nên các dòng này nằm **sau** dòng báo crash). Chỉ dòng mà lệnh log chưa kịp trả về mới có thể mất. Syslog và sink riêng không nhận các dòng này. Chi tiết và các giới hạn: [Crash handling](#crash-handling). |
 | `TBLOG_FATAL` | Dòng FATAL được ghi và fsync, rồi `abort()` (như trên) |
-| `kill -9`, OOM killer, `TerminateProcess`, `_exit()` | **Mất** phần còn trong buffer: tối đa khoảng một `flush.interval_ms` (hoặc tới khi shard đầy 75%). Dữ liệu đã ghi xuống file thì nằm trong page cache của OS và không mất. Số đo: [benchmarks.md](benchmarks.md#kết-quả-mất-log). |
+| `kill -9`, OOM killer, `TerminateProcess`, `_exit()` | **Mất** phần còn trong buffer: tối đa khoảng một `flush.interval_ms` (hoặc tới khi shard đầy 75%). Dữ liệu đã ghi xuống file thì nằm trong page cache của OS và không mất. Với `flush.on_level`: dòng ≥ level mà lệnh log đã trả về, và mọi dòng trước nó của cùng thread, **không mất** (dòng đã được `write()` trước khi lệnh trả về); chỉ các dòng dưới level log sau dòng đó có thể mất. Số đo: [benchmarks.md](benchmarks.md#kết-quả-mất-log). |
+| Dòng ≥ `flush.on_level` trả về | Dòng đó, mọi dòng trước nó của cùng thread và mọi dòng thread nền lấy cùng lượt đã được `write()` vào mọi sink (chưa fsync). Trừ khi: shutdown đang diễn ra, process đang crash (crash handler xả dòng đó), dòng bị bỏ (`full_policy = drop`), lệnh log chạy trên thread nền, hoặc đã chờ quá 2 giây. |
 | Mất điện, kernel panic | Mất phần chưa được fsync: tối đa khoảng một `sync.interval_ms` cộng một `flush.interval_ms`. Dòng ≥ `sync.on_level` kích hoạt fsync ngay sau khi được ghi. `sync.interval_ms = 0`: chỉ sync theo `sync.on_level`, `tblog_flush` và lúc shutdown. |
 
 macOS dùng `fcntl(F_FULLFSYNC)` cho fsync (xem [platforms.md](platforms.md#macos)), nên "đã fsync" ở đây nghĩa là đã ra khỏi cache của ổ đĩa, như `fdatasync` trên Linux.
+
+## Chờ ghi (`flush.on_level`)
+
+Một dòng ≥ `flush.on_level` vào buffer như mọi dòng khác; khác ở chỗ lệnh log chờ tới khi thread nền báo đã ghi lô chứa nó (chú thích "Waiting for the write" trong `src/queue/queue.cpp`):
+
+1. **Vé:** trong cùng đoạn spinlock chép dòng vào shard, lệnh log đọc bộ đếm đổi buffer `swap_gen = G` của shard. Lần `take()` kế tiếp của thread nền đổi buffer chứa dòng đó và tăng bộ đếm lên `G + 1` (dưới cùng spinlock), nên dòng thuộc đúng lô mang số `G + 1` của shard đó. Không cần bộ đếm toàn cục: mỗi shard có vé riêng.
+2. **Đánh thức:** lệnh log đánh thức thread nền ngay (như shard đầy 75%), không đợi `flush.interval_ms`. Nó không bật cờ "khẩn" của `sync.on_level`, nên không tự kéo theo fsync.
+3. **Báo đã ghi:** sau khi ghi **mọi** chunk của lô vào mọi sink, thread nền ghi số lô của từng shard vào `written_gen` của shard đó rồi đánh thức các lệnh đang chờ (condition variable; chỉ khóa mutex khi thật sự có người chờ). Báo sau cả lô, nên khi lệnh trả về thì mọi dòng của lượt đó (mọi shard) đã nằm trong sink.
+4. **Chờ:** lệnh log chờ tới khi `written_gen` của shard nó ≥ `G + 1`. Đếm người chờ và `written_gen` dùng thứ tự seq_cst ở cả hai phía, nên không lỡ lần đánh thức nào.
+
+Không bao giờ treo: chờ tối đa 2 giây (đĩa treo); trả về ngay khi queue đóng (shutdown đánh thức người chờ) hoặc crash (signal handler không đánh thức được condition variable, nên người chờ tự kiểm tra lại mỗi 10 ms; handler xả dòng của nó vào file); dòng bị bỏ (`drop`) không chờ; dòng log sau crash được ghi đồng bộ nên không chờ; thread nền (sink riêng tự log) không chờ chính nó. Với `full_policy = block`, dòng chờ có chỗ trong buffer trước, rồi mới lấy vé. Dòng dưới level chỉ tốn một phép so sánh với một biến atomic nằm cùng cache line với cờ `closed_` (vốn đã được đọc ở mỗi lệnh log).
 
 ## Crash handling
 

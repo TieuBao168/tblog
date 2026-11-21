@@ -29,16 +29,16 @@ make -C lite test test-asan
 
 ## Các bộ test
 
-Test không cần thư viện ngoài: `tests/tiny_test.h` (khung test), `tests/test_os.h` (thao tác file/process dùng cho test, chạy trên POSIX và Windows). Test cần process con (crash, thoát process) chạy lại chính file test với `--tiny-child=<tên>` thay vì `fork`, nên chạy được cả trên Windows.
+Test không cần thư viện ngoài: `tests/tiny_test.h` (khung test), `tests/test_os.h` (thao tác file/process dùng cho test, chạy trên POSIX và Windows). Test cần process con (crash, thoát process) chạy lại chính file test với `--tiny-child=<tên>` thay vì `fork`, nên chạy được cả trên Windows: `tos::run_child()` chạy và chờ; `tos::ChildProcess` chạy không chờ để process cha giết nó cứng (`kill_hard()`); `tos::SharedFile` là vùng nhớ chia sẻ để process con báo tiến độ (vẫn đọc được sau khi nó chết).
 
 | CTest | Nguồn | Link với | Nội dung |
 |---|---|---|---|
-| `test_config` | `tests/unit/test_config.cpp` | bản tĩnh | Parser, `validate_config`, watcher, key đã bỏ |
+| `test_config` | `tests/unit/test_config.cpp` | bản tĩnh | Parser, `validate_config`, watcher, key đã bỏ, giá trị mặc định (`full_policy = block`, `flush.on_level = OFF`), `flush.on_level` |
 | `test_core` | `tests/unit/test_core.cpp` | bản tĩnh | Level, module, thread context, formatter |
 | `test_cpp_api` | `tests/unit/test_cpp_api.cpp` | bản tĩnh | API `{}`, `Logger`, kiểu tự định nghĩa, dấu lỗi (phải build được ở C++11) |
 | `test_crash_sinks` | `tests/unit/test_crash_sinks.cpp` | bản tĩnh | Crash handler qua Pipeline + Queue thật, console, syslog; process con dùng cả thư viện (4 thread log, thread thứ 5 crash): mọi dòng đã trả về có trong file và console đúng một lần |
-| `test_integration` | `tests/unit/test_integration.cpp` | bản tĩnh | Đầu cuối qua API C: SIGSEGV giữ đủ log, hot-reload, `tblog_add_sink`, `file = false` |
-| `test_queue_file` | `tests/unit/test_queue_file.cpp` | bản tĩnh | Queue (thứ tự, drop/block, đánh thức, crash drain, ghi đồng bộ sau crash, chunk đang ghi dở lúc crash), RotatingFile, Pipeline |
+| `test_integration` | `tests/unit/test_integration.cpp` | bản tĩnh | Đầu cuối qua API C: SIGSEGV giữ đủ log, hot-reload, `tblog_add_sink`, `file = false`; `flush.on_level`: dòng ERROR có trong file khi lệnh trả về (cả với `file = false` + sink riêng), hot-reload, và process con bị giết cứng (`TerminateProcess` / `SIGKILL`) ngay sau khi một dòng ERROR trả về: 10 lần, mọi dòng tới dòng ERROR cuối cùng đã trả về của mỗi thread đều có trong file |
+| `test_queue_file` | `tests/unit/test_queue_file.cpp` | bản tĩnh | Queue (thứ tự, drop/block, đánh thức, crash drain, ghi đồng bộ sau crash, chunk đang ghi dở lúc crash), RotatingFile, Pipeline; `flush.on_level`: 8 thread / 8 shard, lệnh ERROR chỉ trả về khi sink đã nhận dòng, dòng dưới level không chờ, chờ có giới hạn, không treo khi shutdown / crash / bỏ dòng, thread nền không tự chờ mình |
 | `test_rotation_time` | `tests/unit/test_rotation_time.cpp` | bản tĩnh | Xoay theo ngày/giờ với đồng hồ giả, giữ file, nén gzip và khôi phục sau crash |
 | `test_shared_exit` | `tests/shared/test_shared_exit.cpp` | bản động | Thoát process không gọi `tblog_shutdown` (Windows: đường DLL unload), crash trong DLL/.so |
 | `example_basic`, `example_cpp_api` | `examples/*` | `tblog::tblog` | Ví dụ chạy được với một `log.conf` trong thư mục nháp |

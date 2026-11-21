@@ -45,7 +45,8 @@ void Pipeline::drain(bool force_flush) {
         // it was appended.
         for (LogSink *s : sinks_) s->begin_batch();
         q.end_write();
-        for (size_t i = 0; i < b.size; ++i) {
+        size_t i = 0;
+        for (; i < b.size; ++i) {
             if (!q.begin_write()) break;  // crashed: the handler drains the rest
             const Queue::Chunk &c = b.chunks[i];
             for (LogSink *s : crash_sinks_) s->write(c.data, c.len);
@@ -54,6 +55,10 @@ void Pipeline::drain(bool force_flush) {
             for (LogSink *s : other_sinks_) s->write(c.data, c.len);
             wrote = true;
         }
+        // flush.on_level: the whole batch is in every sink (write(), before
+        // the flush() / fsync); release its waiting callers. Cut short by a
+        // crash: they return on crashed() instead.
+        if (i == b.size) q.publish_written(b);
         const uint64_t d = q.dropped();
         if (d != reported_dropped_ && q.begin_write()) {
             char line[64];

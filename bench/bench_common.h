@@ -258,6 +258,9 @@ inline const char *base_name(const char *path) {
 // The same line through tblog (the prefix comes from tblog's default pattern).
 #define BENCH_TBLOG_LINE(i, name) \
     TBLOG_INFO("iteration %ld value=%d name=%s", (long)(i), (int)((i) * 7 % 1000), (name))
+// The same line at ERROR (flush.on_level scenarios).
+#define BENCH_TBLOG_ERROR_LINE(i, name) \
+    TBLOG_ERROR("iteration %ld value=%d name=%s", (long)(i), (int)((i) * 7 % 1000), (name))
 
 // The data reached the OS (fflush) -> also the disk (like tblog_shutdown's fsync).
 inline void fsync_file(FILE *f) {
@@ -413,9 +416,10 @@ inline LineCount count_lines(const std::string &path) {
 // tblog config used by every tblog variant: the defaults, except file only
 // (console = false is the default too), no config watcher, and a file size
 // limit large enough that a run never rotates.
-inline std::string tblog_config(const std::string &log_path, const char *policy) {
+// `extra`: more `key = value` lines (e.g. "flush.on_level = ERROR\n").
+inline std::string tblog_config(const std::string &log_path, const char *policy, const std::string &extra = "") {
     return "file.path = " + log_path + "\nconsole = false\nreload.watch = false\nfile.max_size = 4GB\n" +
-           "full_policy = " + policy + "\n";
+           "full_policy = " + policy + "\n" + extra;
 }
 
 // ------------------------------------------------------------------ options

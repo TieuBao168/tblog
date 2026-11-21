@@ -200,7 +200,7 @@ TEST(invalid_values_keep_previous) {
         "file.max_size = -5MB", "file.max_files = abc", "buffer.size = 0",
         "buffer.size = MB", "full_policy = maybe",
         "flush.interval_ms = fast", "flush.interval_ms = -3", "sync.interval_ms = 1e3",
-        "sync.on_level = NOPE", "console = maybe", "console.color = 2", "syslog = ",
+        "sync.on_level = NOPE", "flush.on_level = SOMETIMES", "console = maybe", "console.color = 2", "syslog = ",
         "reload.watch = yesno", "module.net = LOUD", "module. = INFO", "no equals sign",
         "= value", "file.max_files = 99999999999999999999",
     };
@@ -226,6 +226,7 @@ TEST(invalid_values_keep_previous) {
     EXPECT_EQ(c.flush_interval_ms, before.flush_interval_ms);
     EXPECT_EQ(c.sync_interval_ms, before.sync_interval_ms);
     EXPECT_EQ(int(c.urgent_level), int(before.urgent_level));
+    EXPECT_EQ(int(c.flush_level), int(before.flush_level));
     EXPECT_EQ(c.console, before.console);
     EXPECT_EQ(c.console_color, before.console_color);
     EXPECT_EQ(c.syslog, before.syslog);
@@ -521,6 +522,65 @@ TEST(file_key) {
     EXPECT_FALSE(parse_config_string("file = maybe\n", c, &w));  // keeps previous
     EXPECT_TRUE(c.file_enabled);
     EXPECT_TRUE(any_contains(w, "invalid boolean"));
+}
+
+// Defaults that matter for durability: full_policy = block (no line is ever
+// dropped), flush.on_level = OFF (no caller ever waits for the disk).
+TEST(defaults_block_policy_and_flush_level_off) {
+    const Config d;
+    EXPECT_TRUE(d.full_policy == FullPolicy::Block);
+    EXPECT_EQ(int(d.flush_level), int(TBLOG_LV_OFF));
+    EXPECT_EQ(int(d.urgent_level), int(TBLOG_LV_ERROR));
+    const QueueOptions q;
+    EXPECT_TRUE(q.policy == FullPolicy::Block);
+    EXPECT_EQ(int(q.flush_level), int(TBLOG_LV_OFF));
+    EXPECT_TRUE(q.flush_wait_ms > 0);
+    // An empty file keeps them.
+    Config c;
+    EXPECT_TRUE(parse_config_string("", c, nullptr));
+    EXPECT_TRUE(c.full_policy == FullPolicy::Block);
+    // drop stays available.
+    EXPECT_TRUE(parse_config_string("full_policy = drop\n", c, nullptr));
+    EXPECT_TRUE(c.full_policy == FullPolicy::Drop);
+}
+
+TEST(flush_on_level_key) {
+    Config c;
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string("flush.on_level = ERROR\n", c, &w));
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_ERROR));
+    EXPECT_TRUE(parse_config_string("flush.on_level = warning\n", c, &w));  // case-insensitive, alias
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_WARN));
+    EXPECT_TRUE(parse_config_string("flush.on_level = Fatal  # only FATAL\n", c, &w));
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_FATAL));
+    EXPECT_TRUE(parse_config_string("flush.on_level = off\n", c, &w));
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_OFF));
+    EXPECT_EQ(w.size(), size_t(0));
+    EXPECT_FALSE(parse_config_string("flush.on_level = 4\n", c, &w));  // names only
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_OFF));
+    EXPECT_TRUE(any_contains(w, "invalid level"));
+    // Independent of sync.on_level.
+    EXPECT_TRUE(parse_config_string("sync.on_level = WARN\nflush.on_level = ERROR\n", c, nullptr));
+    EXPECT_EQ(int(c.urgent_level), int(TBLOG_LV_WARN));
+    EXPECT_EQ(int(c.flush_level), int(TBLOG_LV_ERROR));
+
+    // validate_config: INFO and above are fine; below INFO warns (kept).
+    for (tblog_level lv : {TBLOG_LV_INFO, TBLOG_LV_WARN, TBLOG_LV_ERROR, TBLOG_LV_FATAL, TBLOG_LV_OFF}) {
+        Config d;
+        d.flush_level = lv;
+        w.clear();
+        EXPECT_TRUE(validate_config(d, &w));
+        EXPECT_EQ(w.size(), size_t(0));
+    }
+    for (tblog_level lv : {TBLOG_LV_TRACE, TBLOG_LV_DEBUG}) {
+        Config d;
+        d.flush_level = lv;
+        w.clear();
+        EXPECT_FALSE(validate_config(d, &w));
+        EXPECT_EQ(w.size(), size_t(1));
+        EXPECT_TRUE(any_contains(w, "flush.on_level below INFO"));
+        EXPECT_EQ(int(d.flush_level), int(lv));
+    }
 }
 
 TEST(validate_file_false_needs_another_sink) {

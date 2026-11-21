@@ -12,8 +12,8 @@
 //                       the OS before the call returns)
 //   fprintf_unbuffered  setvbuf(_IONBF) (not in the default set)
 //   tblog_block         tblog, defaults except file only, full_policy = block
-//   tblog_drop          tblog, defaults except file only, full_policy = drop
 //                       (the default policy)
+//   tblog_drop          tblog, defaults except file only, full_policy = drop
 //
 // Scenarios:
 //   flood     every thread logs flood-lines/threads lines as fast as it can.
@@ -29,6 +29,17 @@
 //             behind it (no coordinated omission). call latency = the call only.
 //   disabled  a call below the level: TBLOG_DEBUG with level = INFO vs
 //             `if (debug_enabled) fprintf(...)` with an atomic flag = false.
+//   flush_level  tblog only, flush.on_level = ERROR (defaults otherwise, file
+//             only): flood where 0%, 1%, 10% or 100% of the lines are
+//             TBLOG_ERROR (every 100th / 10th / every line), the rest
+//             TBLOG_INFO. Each ERROR call returns once the worker wrote it
+//             to the file. Two sync settings: the default sync.on_level =
+//             ERROR (every batch with an ERROR line is also fsynced, on the
+//             sync thread) and sync.on_level = OFF ("nosync": periodic sync
+//             only). Throughput as in flood; latency split into INFO calls
+//             and ERROR calls. A run has flush-lines / threads lines per
+//             thread, at most flush-max-errors ERROR lines per thread (fewer
+//             lines at 10% / 100%: an ERROR call can take an fsync).
 //
 // Every measurement is repeated: --warmup rounds (discarded) then --runs
 // rounds; within a round the variants run in rotating order. Each run gets a
@@ -59,10 +70,27 @@ const Variant kVariants[] = {
     {"snprintf_fwrite", kSnprintfFwrite, "", false,
      "snprintf of the same line into a stack buffer + one fwrite to the shared FILE* (default buffering)"},
     {"tblog_block", kTblog, "block", false,
-     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB), full_policy=block"},
+     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB), full_policy=block (the default)"},
     {"tblog_drop", kTblog, "drop", false,
-     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB), full_policy=drop (the default)"},
+     "TBLOG_INFO, default config except file only (console=false, reload.watch=false, file.max_size=4GB), full_policy=drop"},
 };
+
+// flush_level scenario: tblog_block + flush.on_level = ERROR, `pct` % of the
+// lines at ERROR (spread evenly: every 100 / pct-th line).
+const int kErrorPcts[] = {0, 1, 10, 100};
+std::string flush_variant_name(int pct, bool nosync) {
+    return std::string(nosync ? "tblog_flush_error_nosync_" : "tblog_flush_error_") + std::to_string(pct) + "pct";
+}
+bool flush_variant_parse(const std::string &name, int *pct, bool *nosync) {
+    for (int ns = 0; ns < 2; ++ns)
+        for (int p : kErrorPcts)
+            if (name == flush_variant_name(p, ns != 0)) {
+                *pct = p;
+                *nosync = ns != 0;
+                return true;
+            }
+    return false;
+}
 
 const Variant *find_variant(const std::string &n) {
     for (const Variant &v : kVariants)
@@ -303,6 +331,95 @@ RunOut paced_run(const Variant &v, const Scratch &s, int threads, long per, uint
     r.ok = true;
     return r;
 }
+// flush_level: one flood run of tblog with flush.on_level = ERROR, `pct` % of
+// the lines at ERROR. Latency of the INFO calls and of the ERROR calls apart.
+RunOut flush_level_run(int pct, bool nosync, const Scratch &s, int threads, long total, long max_errors) {
+    RunOut r;
+    long per = std::max(1L, total / threads);
+    if (pct > 0) per = std::min(per, std::max(1L, max_errors * 100 / pct));
+    const long every = pct > 0 ? 100 / pct : 0;
+    const std::string conf = s.dir + "/log.conf";
+    if (!write_file(conf, tblog_config(s.log, "block",
+                                       std::string("flush.on_level = ERROR\n") +
+                                           (nosync ? "sync.on_level = OFF\n" : ""))))
+        return r;
+    const uint64_t dropped_before = tblog_dropped_count();
+    if (tblog_init(conf.c_str()) != 0) return r;
+    std::vector<std::vector<uint32_t>> info((size_t)threads), err((size_t)threads);
+    for (int t = 0; t < threads; ++t) {
+        info[(size_t)t].reserve((size_t)per);
+        if (every) err[(size_t)t].reserve((size_t)(per / every + 1));
+    }
+    std::vector<uint64_t> t_end((size_t)threads);
+    std::vector<std::string> names;
+    for (int t = 0; t < threads; ++t) names.push_back(thread_name(t));
+    const uint64_t t_go = run_threads(threads, [&](int t) {
+        std::vector<uint32_t> &li = info[(size_t)t], &le = err[(size_t)t];
+        const char *name = names[(size_t)t].c_str();
+        for (long i = 0; i < per; ++i) {
+            const bool is_err = every && i % every == 0;
+            const uint64_t a = ticks();
+            if (is_err) BENCH_TBLOG_ERROR_LINE(i, name);
+            else BENCH_TBLOG_LINE(i, name);
+            const uint32_t d = clamp32(ticks() - a);
+            (is_err ? le : li).push_back(d);
+        }
+        t_end[(size_t)t] = now_ns();
+    });
+    uint64_t last = 0;
+    for (uint64_t e : t_end) last = std::max(last, e);
+    const double loop_s = double(last - t_go) / 1e9;
+    tblog_shutdown();
+    const double e2e_s = double(now_ns() - t_go) / 1e9;
+    const uint64_t dropped = tblog_dropped_count() - dropped_before;
+    const uint64_t attempted = (uint64_t)per * (uint64_t)threads;
+    const LineCount lc = count_lines(s.log);
+    const uint64_t in_file = lc.lines - lc.notes;
+    std::vector<uint32_t> ai, ae;
+    for (auto &x : info) ai.insert(ai.end(), x.begin(), x.end());
+    for (auto &x : err) ae.insert(ae.end(), x.begin(), x.end());
+    const std::string ij = ai.empty() ? "null" : latency_json(ai);
+    const std::string ej = ae.empty() ? "null" : latency_json(ae);
+    r.metrics = {{"e2e_s", e2e_s},
+                 {"e2e_lines_per_s", double(attempted - dropped) / e2e_s},
+                 {"loop_s", loop_s},
+                 {"loop_lines_per_s", double(attempted) / loop_s},
+                 {"dropped", double(dropped)}};
+    if (!ai.empty()) {
+        r.metrics.push_back({"info_p50_ns", pns(ai, 0.50)});
+        r.metrics.push_back({"info_p99_ns", pns(ai, 0.99)});
+        r.metrics.push_back({"info_p999_ns", pns(ai, 0.999)});
+        r.metrics.push_back({"info_max_ns", ticks_to_ns(ai.back())});
+    }
+    if (!ae.empty()) {
+        r.metrics.push_back({"error_p50_ns", pns(ae, 0.50)});
+        r.metrics.push_back({"error_p99_ns", pns(ae, 0.99)});
+        r.metrics.push_back({"error_p999_ns", pns(ae, 0.999)});
+        r.metrics.push_back({"error_max_ns", ticks_to_ns(ae.back())});
+    }
+    r.json = Obj()
+                 .num("error_pct", pct)
+                 .boolean("sync_on_error", !nosync)
+                 .num("lines_per_thread", double(per))
+                 .num("lines_attempted", double(attempted))
+                 .num("error_lines", double(ae.size()))
+                 .num("lines_dropped", double(dropped))
+                 .num("lines_in_file", double(in_file))
+                 .boolean("file_complete", in_file == attempted - dropped)
+                 .num("loop_s", loop_s)
+                 .num("e2e_s", e2e_s)
+                 .num("e2e_lines_per_s", double(attempted - dropped) / e2e_s)
+                 .num("loop_lines_per_s", double(attempted) / loop_s)
+                 .raw("info_latency_ns", ij)
+                 .raw("error_latency_ns", ej)
+                 .done();
+    r.ok = in_file == attempted - dropped;
+    if (!r.ok)
+        std::fprintf(stderr, "  !! flush_level %d%%: %" PRIu64 " lines in the file, expected %" PRIu64 "\n", pct,
+                     in_file, attempted - dropped);
+    return r;
+}
+
 std::atomic<bool> g_debug_enabled{false};  // the printf side's "level check"
 
 RunOut disabled_run(bool tblog, const Scratch &s, long calls) {
@@ -367,7 +484,7 @@ void usage() {
         "usage: bench_vs_printf [options]\n"
         "  --quick                 short smoke run (1 run, 1 and 4 threads, few lines)\n"
         "  --runs N                measured runs per cell (default 5), after --warmup N (default 1)\n"
-        "  --scenarios LIST        flood,paced,disabled (default all)\n"
+        "  --scenarios LIST        flood,paced,disabled,flush_level (default all)\n"
         "  --variants LIST         fprintf_buffered,fprintf_flush,snprintf_fwrite,tblog_block,tblog_drop\n"
         "                          (default); also fprintf_unbuffered\n"
         "  --threads LIST          flood thread counts (default 1,2,4,8,16)\n"
@@ -376,6 +493,9 @@ void usage() {
         "  --paced-lines N         lines per thread per paced run (default 50000)\n"
         "  --rate N                paced lines/s per thread (default 50000)\n"
         "  --disabled-calls N      calls per disabled-level run (default 20000000)\n"
+        "  --flush-threads LIST    flush_level thread counts (default 1,8)\n"
+        "  --flush-lines N         lines per flush_level run, split over the threads (default 200000)\n"
+        "  --flush-max-errors N    at most N ERROR lines per thread per flush_level run (default 1000)\n"
         "  --dir DIR               scratch directory (default: <temp>/tblog-bench-<pid>)\n"
         "  --out FILE | --out-dir DIR   result JSON (default name <os>-<compiler>-<cpu>-<date>-perf.json)\n"
         "  --label S --build-info S --commit SHA   recorded in the JSON\n");
@@ -392,7 +512,7 @@ int main(int argc, char **argv) {
     const bool quick = args.flag("--quick");
     const int runs = (int)args.num("--runs", quick ? 1 : 5);
     const int warmup = (int)args.num("--warmup", 1);
-    const std::vector<std::string> scenarios = split(args.get("--scenarios", "flood,paced,disabled"));
+    const std::vector<std::string> scenarios = split(args.get("--scenarios", "flood,paced,disabled,flush_level"));
     const std::vector<std::string> vnames =
         split(args.get("--variants", "fprintf_buffered,fprintf_flush,snprintf_fwrite,tblog_block,tblog_drop"));
     const std::vector<int> flood_threads = int_list(args.get("--threads", quick ? "1,4" : "1,2,4,8,16"));
@@ -401,6 +521,9 @@ int main(int argc, char **argv) {
     const long paced_lines = (long)args.num("--paced-lines", quick ? 2000 : 50000);
     const uint64_t rate = (uint64_t)args.num("--rate", 50000);
     const long disabled_calls = (long)args.num("--disabled-calls", quick ? 1000000 : 20000000);
+    const std::vector<int> flush_threads = int_list(args.get("--flush-threads", quick ? "1,4" : "1,8"));
+    const long flush_lines = (long)args.num("--flush-lines", quick ? 4000 : 200000);
+    const long flush_max_errors = (long)args.num("--flush-max-errors", quick ? 100 : 1000);
     const std::string base = args.get("--dir", temp_root() + "/tblog-bench-" + std::to_string(pid()));
 
     std::vector<const Variant *> variants;
@@ -460,7 +583,8 @@ int main(int argc, char **argv) {
                                 measured ? "run " : "warm");
                     for (const auto &m : r.metrics)
                         if (m.first == "e2e_lines_per_s" || m.first == "lat_p50_ns" || m.first == "lat_p99_ns" ||
-                            m.first == "ns_per_call" || m.first == "achieved_lines_per_s")
+                            m.first == "ns_per_call" || m.first == "achieved_lines_per_s" ||
+                            m.first == "error_p50_ns" || m.first == "error_p99_ns")
                             std::printf("  %s=%.4g", m.first.c_str(), m.second);
                     std::printf("%s\n", r.ok ? "" : "  FAILED");
                     std::fflush(stdout);
@@ -474,11 +598,13 @@ int main(int argc, char **argv) {
         }
     };
 
-    static long s_flood_lines, s_paced_lines, s_disabled;
+    static long s_flood_lines, s_paced_lines, s_disabled, s_flush_lines, s_flush_max_errors;
     static uint64_t s_rate;
     s_flood_lines = flood_lines;
     s_paced_lines = paced_lines;
     s_disabled = disabled_calls;
+    s_flush_lines = flush_lines;
+    s_flush_max_errors = flush_max_errors;
     s_rate = rate;
     for (const auto &scn : scenarios) {
         if (scn == "flood") {
@@ -502,6 +628,16 @@ int main(int argc, char **argv) {
                        [](const std::string &vn, const Scratch &s, int) -> RunOut {
                            return disabled_run(vn == "tblog_below_level", s, s_disabled);
                        });
+        } else if (scn == "flush_level") {
+            std::vector<std::string> fv;
+            for (int ns = 0; ns < 2; ++ns)
+                for (int p : kErrorPcts) fv.push_back(flush_variant_name(p, ns != 0));
+            run_matrix(scn, flush_threads, fv, [](const std::string &vn, const Scratch &s, int t) -> RunOut {
+                int pct = 0;
+                bool nosync = false;
+                flush_variant_parse(vn, &pct, &nosync);
+                return flush_level_run(pct, nosync, s, t, s_flush_lines, s_flush_max_errors);
+            });
         } else {
             std::fprintf(stderr, "unknown scenario %s\n", scn.c_str());
             return 2;
@@ -514,6 +650,11 @@ int main(int argc, char **argv) {
     for (const Variant &v : kVariants) vd.str(v.name, v.desc);
     vd.str("printf_if_guard", "if (atomic<bool> debug_enabled /* false */) fprintf(...): the filtered printf call");
     vd.str("tblog_below_level", "TBLOG_DEBUG(...) with level = INFO: the filtered tblog call");
+    for (int ns = 0; ns < 2; ++ns)
+        for (int p : kErrorPcts)
+            vd.str(flush_variant_name(p, ns != 0),
+                   std::string("tblog_block + flush.on_level=ERROR") + (ns ? " + sync.on_level=OFF" : "") + "; " +
+                       std::to_string(p) + "% of the lines are TBLOG_ERROR (evenly spread), the rest TBLOG_INFO");
     std::vector<std::string> cj;
     for (const Cell &c : cells) cj.push_back(cell_json(c));
     std::vector<std::string> sl, vl;
@@ -522,6 +663,8 @@ int main(int argc, char **argv) {
     std::vector<std::string> ft, pt;
     for (int t : flood_threads) ft.push_back(jnum(t));
     for (int t : paced_threads) pt.push_back(jnum(t));
+    std::vector<std::string> flt;
+    for (int t : flush_threads) flt.push_back(jnum(t));
     const std::string config =
         Obj()
             .boolean("quick", quick)
@@ -535,6 +678,9 @@ int main(int argc, char **argv) {
             .num("paced_lines_per_thread", double(paced_lines))
             .num("paced_rate_per_thread", double(rate))
             .num("disabled_calls", double(disabled_calls))
+            .raw("flush_threads", jarr(flt))
+            .num("flush_lines_per_run", double(flush_lines))
+            .num("flush_max_errors_per_thread", double(flush_max_errors))
             .str("per_call_timer", tick_source())
             .num("ns_per_tick", ns_per_tick())
             .raw("timer_overhead_ns", Obj().num("min", tov.min_ns).num("median", tov.median_ns).done())

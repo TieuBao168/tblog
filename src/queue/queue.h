@@ -5,16 +5,19 @@
 // Threads:
 //   append()                       any thread (hot path; no syscall in the
 //                                  common case, no allocation, no virtual call)
-//   wait_for_work/take/begin_write/mark_written/end_write/release/consume_urgent
-//                                  the worker only (one thread at a time)
-//   wake(), close(), dropped()     any thread
+//   wait_for_work/take/begin_write/mark_written/end_write/publish_written/
+//   release/consume_urgent         the worker only (one thread at a time)
+//   wake(), close(), dropped(), set_flush_level()
+//                                  any thread
 //   crash_drain(), crashed()       signal handler: async-signal-safe
 //
 // Batch protocol (worker):  take(b) -> for each chunk i, in order:
 // begin_write() (false: the queue crashed, write nothing more), write
-// b.chunks[i] to every crash-safe sink, mark_written(b, i), end_write() ->
-// release(b). Every other write to a crash-safe sink (the time-rotation check
-// of begin_batch, the "lines dropped" note) also happens between
+// b.chunks[i] to every crash-safe sink, mark_written(b, i), end_write(),
+// write it to the other sinks -> (every chunk in every sink)
+// publish_written(b) -> release(b). Every other write to a crash-safe sink
+// (the time-rotation check of begin_batch, the "lines dropped" note) also
+// happens between
 // begin_write() and end_write(). Exactly one batch may be outstanding (take()
 // again only after release()). Each chunk holds whole lines only; one chunk
 // per shard.
@@ -23,6 +26,12 @@
 // waits until the drain and its marker are written, then writes the line
 // itself, synchronously, through the crash_drain() visitor (the crash-safe
 // sinks), one thread at a time. See queue.cpp, "Crash safety".
+//
+// flush.on_level (queue.cpp, "Waiting for the write"): a line at or above
+// the flush level is appended as usual; then append() waits (bounded) until
+// the worker has written the batch that holds it to the sinks
+// (publish_written), so the line is in the OS (page cache) when the call
+// returns and survives a kill of the process.
 #pragma once
 
 #include "core/compat.h"
@@ -43,8 +52,10 @@ enum class FullPolicy { Drop, Block };
 
 struct QueueOptions {
     size_t buffer_size = 4u << 20;               // buffer.size (per buffer, A and B)
-    FullPolicy policy = FullPolicy::Drop;        // full_policy
+    FullPolicy policy = FullPolicy::Block;       // full_policy
     tblog_level urgent_level = TBLOG_LV_ERROR;   // sync.on_level: wakes worker + marks urgent
+    tblog_level flush_level = TBLOG_LV_OFF;      // flush.on_level: caller waits for the write
+    unsigned flush_wait_ms = 2000;               // upper bound of that wait
 };
 
 class Queue : public CacheAlignedNew {
@@ -62,6 +73,7 @@ public:
         size_t size = 0;
         Chunk chunks[kMaxShards];
         unsigned char shard[kMaxShards];  // internal: shard of chunks[i]
+        uint64_t gen[kMaxShards];         // internal: that shard's swap generation after the take
     };
 
     // nullptr (after a message on stderr) if the buffers cannot be allocated.
@@ -75,6 +87,10 @@ public:
     // than a shard, or the queue is closed). Once the queue crashed the line
     // is written synchronously to the crash-safe sinks, after the crash
     // drain, and true is returned.
+    // lv >= flush level and the line was buffered: returns only once the
+    // worker published the batch holding it (publish_written), or the queue
+    // closed / crashed, or flush_wait_ms passed. Never waits on the worker
+    // thread itself (a sink that logs).
     bool append(const char *data, uint32_t len, tblog_level lv) noexcept;
 
     // ---- worker thread
@@ -94,6 +110,10 @@ public:
     // Chunk i reached every crash-safe sink: the crash handler must not
     // write it again. Called before end_write().
     void mark_written(const Batch &b, size_t i) noexcept;
+    // Every chunk of `b` reached every sink (write(), not fsync): wake the
+    // callers waiting for it (flush.on_level). Not called when the batch was
+    // cut short by a crash (those callers see crashed() instead).
+    void publish_written(const Batch &b) noexcept;
     // Hand the buffers of `b` back for reuse (b is emptied). Once the queue
     // crashed, chunks not marked written are kept for crash_drain().
     void release(Batch &b) noexcept;
@@ -107,6 +127,13 @@ public:
     // everything that was accepted. Idempotent.
     void close() noexcept;
     uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+    // flush.on_level (hot-reload). TBLOG_LV_OFF: no caller ever waits.
+    void set_flush_level(tblog_level lv) noexcept {
+        flush_level_.store(static_cast<int>(lv), std::memory_order_relaxed);
+    }
+    tblog_level flush_level() const noexcept {
+        return static_cast<tblog_level>(flush_level_.load(std::memory_order_relaxed));
+    }
 
     // ---- signal handler: async-signal-safe ONLY (no locks, no malloc).
     // Closes the queue, waits (bounded) for the worker's current write to the
@@ -136,7 +163,9 @@ private:
     bool append_closed(const char *data, size_t len) noexcept;
     bool write_after_crash(const char *data, size_t len) noexcept;
     bool wait_for_swap(Shard &sh, uint64_t gen) noexcept;
+    void wait_written(Shard &sh, uint64_t gen) noexcept;
     void wake_blocked() noexcept;
+    void wake_flush_waiters() noexcept;
 
     const size_t nshards_;
     const size_t mask_;
@@ -144,10 +173,13 @@ private:
     const size_t threshold_;  // 75% of cap_
     const FullPolicy policy_;
     const tblog_level urgent_level_;
+    const unsigned flush_wait_ms_;
     Shard *const shards_;
 
-    // Read on every append, written once at close/crash.
+    // Read on every append; written once at close/crash (closed_) and on a
+    // hot-reload (flush_level_).
     alignas(64) std::atomic<bool> closed_{false};
+    std::atomic<int> flush_level_;
     // Written rarely by producers (first notifier per take / urgent lines).
     alignas(64) std::atomic<bool> notified_{false};
     std::atomic<bool> urgent_{false};
@@ -169,6 +201,12 @@ private:
     std::mutex block_mu_;
     std::condition_variable block_cv_;
     std::atomic<int> block_waiters_{0};
+
+    // flush.on_level waiters (wait_written / publish_written).
+    std::mutex written_mu_;
+    std::condition_variable written_cv_;
+    std::atomic<int> written_waiters_{0};
+    std::atomic<uint32_t> worker_id_{0};  // thread of the last take() (never waits on itself)
 };
 
 }  // namespace tblog

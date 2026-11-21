@@ -21,7 +21,7 @@ void tblog_flush(void);
   - Gọi lại khi logger đang chạy: không làm gì, trả `0` (không đọc lại cấu hình).
   - Lần init đầu tiên đăng ký `tblog_shutdown` với `atexit()`.
 - `tblog_shutdown()`: dừng thread nền, ghi nốt mọi dòng còn trong buffer, fsync, đóng file. Gọi nhiều lần không sao. Sau khi shutdown, log lại đi ra stderr. Có thể `tblog_init` lại, nhưng mỗi cặp init/shutdown giữ lại buffer của lần đó (không giải phóng), nên ứng dụng chỉ nên init một lần.
-- `tblog_flush()`: nhờ thread nền ghi mọi dòng đã có vào các sink, gọi `flush` của các sink, fsync file, rồi mới trả về (chờ tối đa 2 giây). Không làm gì nếu logger chưa chạy.
+- `tblog_flush()`: nhờ thread nền ghi mọi dòng đã có vào các sink, gọi `flush` của các sink, fsync file, rồi mới trả về (chờ tối đa 2 giây). Không làm gì nếu logger chưa chạy. Muốn mọi dòng từ một level trở lên tự động được ghi vào file trước khi lệnh log trả về (không fsync) thì dùng key `flush.on_level` thay vì gọi `tblog_flush()` sau từng dòng ([configuration.md](configuration.md#flushon_level)).
 
 ### Level và module
 
@@ -35,7 +35,7 @@ uint64_t     tblog_dropped_count(void);
 - Level: `TBLOG_LV_TRACE` < `DEBUG` < `INFO` < `WARN` < `ERROR` < `FATAL` < `OFF`. Level gốc mặc định là `INFO`.
 - `module` `NULL` hoặc `""` là module gốc. Đặt level gốc thì mọi module chưa có level riêng cũng đổi theo; module đã được đặt level riêng (bằng `tblog_set_level` hoặc `module.<tên>` trong cấu hình) giữ level của nó.
 - `tblog_module_get(name)` trả con trỏ ổn định (không bao giờ bị giải phóng). Tên dài hơn 45 ký tự bị cắt. Có tối đa 256 module tính cả gốc; vượt quá thì trả về module gốc.
-- `tblog_dropped_count()`: tổng số dòng bị bỏ vì buffer đầy (chính sách `drop`), cộng dồn qua các lần init/shutdown. Khi có dòng bị bỏ, thread nền cũng ghi một dòng `tblog: N lines dropped` vào log.
+- `tblog_dropped_count()`: tổng số dòng bị bỏ vì buffer đầy (chỉ với `full_policy = drop`; mặc định `block` không bỏ dòng), cộng dồn qua các lần init/shutdown. Khi có dòng bị bỏ, thread nền cũng ghi một dòng `tblog: N lines dropped` vào log.
 
 ### Macro ghi log
 
@@ -49,6 +49,7 @@ TBLOG_LOG(level, module, fmt, ...)
 - Thứ tự ở mỗi lệnh: cắt theo `TBLOG_COMPILE_LEVEL` lúc biên dịch, tra module của call site (chỉ lần đầu, rồi cache trong biến static), so với level của module. **Lệnh bị lọc không format và không tính đối số.**
 - `module` là chuỗi; nó chỉ được đọc ở lần chạy đầu tiên của call site đó, nên phải là hằng (thường là literal).
 - Một dòng log đã format tối đa 1024 byte, tính cả `\n`. Dài hơn thì bị cắt và kết thúc bằng `...`.
+- Thường thì lệnh log trả về sau khi chép dòng vào buffer, không có system call. Nó **chờ** trong hai trường hợp do cấu hình quyết định ([configuration.md](configuration.md#ghi-xuống-đĩa-và-độ-bền)): buffer của thread đầy với `full_policy = block` (mặc định), tới khi thread nền đổi buffer; và dòng ở level ≥ `flush.on_level` (mặc định `OFF`), tới khi thread nền đã ghi dòng đó vào file, tối đa 2 giây. Lệnh log gọi từ trong `write` / `flush` của sink riêng (tức là trên thread nền) không bao giờ chờ chính nó.
 
 `tblog_write(m, lv, file, line, func, fmt, ...)` là hàm mà các macro gọi. Nó không tự kiểm tra level; dùng macro thay vì gọi trực tiếp.
 

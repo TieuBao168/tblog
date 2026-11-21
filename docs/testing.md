@@ -43,7 +43,7 @@ Test không cần thư viện ngoài: `tests/tiny_test.h` (khung test), `tests/t
 | `test_shared_exit` | `tests/shared/test_shared_exit.cpp` | bản động | Thoát process không gọi `tblog_shutdown` (Windows: đường DLL unload), crash trong DLL/.so |
 | `example_basic`, `example_cpp_api` | `examples/*` | `tblog::tblog` | Ví dụ chạy được với một `log.conf` trong thư mục nháp |
 | `bench_vs_printf_smoke` | `bench/bench_vs_printf.cpp` | bản tĩnh | `--quick`: chạy ngắn mọi biến thể (fprintf, tblog), không phải phép đo; fail nếu file log thiếu dòng |
-| `bench_crash_loss_smoke` | `bench/bench_crash_loss.cpp` | bản tĩnh | `--quick`: mỗi kịch bản crash/kill/exit một lần cho mỗi biến thể; fail nếu một process con bị treo |
+| `bench_crash_loss_smoke` | `bench/bench_crash_loss.cpp` | bản tĩnh | `--quick`: mỗi kịch bản crash/kill/exit một lần cho mỗi biến thể; fail nếu một process con bị treo. Bản build TSan bỏ qua `stack_overflow` và `stack_overflow_thread`: runtime TSan chạy signal handler trên stack của thread bị lỗi, mà sau khi tràn stack thì không còn stack nào, nên process con bị treo hoặc chết với SIGILL thay vì tới được handler của tblog |
 | `check_symbols` | `packaging/check-symbols.sh` | | `.so`/`.dylib` export đúng các hàm `tblog_*` mà `.a` định nghĩa; không có trong build sanitizer |
 | `check_exports` | `packaging/check-exports.ps1` | | Windows: DLL export đúng các hàm `TBLOG_API` |
 

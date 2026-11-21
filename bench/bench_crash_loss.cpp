@@ -62,6 +62,19 @@ namespace {
 
 using namespace bench;
 
+// Built with ThreadSanitizer (GCC defines __SANITIZE_THREAD__, Clang has
+// __has_feature(thread_sanitizer)).
+#if defined(__SANITIZE_THREAD__)
+#define TBLOG_BENCH_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define TBLOG_BENCH_TSAN 1
+#endif
+#endif
+#ifndef TBLOG_BENCH_TSAN
+#define TBLOG_BENCH_TSAN 0
+#endif
+
 // ------------------------------------------------------------------ scenarios
 struct Scenario {
     const char *name;
@@ -811,6 +824,23 @@ int parent_main(const Args &args, const char *argv0) {
             std::fprintf(stderr, "unknown variant %s\n", v.c_str());
             return 2;
         }
+#if TBLOG_BENCH_TSAN
+    // ThreadSanitizer intercepts signals and runs the application's handler
+    // later, on the faulting thread's stack; after a stack overflow there is
+    // no stack left, so the child hangs or dies with SIGILL (seen on macOS CI)
+    // instead of reaching tblog's handler. A limit of the TSan runtime, not of
+    // tblog (the Release and ASan builds run these scenarios).
+    {
+        std::vector<std::string> kept;
+        for (const auto &s : snames) {
+            if (s == "stack_overflow" || s == "stack_overflow_thread")
+                std::printf("skipped %s: not meaningful under ThreadSanitizer\n", s.c_str());
+            else
+                kept.push_back(s);
+        }
+        snames.swap(kept);
+    }
+#endif
     const std::string base = args.get("--dir", temp_root() + "/tblog-crash-" + std::to_string(pid()));
     const std::string exe = self_exe(argv0);
     remove_tree(base);

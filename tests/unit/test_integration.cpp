@@ -383,7 +383,14 @@ TEST(flush_on_level_survives_kill_hard) {
         }
         EXPECT_TRUE(last_err[victim] > e0);
         long bad = 0;
-        for (const auto &l : lines_of(read_file(dir + "/app.log"))) {
+        // The kill can land while the worker's write() is in progress: the
+        // file may then end in a torn, unterminated line (a line of the
+        // current batch, after the last acknowledged ERROR line). Only whole
+        // lines are checked.
+        const std::string content = read_file(dir + "/app.log");
+        std::vector<std::string> whole = lines_of(content);
+        if (!content.empty() && content.back() != '\n' && !whole.empty()) whole.pop_back();
+        for (const auto &l : whole) {
             int t = -1;
             long i = -1;
             char lv[8] = {0};

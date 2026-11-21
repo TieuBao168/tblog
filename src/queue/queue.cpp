@@ -397,9 +397,12 @@ closed:  // outside the shard lock (the guard's scope was left)
 
 // Cold: the queue is closed (shutdown: drop) or crashed (write it now).
 TBLOG_COLD bool Queue::append_closed(const char *data, size_t len) noexcept {
-    // Pairs with crash_drain()'s seq_cst store of closed_ (after crashed_ and
-    // the visitor): a closed_ seen by a relaxed load implies both.
-    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // The caller saw closed_ with a relaxed load. Re-read it with acquire: it
+    // is still true (coherence) and this load synchronizes with
+    // crash_drain()'s store of closed_, which comes after crashed_ and the
+    // visitor, so both are visible below. (Not a fence: GCC's TSan rejects
+    // atomic_thread_fence under -Werror=tsan.)
+    (void)closed_.load(std::memory_order_acquire);
     if (!crashed_.load(std::memory_order_acquire)) return false;
     return write_after_crash(data, len);
 }

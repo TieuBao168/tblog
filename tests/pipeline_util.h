@@ -26,7 +26,7 @@ inline std::unique_ptr<Pipeline> make_pipe(const PipeOptions &o) {
     qo.urgent_level = o.urgent_level;
     std::unique_ptr<Queue> q = Queue::create(qo);
     if (!q) return nullptr;
-    std::unique_ptr<Sink> f = make_file_sink(o.file);
+    std::unique_ptr<LogSink> f = make_file_sink(o.file);
     if (!f) return nullptr;
     std::unique_ptr<Pipeline> p(new Pipeline(std::move(q)));
     p->add_sink(std::move(f));

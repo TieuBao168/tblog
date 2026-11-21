@@ -3,8 +3,8 @@
 // Run:   ./cpp_api [log.conf] [iterations]
 #include <tblog/tblog.hpp>
 
-#include <time.h>
-
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -23,9 +23,9 @@ void tblog_format(tblog::Sink &s, const Endpoint &e) { s.format("{}:{}", e.host,
 
 namespace {
 uint64_t now_ns() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
 }
 
 template <class Fn> double per_call(int n, Fn fn) {

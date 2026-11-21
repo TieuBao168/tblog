@@ -4,7 +4,7 @@
 namespace tblog {
 namespace {
 
-class CallbackSink final : public Sink {
+class CallbackSink final : public LogSink {
 public:
     CallbackSink(SinkWriteFn write_fn, SinkFlushFn flush_fn, void *ctx)
         : write_(write_fn), flush_(flush_fn), ctx_(ctx) {}
@@ -24,9 +24,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Sink> make_callback_sink(SinkWriteFn write, SinkFlushFn flush, void *ctx) {
+std::unique_ptr<LogSink> make_callback_sink(SinkWriteFn write, SinkFlushFn flush, void *ctx) {
     if (!write) return nullptr;
-    return std::unique_ptr<Sink>(new CallbackSink(write, flush, ctx));
+    return std::unique_ptr<LogSink>(new CallbackSink(write, flush, ctx));
 }
 
 }  // namespace tblog

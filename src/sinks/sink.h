@@ -29,9 +29,11 @@
 
 namespace tblog {
 
-class Sink {
+// Internal interface; named LogSink so it cannot collide (ODR) with the public
+// formatting buffer tblog::Sink of <tblog/detail/format.hpp>.
+class LogSink {
 public:
-    virtual ~Sink() = default;
+    virtual ~LogSink() = default;
 
     // One or more complete lines ('\n'-terminated).
     virtual void write(const char *data, size_t len) = 0;
@@ -56,16 +58,16 @@ public:
     virtual bool writes_stderr() const noexcept { return false; }
 };
 
-std::unique_ptr<Sink> make_console_sink(bool color);  // stderr
+std::unique_ptr<LogSink> make_console_sink(bool color);  // stderr
 // System log (openlog/syslog on POSIX). Returns nullptr, after one warning on
 // stderr, where the platform has no supported system log.
-std::unique_ptr<Sink> make_syslog_sink(const char *ident);
+std::unique_ptr<LogSink> make_syslog_sink(const char *ident);
 
 // User sink (tblog_add_sink): write(ctx, data, len) per chunk, flush(ctx)
 // (may be null) on flush and at shutdown. Not crash-safe.
 typedef void (*SinkWriteFn)(void *ctx, const char *data, size_t len);
 typedef void (*SinkFlushFn)(void *ctx);
-std::unique_ptr<Sink> make_callback_sink(SinkWriteFn write, SinkFlushFn flush, void *ctx);
+std::unique_ptr<LogSink> make_callback_sink(SinkWriteFn write, SinkFlushFn flush, void *ctx);
 
 // Test hook: write `data` to `h` exactly as the console sink would,
 // colourised when `color` is true (no terminal check here).

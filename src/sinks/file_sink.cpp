@@ -8,7 +8,7 @@
 namespace tblog {
 namespace {
 
-class FileSink final : public Sink {
+class FileSink final : public LogSink {
 public:
     bool open(const FileOptions &opt) { return file_.open(opt); }
 
@@ -57,10 +57,10 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Sink> make_file_sink(const FileOptions &opt) {
+std::unique_ptr<LogSink> make_file_sink(const FileOptions &opt) {
     std::unique_ptr<FileSink> s(new FileSink);
     if (!s->open(opt)) return nullptr;
-    return std::unique_ptr<Sink>(s.release());
+    return std::unique_ptr<LogSink>(s.release());
 }
 
 }  // namespace tblog

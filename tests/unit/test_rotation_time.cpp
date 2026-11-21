@@ -6,6 +6,7 @@
 #include "pipeline_util.h"
 #include "sinks/archiver.h"
 #include "sinks/rotating_file.h"
+#include "test_os.h"
 #include "tiny_test.h"
 
 #include <algorithm>
@@ -17,11 +18,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #ifdef TBLOG_HAVE_ZLIB
 #include <zlib.h>
@@ -38,10 +34,7 @@ const int kScale = 1;
 #endif
 
 struct UtcTz {
-    UtcTz() {
-        ::setenv("TZ", "UTC", 1);
-        ::tzset();
-    }
+    UtcTz() { tos::set_tz_utc(); }
 } g_utc;
 
 // 2030-01-01T00:00:00Z
@@ -51,64 +44,32 @@ const int64_t kDay = 86400;
 std::atomic<int64_t> g_now{kBase};
 int64_t fake_now() { return g_now.load(); }
 
-std::string base_dir() {
-    const char *e = std::getenv("TBLOG_TEST_DIR");
-    return (e && *e) ? e : "build/tmp";
-}
+std::string base_dir() { return tos::test_dir(); }
 
-void mkdirs(const std::string &dir) {
-    for (size_t i = 1; i <= dir.size(); ++i)
-        if (i == dir.size() || dir[i] == '/') ::mkdir(dir.substr(0, i).c_str(), 0755);
-}
+void mkdirs(const std::string &dir) { tos::make_dirs(dir); }
 
+// Sorted entry names, without hidden ones.
 std::vector<std::string> list_dir(const std::string &dir) {
     std::vector<std::string> out;
-    if (DIR *d = ::opendir(dir.c_str())) {
-        while (dirent *e = ::readdir(d))
-            if (e->d_name[0] != '.') out.push_back(e->d_name);
-        ::closedir(d);
-    }
-    std::sort(out.begin(), out.end());
+    for (const std::string &n : tos::list_dir(dir))
+        if (n[0] != '.') out.push_back(n);
     return out;
 }
 
 std::string fresh_dir(const char *name) {
     std::string d = base_dir() + "/rt_" + name;
     mkdirs(d);
-    for (auto &f : list_dir(d)) ::unlink((d + "/" + f).c_str());
+    for (auto &f : list_dir(d)) tos::remove_file(d + "/" + f);
     return d;
 }
 
-bool exists(const std::string &p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0;
-}
+bool exists(const std::string &p) { return tos::exists(p); }
 
-std::string read_file(const std::string &path) {
-    std::string s;
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) return s;
-    char buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
-    std::fclose(f);
-    return s;
-}
+std::string read_file(const std::string &path) { return tos::read_file(path); }
 
-void write_file(const std::string &path, const std::string &data) {
-    FILE *f = std::fopen(path.c_str(), "wb");
-    if (!f) return;
-    std::fwrite(data.data(), 1, data.size(), f);
-    std::fclose(f);
-}
+void write_file(const std::string &path, const std::string &data) { tos::write_file(path, data); }
 
-void set_mtime(const std::string &p, int64_t sec) {
-    struct timespec ts[2];
-    ts[0].tv_sec = (time_t)sec;
-    ts[0].tv_nsec = 0;
-    ts[1] = ts[0];
-    ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
-}
+void set_mtime(const std::string &p, int64_t sec) { tos::set_mtime(p, sec); }
 
 #ifdef TBLOG_HAVE_ZLIB
 // Decompresses a .gz file; expects a valid gzip stream.
@@ -123,6 +84,18 @@ std::string gunzip(const std::string &path) {
     EXPECT_TRUE(n == 0);
     EXPECT_TRUE(::gzclose(g) == Z_OK);
     return out;
+}
+
+// `gzip -n [-k] -f path` with zlib (no gzip binary needed): path.gz holds a
+// complete gzip stream of path; the original is removed unless `keep`.
+bool gzip_file(const std::string &path, bool keep) {
+    const std::string data = read_file(path);
+    gzFile g = ::gzopen((path + ".gz").c_str(), "wb6");
+    if (!g) return false;
+    bool ok = data.empty() || ::gzwrite(g, data.data(), (unsigned)data.size()) == (int)data.size();
+    ok = ::gzclose(g) == Z_OK && ok;
+    if (ok && !keep) ok = tos::remove_file(path);
+    return ok;
 }
 #endif
 
@@ -177,7 +150,7 @@ int day_of(const std::string &name) {
     t.tm_year = y - 1900;
     t.tm_mon = m - 1;
     t.tm_mday = d;
-    return (int)((::timegm(&t) - kBase) / kDay);
+    return (int)((tos::timegm_utc(&t) - kBase) / kDay);
 }
 
 FileOptions file_opts(const std::string &dir, RotateMode mode, CompressMode cm,
@@ -442,7 +415,7 @@ TEST(rotating_retention_counts_compressed) {
     // Older rotated files from a previous run: one compressed, one not, plus
     // an unrelated file that must survive.
     write_file(d + "/app.2029-12-01.log", "old1\n");
-    EXPECT_EQ(::system(("gzip -n -f '" + d + "/app.2029-12-01.log'").c_str()), 0);
+    EXPECT_TRUE(gzip_file(d + "/app.2029-12-01.log", false));
     write_file(d + "/app.2029-12-02.log", "old2\n");
     write_file(d + "/app.2029-12-02.log.gz.tmp", "partial");  // interrupted compression
     write_file(d + "/other.log", "keep\n");
@@ -523,7 +496,7 @@ TEST(compress_crash_recovery) {
     write_file(d + "/app.2030-01-01.log", x);
     write_file(d + "/app.2030-01-01.log.gz.tmp", std::string("\x1f\x8b\x08\0garbage", 11));
     write_file(d + "/app.2030-01-02.log", y);
-    EXPECT_EQ(::system(("gzip -n -k -f '" + d + "/app.2030-01-02.log'").c_str()), 0);
+    EXPECT_TRUE(gzip_file(d + "/app.2030-01-02.log", true));
     ASSERT_TRUE(exists(d + "/app.2030-01-02.log.gz") && exists(d + "/app.2030-01-02.log"));
     g_now = kBase + 3 * kDay;
     {
@@ -687,8 +660,8 @@ TEST(pipeline_size_and_time_naming) {
     EXPECT_TRUE(std::find(files.begin(), files.end(), "app.2030-01-01.1.log") != files.end());
     EXPECT_TRUE(std::find(files.begin(), files.end(), "app.2030-01-02.log") != files.end());
     for (auto &f : files) {
-        struct stat st;
-        EXPECT_TRUE(::stat((d + "/" + f).c_str(), &st) == 0 && st.st_size <= (64 << 10));
+        const unsigned long long size = tos::file_size(d + "/" + f);
+        EXPECT_TRUE(size != ~0ull && size <= (64u << 10));
     }
 }
 

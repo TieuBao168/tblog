@@ -1,15 +1,27 @@
-# tblog — CMake build. This is the primary build (verified in CI, see
-# .github/workflows/ci.yml); the Makefile is a Linux-only convenience.
+# tblog — CMake build. This is the primary build (verified in CI on Linux and
+# Windows, see .github/workflows/ci.yml); the Makefile is a Linux-only
+# convenience.
 #
 #   cmake -S . -B build-cmake -DTBLOG_BUILD_TESTS=ON
 #   cmake --build build-cmake -j8 && (cd build-cmake && ctest --output-on-failure)
 #   cmake --install build-cmake --prefix /usr/local
 #
+# Windows (MSVC; multi-config, so pass the configuration):
+#   cmake -S . -B build -A x64 -DTBLOG_BUILD_TESTS=ON
+#   cmake --build build --config Release && ctest --test-dir build -C Release
+# Windows (MinGW-w64, MSYS2 MINGW64 shell):
+#   cmake -S . -B build -G Ninja -DTBLOG_BUILD_TESTS=ON && cmake --build build
+#
+# Library files: Linux/macOS libtblog.a + libtblog.so; Windows tblog_static.lib
+# + tblog.dll / tblog.lib (MSVC) or libtblog_static.a + libtblog.dll /
+# libtblog.dll.a (MinGW): the static library and the DLL's import library
+# must not share a name.
+#
 # Consumers: find_package(tblog REQUIRED) + target_link_libraries(app tblog::tblog),
 # or add_subdirectory(tblog) and link tblog::tblog.
 #
 # Header check only (compile the public headers, build nothing else; what the
-# Windows and macOS CI jobs use until the library is ported there):
+# macOS and Windows ARM64 CI jobs use):
 #   cmake -S . -B build-hc -DTBLOG_HEADERS_ONLY_CHECK=ON [-DCMAKE_CXX_STANDARD=20]
 #   cmake --build build-hc
 cmake_minimum_required(VERSION 3.10)
@@ -113,6 +125,7 @@ if(TBLOG_WITH_ZLIB)
     set(TBLOG_HAVE_ZLIB ON)
   endif()
 endif()
+message(STATUS "tblog: gzip compression of rotated files (zlib): ${TBLOG_HAVE_ZLIB}")
 
 # Library sources: every src/**/*.cpp except the platform layer, plus the one
 # platform implementation for the target OS (src/platform/posix on UNIX,
@@ -137,14 +150,47 @@ file(GLOB TBLOG_PLATFORM_SOURCES RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" ${_tblog
   "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/${TBLOG_PLATFORM_DIR}/*.cpp")
 list(APPEND TBLOG_SOURCES ${TBLOG_PLATFORM_SOURCES})
 
+# Where an executable of kind `subdir` (tests, examples, bench) is written.
+# Windows: tblog.dll and every executable share one directory, bin/, so they
+# find the DLL without PATH changes (multi-config generators add the
+# configuration: bin/Release/...).
+set(TBLOG_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
+function(tblog_runtime_dir target subdir)
+  if(WIN32)
+    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TBLOG_BIN_DIR}")
+  else()
+    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${subdir}")
+  endif()
+endfunction()
+
 set(TBLOG_WARNINGS)
 set(TBLOG_LIB_OPTIONS)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+set(TBLOG_DEFINES)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
   set(TBLOG_WARNINGS -Wall -Wextra)
   if(TBLOG_WERROR)
     list(APPEND TBLOG_WARNINGS -Werror)
   endif()
   set(TBLOG_LIB_OPTIONS -fno-omit-frame-pointer)
+elseif(MSVC)
+  # /W3 without the implicit-conversion warnings (C4244, C4267): the same set
+  # as GCC's -Wall -Wextra, which has no -Wconversion either. /utf-8: the
+  # sources are UTF-8. /Zc:__cplusplus: report the real language level.
+  # (both added by tblog_target_flags)
+  set(TBLOG_WARNINGS /W3 /wd4244 /wd4267)
+  if(TBLOG_WERROR)
+    list(APPEND TBLOG_WARNINGS /WX)
+  endif()
+endif()
+if(WIN32)
+  # Standard C functions without the MSVC "use the _s variant" deprecations.
+  list(APPEND TBLOG_DEFINES _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+if(MINGW)
+  # C99 printf semantics (%zu, %lld, %Lf ...) for the formatter's vsnprintf,
+  # matching the gnu_printf format checking tblog_write gets in <tblog/log.h>;
+  # MinGW's default (msvcrt) printf does not have them.
+  list(APPEND TBLOG_DEFINES __USE_MINGW_ANSI_STDIO=1)
 endif()
 
 # Sanitizer flags: compile and link options of every target built here.
@@ -171,11 +217,25 @@ if(TBLOG_SANITIZE)
   set(TBLOG_SAN_LINK -fsanitize=${TBLOG_SANITIZE})
 endif()
 
-# Warnings + sanitizers for any target built here.
+# Warnings + sanitizers (+ the Windows defines) for any target built here.
 function(tblog_target_flags target)
   target_compile_options(${target} PRIVATE ${TBLOG_WARNINGS} ${TBLOG_SAN_COMPILE})
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /utf-8 $<$<COMPILE_LANGUAGE:CXX>:/Zc:__cplusplus>)
+  endif()
+  if(TBLOG_DEFINES)
+    target_compile_definitions(${target} PRIVATE ${TBLOG_DEFINES})
+  endif()
   if(TBLOG_SAN_LINK)
     target_link_libraries(${target} PRIVATE ${TBLOG_SAN_LINK})
+  endif()
+endfunction()
+
+# -rdynamic for executables (ELF/Mach-O: backtraces name their functions);
+# meaningless on Windows, where ENABLE_EXPORTS would only add an import library.
+function(tblog_enable_exports target)
+  if(NOT WIN32)
+    set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON)
   endif()
 endfunction()
 
@@ -205,6 +265,11 @@ endfunction()
 
 add_library(tblog_static STATIC ${TBLOG_SOURCES})
 tblog_configure_library(tblog_static)
+if(WIN32)
+  # tblog.lib is the DLL's import library (MSVC); the static one gets its own
+  # name (tblog_static.lib, libtblog_static.a with MinGW).
+  set_target_properties(tblog_static PROPERTIES OUTPUT_NAME tblog_static)
+endif()
 
 add_library(tblog_shared SHARED ${TBLOG_SOURCES})
 tblog_configure_library(tblog_shared)
@@ -216,6 +281,7 @@ if(WIN32)
   # dllimport for whoever links it -- also through the installed package
   # (INTERFACE_COMPILE_DEFINITIONS of tblog::tblog_shared).
   target_compile_definitions(tblog_shared PRIVATE TBLOG_BUILDING_DLL INTERFACE TBLOG_DLL)
+  set_target_properties(tblog_shared PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TBLOG_BIN_DIR}")
 endif()
 if(NOT APPLE AND NOT WIN32)
   # Export the tblog_* C API only (also hides std:: template instantiations).
@@ -255,26 +321,33 @@ if(TBLOG_BUILD_TESTS)
     endif()
   endif()
 
+  # tests/unit/*.cpp: internal C++ API, so linked with the static library.
+  # tests/shared/*.cpp: public API only, linked with the shared library.
   file(GLOB TBLOG_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/*.cpp")
-  foreach(src ${TBLOG_TEST_SOURCES})
+  file(GLOB TBLOG_SHARED_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/tests/shared/*.cpp")
+  foreach(src ${TBLOG_TEST_SOURCES} ${TBLOG_SHARED_TEST_SOURCES})
     get_filename_component(name ${src} NAME_WE)
     add_executable(${name} ${src})
-    # Unit tests use internal C++ symbols, which only the static lib provides.
-    target_link_libraries(${name} PRIVATE tblog_static)
-    target_include_directories(${name} PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    tblog_target_flags(${name})
-    if(TBLOG_HAVE_ZLIB)
-      # Compression tests (and their zlib-based gunzip) need it, like the Makefile.
-      target_compile_definitions(${name} PRIVATE TBLOG_HAVE_ZLIB=1)
-      target_link_libraries(${name} PRIVATE ZLIB::ZLIB)
+    if(src IN_LIST TBLOG_SHARED_TEST_SOURCES)
+      target_link_libraries(${name} PRIVATE tblog_shared)
+      target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    else()
+      target_link_libraries(${name} PRIVATE tblog_static)
+      target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+      if(TBLOG_HAVE_ZLIB)
+        # Compression tests (and their zlib-based gzip/gunzip) need it, like the Makefile.
+        target_compile_definitions(${name} PRIVATE TBLOG_HAVE_ZLIB=1)
+        target_link_libraries(${name} PRIVATE ZLIB::ZLIB)
+      endif()
     endif()
+    tblog_target_flags(${name})
+    tblog_enable_exports(${name})  # -rdynamic, like the Makefile
+    tblog_runtime_dir(${name} tests)
     set_target_properties(${name} PROPERTIES
       CXX_STANDARD ${TBLOG_CXX_STANDARD}
       CXX_STANDARD_REQUIRED ON
-      CXX_EXTENSIONS OFF
-      ENABLE_EXPORTS ON                       # -rdynamic, like the Makefile
-      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/tests)
+      CXX_EXTENSIONS OFF)
     add_test(NAME ${name} COMMAND ${TBLOG_TEST_RUNNER} $<TARGET_FILE:${name}>)
     # One scratch directory per test, so `ctest -j` cannot mix their files.
     file(MAKE_DIRECTORY "${TBLOG_TEST_DIR}/${name}")
@@ -303,6 +376,31 @@ if(TBLOG_BUILD_TESTS)
       message(STATUS "nm not found: check_symbols test not registered")
     endif()
   endif()
+
+  # Windows: tblog.dll must export exactly the TBLOG_API functions of
+  # <tblog/log.h> (packaging/check-exports.ps1; dumpbin with MSVC, objdump
+  # with MinGW).
+  if(WIN32)
+    find_program(TBLOG_POWERSHELL NAMES pwsh powershell
+      HINTS "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0")
+    set(_tblog_dump "")
+    if(MSVC)
+      get_filename_component(_tblog_linker_dir "${CMAKE_LINKER}" DIRECTORY)
+      find_program(TBLOG_DUMPBIN dumpbin HINTS "${_tblog_linker_dir}")
+      set(_tblog_dump "${TBLOG_DUMPBIN}")
+    elseif(CMAKE_OBJDUMP)
+      set(_tblog_dump "${CMAKE_OBJDUMP}")
+    endif()
+    if(TBLOG_POWERSHELL AND _tblog_dump)
+      add_test(NAME check_exports
+        COMMAND "${TBLOG_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/packaging/check-exports.ps1"
+                -Dll $<TARGET_FILE:tblog_shared> -Tool "${_tblog_dump}")
+      set_tests_properties(check_exports PROPERTIES TIMEOUT 60)
+    else()
+      message(STATUS "powershell or dumpbin/objdump not found: check_exports test not registered")
+    endif()
+  endif()
 endif()
 
 # ---- examples ----------------------------------------------------------------
@@ -315,6 +413,8 @@ if(TBLOG_BUILD_EXAMPLES)
     add_executable(example_${name} ${src})
     target_link_libraries(example_${name} PRIVATE tblog::tblog)
     tblog_target_flags(example_${name})
+    tblog_enable_exports(example_${name})
+    tblog_runtime_dir(example_${name} examples)
     set_target_properties(example_${name} PROPERTIES
       OUTPUT_NAME ${name}
       C_STANDARD 99
@@ -322,9 +422,17 @@ if(TBLOG_BUILD_EXAMPLES)
       C_EXTENSIONS OFF
       CXX_STANDARD ${TBLOG_CXX_STANDARD}
       CXX_STANDARD_REQUIRED ON
-      CXX_EXTENSIONS OFF
-      ENABLE_EXPORTS ON
-      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/examples)
+      CXX_EXTENSIONS OFF)
+    if(TBLOG_BUILD_TESTS)
+      # Smoke test: the example runs (against tblog::tblog, by default the
+      # shared library) with a config that logs into its scratch directory.
+      set(_dir "${TBLOG_TEST_DIR}/example_${name}")
+      file(MAKE_DIRECTORY "${_dir}")
+      file(WRITE "${_dir}/log.conf" "file.path = ${_dir}/app.log\nreload.watch = false\n")
+      add_test(NAME example_${name}
+        COMMAND ${TBLOG_TEST_RUNNER} $<TARGET_FILE:example_${name}> "${_dir}/log.conf" 1000)
+      set_tests_properties(example_${name} PROPERTIES TIMEOUT 120)
+    endif()
   endforeach()
 endif()
 
@@ -334,12 +442,12 @@ if(TBLOG_BUILD_BENCH)
   add_executable(bench_latency "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_latency.cpp")
   target_link_libraries(bench_latency PRIVATE tblog_static)
   tblog_target_flags(bench_latency)
+  tblog_enable_exports(bench_latency)
+  tblog_runtime_dir(bench_latency bench)
   set_target_properties(bench_latency PROPERTIES
     CXX_STANDARD ${TBLOG_CXX_STANDARD}
     CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF
-    ENABLE_EXPORTS ON
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bench)
+    CXX_EXTENSIONS OFF)
 endif()
 
 # ---- install + package config -------------------------------------------------
@@ -366,7 +474,8 @@ install(FILES
   "${CMAKE_CURRENT_BINARY_DIR}/tblogConfigVersion.cmake"
   DESTINATION ${TBLOG_CMAKE_DIR})
 
-# tblog.pc — same template as `make install`.
+# tblog.pc — same template as `make install`. MinGW: `-ltblog` picks the DLL's
+# import library (libtblog.dll.a); the static library is libtblog_static.a.
 set(TBLOG_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
 foreach(kind LIBDIR INCLUDEDIR)
   if(IS_ABSOLUTE "${CMAKE_INSTALL_${kind}}")

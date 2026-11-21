@@ -4,7 +4,7 @@
 //
 // report_crash() runs inside the fatal-signal handler: everything reachable
 // from it must be async-signal-safe (atomics, pf::stderr_write,
-// Pipeline::crash -> Queue::crash_drain + Sink::crash_write). No malloc, no
+// Pipeline::crash -> Queue::crash_drain + LogSink::crash_write). No malloc, no
 // locks, no stdio.
 #include "crash/crash_handler.h"
 
@@ -45,10 +45,25 @@ size_t append_int(char *buf, size_t pos, size_t cap, int v) noexcept {
     return pos;
 }
 
-void report_crash(int sig, const char *name) {
-    char msg[96];
-    size_t n = append_str(msg, 0, sizeof(msg), "*** tblog: caught signal ");
-    n = append_int(msg, n, sizeof(msg), sig);
+size_t append_hex32(char *buf, size_t pos, size_t cap, unsigned v) noexcept {
+    static const char kDigits[] = "0123456789ABCDEF";
+    pos = append_str(buf, pos, cap, "0x");
+    for (int shift = 28; shift >= 0 && pos < cap; shift -= 4) buf[pos++] = kDigits[(v >> shift) & 0xFu];
+    return pos;
+}
+
+// "*** tblog: caught signal 11 (SIGSEGV) ***" or, for a Windows exception,
+// "*** tblog: caught exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION) ***".
+void report_crash(pf::CrashKind kind, int code, const char *name) {
+    char msg[128];
+    size_t n;
+    if (kind == pf::CrashKind::Exception) {
+        n = append_str(msg, 0, sizeof(msg), "*** tblog: caught exception ");
+        n = append_hex32(msg, n, sizeof(msg), static_cast<unsigned>(code));
+    } else {
+        n = append_str(msg, 0, sizeof(msg), "*** tblog: caught signal ");
+        n = append_int(msg, n, sizeof(msg), code);
+    }
     n = append_str(msg, n, sizeof(msg), " (");
     n = append_str(msg, n, sizeof(msg), name);
     n = append_str(msg, n, sizeof(msg), ") ***\n");

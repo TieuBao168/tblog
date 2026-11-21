@@ -61,7 +61,7 @@ private:
 
 constexpr char kReset[] = "\033[0m";
 
-class ConsoleSink final : public Sink {
+class ConsoleSink final : public LogSink {
 public:
     explicit ConsoleSink(bool color)
         : color_(color && pf::stderr_is_terminal() && pf::enable_ansi_colors()) {}
@@ -108,8 +108,8 @@ void console_write_to(pf::FileHandle h, const char *data, size_t len, bool color
     }
 }
 
-std::unique_ptr<Sink> make_console_sink(bool color) {
-    return std::unique_ptr<Sink>(new ConsoleSink(color));
+std::unique_ptr<LogSink> make_console_sink(bool color) {
+    return std::unique_ptr<LogSink>(new ConsoleSink(color));
 }
 
 }  // namespace tblog

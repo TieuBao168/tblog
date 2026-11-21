@@ -1,12 +1,7 @@
 // End-to-end tests through the public C API.
+#include "test_os.h"
 #include "tiny_test.h"
 #include "tblog/log.h"
-
-#include <signal.h>
-#include <sys/resource.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <cstdlib>
 #include <fstream>
@@ -18,23 +13,15 @@
 
 namespace {
 
-std::string test_dir() {
-    const char *d = std::getenv("TBLOG_TEST_DIR");
-    std::string dir = d && *d ? d : "build/tmp";
-    std::string cmd = "mkdir -p '" + dir + "'";
-    if (std::system(cmd.c_str()) != 0) std::abort();
-    return dir;
-}
-
 std::string fresh(const std::string &name) {
-    std::string dir = test_dir() + "/it_" + name;
-    std::string cmd = "rm -rf '" + dir + "' && mkdir -p '" + dir + "'";
-    if (std::system(cmd.c_str()) != 0) std::abort();
+    std::string dir = tos::test_dir() + "/it_" + name;
+    tos::remove_tree(dir);
+    tos::make_dirs(dir);
     return dir;
 }
 
 void write_file(const std::string &path, const std::string &text) {
-    std::ofstream(path) << text;
+    std::ofstream(path, std::ios::binary) << text;
 }
 
 std::string read_file(const std::string &path) {
@@ -144,23 +131,18 @@ TEST(log_before_init_goes_to_stderr_and_does_not_crash) {
 
 // ---------------------------------------------------------------- user sinks
 // tblog_add_sink() registrations last for the whole process, so each of these
-// tests runs in a forked child; the child's EXPECTs print there and its exit
-// status says whether any failed.
+// tests runs in a child process (this binary re-executed on a TINY_CHILD
+// scenario, the test's directory in tos::child_arg()); the child's EXPECTs
+// print there and its exit status says whether any failed.
 namespace {
 
-template <class F>
-bool in_child(F fn) {
-    std::fflush(stdout);
-    pid_t pid = fork();
-    if (pid == 0) {
-        const int before = tiny::failures();
-        fn();
-        std::fflush(stdout);
-        _exit(tiny::failures() == before ? 0 : 1);
+bool in_child(const char *scenario, const std::string &dir) {
+    tos::ChildResult r = tos::run_child(scenario, dir);
+    if (!tos::exited_with(r, 0)) {
+        std::printf("  child %s: %s\n", scenario, tos::describe(r).c_str());
+        return false;
     }
-    int st = 0;
-    waitpid(pid, &st, 0);
-    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    return true;
 }
 
 struct Captured {
@@ -174,119 +156,142 @@ void capture_flush(void *ctx) { ++static_cast<Captured *>(ctx)->flushes; }
 
 }  // namespace
 
+TINY_CHILD(user_sink_order) {
+    const std::string dir = tos::child_arg();
+    static Captured cap;
+    ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
+    ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
+    constexpr int kThreads = 8, kPerThread = 5000;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([t] {
+            for (int i = 0; i < kPerThread; ++i) TBLOG_INFO("t%d i%d", t, i);
+        });
+    for (auto &t : ts) t.join();
+    tblog_shutdown();
+    // Same bytes as the file, in the same order.
+    EXPECT_TRUE(cap.data == read_file(dir + "/app.log"));
+    std::vector<int> next(kThreads, 0);
+    size_t n = 0;
+    bool ordered = true;
+    for (const auto &l : lines_of(cap.data)) {
+        int t = -1, i = -1;
+        if (std::sscanf(l.c_str(), "[INFO] [-] t%d i%d", &t, &i) != 2) continue;
+        ordered = ordered && t >= 0 && t < kThreads && i == next[t];
+        if (t >= 0 && t < kThreads) next[t] = i + 1;
+        ++n;
+    }
+    EXPECT_TRUE(ordered);
+    EXPECT_EQ(n, size_t(kThreads) * kPerThread);
+    EXPECT_TRUE(cap.flushes > 0);
+}
 TEST(user_sink_receives_every_line_in_order) {
-    const std::string dir = fresh("usink");
-    EXPECT_TRUE(in_child([&] {
-        static Captured cap;
-        ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
-        ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-        constexpr int kThreads = 8, kPerThread = 5000;
-        std::vector<std::thread> ts;
-        for (int t = 0; t < kThreads; ++t)
-            ts.emplace_back([t] {
-                for (int i = 0; i < kPerThread; ++i) TBLOG_INFO("t%d i%d", t, i);
-            });
-        for (auto &t : ts) t.join();
-        tblog_shutdown();
-        // Same bytes as the file, in the same order.
-        EXPECT_TRUE(cap.data == read_file(dir + "/app.log"));
-        std::vector<int> next(kThreads, 0);
-        size_t n = 0;
-        bool ordered = true;
-        for (const auto &l : lines_of(cap.data)) {
-            int t = -1, i = -1;
-            if (std::sscanf(l.c_str(), "[INFO] [-] t%d i%d", &t, &i) != 2) continue;
-            ordered = ordered && t >= 0 && t < kThreads && i == next[t];
-            if (t >= 0 && t < kThreads) next[t] = i + 1;
-            ++n;
-        }
-        EXPECT_TRUE(ordered);
-        EXPECT_EQ(n, size_t(kThreads) * kPerThread);
-        EXPECT_TRUE(cap.flushes > 0);
-    }));
+    EXPECT_TRUE(in_child("user_sink_order", fresh("usink")));
 }
 
+TINY_CHILD(user_sink_flush) {
+    const std::string dir = tos::child_arg();
+    static Captured cap;
+    ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
+    // Long interval: only tblog_flush() makes the worker run.
+    ASSERT_TRUE(tblog_init(config(dir, "flush.interval_ms = 60000\n").c_str()) == 0);
+    tblog_flush();  // nothing to write: the flush callback still runs
+    const int f0 = cap.flushes;
+    EXPECT_TRUE(f0 > 0);
+    TBLOG_INFO("before flush");
+    tblog_flush();
+    EXPECT_TRUE(cap.flushes > f0);
+    EXPECT_TRUE(cap.data.find("[INFO] [-] before flush\n") != std::string::npos);
+    tblog_shutdown();
+}
 TEST(user_sink_flush_called_by_tblog_flush) {
-    const std::string dir = fresh("usink_flush");
-    EXPECT_TRUE(in_child([&] {
-        static Captured cap;
-        ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
-        // Long interval: only tblog_flush() makes the worker run.
-        ASSERT_TRUE(tblog_init(config(dir, "flush.interval_ms = 60000\n").c_str()) == 0);
-        tblog_flush();  // nothing to write: the flush callback still runs
-        const int f0 = cap.flushes;
-        EXPECT_TRUE(f0 > 0);
-        TBLOG_INFO("before flush");
-        tblog_flush();
-        EXPECT_TRUE(cap.flushes > f0);
-        EXPECT_TRUE(cap.data.find("[INFO] [-] before flush\n") != std::string::npos);
-        tblog_shutdown();
-    }));
+    EXPECT_TRUE(in_child("user_sink_flush", fresh("usink_flush")));
 }
 
+TINY_CHILD(add_sink_rules) {
+    const std::string dir = tos::child_arg();
+    static Captured cap;
+    EXPECT_EQ(tblog_add_sink(nullptr, capture_flush, &cap), -1);  // write is required
+    EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), 0);   // flush is optional
+    ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
+    EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), -1);  // running
+    TBLOG_INFO("cycle one");
+    tblog_shutdown();
+    // Registered sinks persist across init/shutdown cycles.
+    ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
+    TBLOG_INFO("cycle two");
+    tblog_shutdown();
+    EXPECT_TRUE(cap.data.find("cycle one") != std::string::npos);
+    EXPECT_TRUE(cap.data.find("cycle two") != std::string::npos);
+    EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), 0);  // stopped again
+}
 TEST(add_sink_rules) {
-    const std::string dir = fresh("usink_rules");
-    EXPECT_TRUE(in_child([&] {
-        static Captured cap;
-        EXPECT_EQ(tblog_add_sink(nullptr, capture_flush, &cap), -1);  // write is required
-        EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), 0);   // flush is optional
-        ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-        EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), -1);  // running
-        TBLOG_INFO("cycle one");
-        tblog_shutdown();
-        // Registered sinks persist across init/shutdown cycles.
-        ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-        TBLOG_INFO("cycle two");
-        tblog_shutdown();
-        EXPECT_TRUE(cap.data.find("cycle one") != std::string::npos);
-        EXPECT_TRUE(cap.data.find("cycle two") != std::string::npos);
-        EXPECT_EQ(tblog_add_sink(capture_write, nullptr, &cap), 0);  // stopped again
-    }));
+    EXPECT_TRUE(in_child("add_sink_rules", fresh("usink_rules")));
 }
 
+TINY_CHILD(file_false) {
+    const std::string dir = tos::child_arg();
+    static Captured cap;
+    ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
+    ASSERT_TRUE(tblog_init(config(dir, "file = false\n").c_str()) == 0);
+    for (int i = 0; i < 100; ++i) TBLOG_INFO("only to the sink %d", i);
+    tblog_shutdown();
+    EXPECT_FALSE(tos::exists(dir + "/app.log"));  // never created
+    EXPECT_EQ(lines_of(cap.data).size(), size_t(100));
+    EXPECT_TRUE(cap.data.find("only to the sink 99\n") != std::string::npos);
+}
 TEST(file_false_with_user_sink_writes_no_file) {
-    const std::string dir = fresh("nofile");
-    EXPECT_TRUE(in_child([&] {
-        static Captured cap;
-        ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
-        ASSERT_TRUE(tblog_init(config(dir, "file = false\n").c_str()) == 0);
-        for (int i = 0; i < 100; ++i) TBLOG_INFO("only to the sink %d", i);
-        tblog_shutdown();
-        struct stat st;
-        EXPECT_TRUE(::stat((dir + "/app.log").c_str(), &st) != 0);  // never created
-        EXPECT_EQ(lines_of(cap.data).size(), size_t(100));
-        EXPECT_TRUE(cap.data.find("only to the sink 99\n") != std::string::npos);
-    }));
+    EXPECT_TRUE(in_child("file_false", fresh("nofile")));
 }
 
-// Buffered lines survive SIGSEGV through the crash handler.
+// ---------------------------------------------------------------- process end
+// The crash marker written for an access violation / SIGSEGV.
+#if defined(_WIN32)
+const char kSegvMarker[] = "*** tblog: caught exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION) ***";
+#else
+const char kSegvMarker[] = "*** tblog: caught signal 11 (SIGSEGV) ***";
+#endif
+
+TINY_CHILD(segv_after_logging) {
+    if (tblog_init(config(tos::child_arg(), "flush.interval_ms = 60000\n").c_str()) != 0)
+        std::_Exit(2);
+    for (int i = 0; i < 3000; ++i) TBLOG_INFO("line %d", i);
+    volatile int *volatile p = nullptr;  // both volatiles: GCC drops/traps otherwise
+    *p = 1;
+}
+// Buffered lines survive SIGSEGV / an access violation through the crash handler.
 TEST(segv_keeps_logs) {
     const std::string dir = fresh("segv");
-    const std::string cfg = config(dir, "flush.interval_ms = 60000\n");
-    pid_t pid = fork();
-    if (pid == 0) {
-        // Under ASan/TSan the sanitizer's SEGV handler would be the "previous"
-        // handler tblog chains to, and it exits instead of dying by signal.
-        signal(SIGSEGV, SIG_DFL);
-        if (tblog_init(cfg.c_str()) != 0) _exit(2);
-        for (int i = 0; i < 3000; ++i) TBLOG_INFO("line %d", i);
-        struct rlimit rl = {1, 1};  // 1 (not 0) skips apport's slow core pipe
-        setrlimit(RLIMIT_CORE, &rl);
-        volatile int *volatile p = nullptr;  // both volatiles: GCC drops/traps otherwise
-        *p = 1;
-        _exit(0);
-    }
-    int st = 0;
-    waitpid(pid, &st, 0);
-    EXPECT_TRUE(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+    tos::ChildResult r = tos::run_child("segv_after_logging", dir);
+    EXPECT_TRUE(tos::died_with(r, tos::Crash::Segv));
     const std::string s = read_file(dir + "/app.log");
     std::set<std::string> seen;
     for (const auto &l : lines_of(s))
         if (l.rfind("[INFO] [-] line ", 0) == 0) seen.insert(l);
     EXPECT_EQ(seen.size(), size_t(3000));
-    EXPECT_TRUE(s.find("caught signal 11") != std::string::npos);
+    EXPECT_TRUE(s.find(kSegvMarker) != std::string::npos);
     // The marker must come after the last line logged before the crash.
-    EXPECT_TRUE(s.find("caught signal 11") > s.find("[INFO] [-] line 2999"));
+    EXPECT_TRUE(s.find(kSegvMarker) > s.find("[INFO] [-] line 2999"));
+}
+
+TINY_CHILD(exit_without_shutdown) {
+    if (tblog_init(config(tos::child_arg(), "flush.interval_ms = 60000\n").c_str()) != 0)
+        std::_Exit(2);
+    std::thread t([] {
+        for (int i = 0; i < 2000; ++i) TBLOG_INFO("bg %d", i);
+    });
+    for (int i = 0; i < 2000; ++i) TBLOG_INFO("main %d", i);
+    t.join();
+    std::exit(0);  // atexit -> tblog_shutdown: every buffered line reaches the file
+}
+TEST(exit_without_shutdown_keeps_logs) {
+    const std::string dir = fresh("exit");
+    tos::ChildResult r = tos::run_child("exit_without_shutdown", dir);
+    EXPECT_TRUE(tos::exited_with(r, 0));
+    size_t n = 0;
+    for (const auto &l : lines_of(read_file(dir + "/app.log")))
+        if (l.rfind("[INFO] [-] main ", 0) == 0 || l.rfind("[INFO] [-] bg ", 0) == 0) ++n;
+    EXPECT_EQ(n, size_t(4000));
 }
 
 TINY_TEST_MAIN()

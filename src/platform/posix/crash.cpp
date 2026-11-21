@@ -120,7 +120,8 @@ void crash_signal_handler(int sig, siginfo_t *info, void *) {
         return;
     }
 
-    if (CrashReporter r = g_reporter.load(std::memory_order_acquire)) r(sig, signal_name(sig));
+    if (CrashReporter r = g_reporter.load(std::memory_order_acquire))
+        r(CrashKind::Signal, sig, signal_name(sig));
 
 #if TBLOG_HAVE_BACKTRACE
     void *frames[64];

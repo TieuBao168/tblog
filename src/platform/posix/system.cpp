@@ -34,6 +34,8 @@ uint32_t current_thread_id() noexcept {
 #endif
 }
 
+bool process_exiting() noexcept { return false; }
+
 // ------------------------------------------------------------------ memory
 void *alloc_aligned(size_t align, size_t size) noexcept {
     void *p = nullptr;

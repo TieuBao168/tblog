@@ -2,6 +2,7 @@
 // walks the ops writing into the caller's buffer without allocating.
 #include "core/formatter.h"
 
+#include "core/compat.h"
 #include "core/levels.h"
 #include "platform/platform.h"
 
@@ -36,7 +37,7 @@ inline void put2(char *p, int v) {
 const TimeCache &time_cache(uint64_t ts_ns) {
     static thread_local TimeCache tc;
     int64_t sec = (int64_t)(ts_ns / 1000000000ull);
-    if (__builtin_expect(sec != tc.sec, 0)) {
+    if (TBLOG_UNLIKELY(sec != tc.sec)) {
         std::tm tm;
         if (!pf::local_time(sec, &tm)) std::memset(&tm, 0, sizeof tm);
         int y = tm.tm_year + 1900;

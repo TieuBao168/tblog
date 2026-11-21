@@ -1,11 +1,11 @@
 // Tests for the header-only C++ API (<tblog/tblog.hpp>). Must build as C++11.
+#include "test_os.h"
 #include "tiny_test.h"
 #include "tblog/tblog.hpp"
 
-#include <time.h>
-
 #include <atomic>
 #include <cfloat>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstdarg>
@@ -27,7 +27,7 @@ template <class... A> std::string F(const char *fmt, const A &...args) {
     return std::string(buf, n);
 }
 
-__attribute__((format(printf, 1, 2))) std::string P(const char *fmt, ...) {
+TOS_PRINTF(1, 2) std::string P(const char *fmt, ...) {
     char buf[2048];
     va_list ap;
     va_start(ap, fmt);
@@ -36,18 +36,10 @@ __attribute__((format(printf, 1, 2))) std::string P(const char *fmt, ...) {
     return std::string(buf, n > 0 ? static_cast<std::size_t>(n) : 0);
 }
 
-std::string test_dir() {
-    const char *d = std::getenv("TBLOG_TEST_DIR");
-    std::string dir = d && *d ? d : "build/tmp";
-    std::string cmd = "mkdir -p '" + dir + "'";
-    if (std::system(cmd.c_str()) != 0) std::abort();
-    return dir;
-}
-
 std::string fresh(const std::string &name) {
-    std::string dir = test_dir() + "/cpp_" + name;
-    std::string cmd = "rm -rf '" + dir + "' && mkdir -p '" + dir + "'";
-    if (std::system(cmd.c_str()) != 0) std::abort();
+    std::string dir = tos::test_dir() + "/cpp_" + name;
+    tos::remove_tree(dir);
+    tos::make_dirs(dir);
     return dir;
 }
 
@@ -86,11 +78,7 @@ std::string config(const std::string &dir, const std::string &pattern = "[%L] [%
     return cfg;
 }
 
-uint64_t now_ns() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
-}
+uint64_t now_ns() { return tos::mono_ns(); }
 
 }  // namespace
 
@@ -325,18 +313,27 @@ TEST(chars_and_bools) {
     EXPECT_EQ(F("{:.2}", 'A'), std::string("{!bad-spec}"));
 }
 
+// "{}" of a pointer is 0x + lower-case hex digits, which is what glibc's %p
+// prints; Windows' %p prints zero-padded digits without 0x, so the tests
+// compare against this instead.
+std::string hex_ptr(const void *p, int width = 0) {
+    char hex[32];
+    std::snprintf(hex, sizeof hex, "0x%" PRIxPTR, reinterpret_cast<uintptr_t>(p));
+    return P("%*s", width, hex);
+}
+
 TEST(pointers) {
     int x = 0;
     const void *vp = &x;
     int *ip = &x;
-    EXPECT_EQ(F("{}", vp), P("%p", vp));
-    EXPECT_EQ(F("{:p}", ip), P("%p", static_cast<void *>(ip)));
-    EXPECT_EQ(F("{}", static_cast<const int *>(ip)), P("%p", vp));
+    EXPECT_EQ(F("{}", vp), hex_ptr(vp));
+    EXPECT_EQ(F("{:p}", ip), hex_ptr(ip));
+    EXPECT_EQ(F("{}", static_cast<const int *>(ip)), hex_ptr(vp));
     const char *cs = "str";
-    EXPECT_EQ(F("{:p}", cs), P("%p", static_cast<const void *>(cs)));  // {:p} on a C string
+    EXPECT_EQ(F("{:p}", cs), hex_ptr(cs));  // {:p} on a C string
     EXPECT_EQ(F("{}", nullptr), std::string("0x0"));
     EXPECT_EQ(F("{}", static_cast<void *>(nullptr)), std::string("0x0"));
-    EXPECT_EQ(F("{:>20}", vp), P("%20p", vp));
+    EXPECT_EQ(F("{:>20}", vp), hex_ptr(vp, 20));
     EXPECT_EQ(F("{:x}", vp), std::string("{!bad-spec}"));
 }
 

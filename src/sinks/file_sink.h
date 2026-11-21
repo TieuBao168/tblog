@@ -41,6 +41,6 @@ struct FileOptions {
 //                rotation; the file lock is not held during the sync)
 //   shutdown     fdatasync + close (waits for queued compressions, bounded)
 //   crash_safe   true: crash_write() write()s to the current handle
-std::unique_ptr<Sink> make_file_sink(const FileOptions &opt);
+std::unique_ptr<LogSink> make_file_sink(const FileOptions &opt);
 
 }  // namespace tblog

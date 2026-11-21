@@ -1,6 +1,6 @@
 # tblog
 
-Thư viện log bất đồng bộ cho ứng dụng C/C++ trên Linux. Thread gọi log không bao giờ chạm vào đĩa: việc ghi file, fsync, xoay file và nén file cũ đều nằm ở thread nền.
+Thư viện log bất đồng bộ cho ứng dụng C/C++ trên Linux và Windows (MSVC, MinGW-w64). Thread gọi log không bao giờ chạm vào đĩa: việc ghi file, fsync, xoay file và nén file cũ đều nằm ở thread nền.
 
 - **API C thuần** (`<tblog/log.h>`), dùng được từ C99 và mọi chuẩn C++; thêm **API C++ dạng `{}`** (`<tblog/tblog.hpp>`).
 - **Ghi qua buffer**: thread gọi log chỉ chép dòng vào buffer của nó; worker gom lại và ghi theo lô.
@@ -58,7 +58,7 @@ Mỗi dòng log mặc định có dạng:
 
 ## Build
 
-Yêu cầu: Linux, compiler hỗ trợ C++11 trở lên (GCC hoặc Clang), CMake ≥ 3.10. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
+Yêu cầu: Linux (GCC hoặc Clang) hoặc Windows 8+ (MSVC 2019+ hoặc MinGW-w64), compiler hỗ trợ C++11 trở lên (MSVC: C++14), CMake ≥ 3.10. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
 
 ### CMake (cách build chính)
 
@@ -76,7 +76,7 @@ Kết quả nằm trong `build-cmake/`: `libtblog.a`, `libtblog.so.0.1.0` cùng 
 | `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` trỏ tới bản động (`OFF`: bản tĩnh). Cả hai bản luôn được build và cài. |
 | `TBLOG_CXX_STANDARD` | `17` | Chuẩn C++ dùng để build thư viện: 11, 14 hoặc 17. Ứng dụng dùng thư viện không bị ràng buộc theo chuẩn này. |
 | `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
-| `TBLOG_BUILD_TESTS` | `OFF` | Build test và đăng ký với CTest (mỗi file `tests/unit/*.cpp` là một test, thêm `check_symbols`) |
+| `TBLOG_BUILD_TESTS` | `OFF` | Build test và đăng ký với CTest (mỗi file `tests/unit/*.cpp` và `tests/shared/*.cpp` là một test, thêm `check_symbols` trên Linux, `check_exports` trên Windows, và chạy thử các ví dụ nếu bật `TBLOG_BUILD_EXAMPLES`) |
 | `TBLOG_BUILD_EXAMPLES` | `OFF` | Build `examples/basic.c` và `examples/cpp_api.cpp` |
 | `TBLOG_BUILD_BENCH` | `OFF` | Build `bench/bench_latency` (chạy từ thư mục gốc của repo) |
 | `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` hoặc `address,undefined`. Áp dụng cho thư viện, test, ví dụ và bench. Với `thread`, CTest tự chạy test qua `setarch -R`, vì TSan không chạy được khi ASLR bật trên kernel mới. |
@@ -90,6 +90,30 @@ cmake --build build-tsan -j8 && (cd build-tsan && ctest --output-on-failure)
 ```
 
 Cross-compile: dùng toolchain file của CMake như thường lệ (`-DCMAKE_TOOLCHAIN_FILE=...`).
+
+### Windows (MSVC và MinGW-w64)
+
+Hỗ trợ Windows 8 trở lên, x64, với MSVC (Visual Studio 2019/2022) hoặc MinGW-w64 (MSYS2). Build cả bản tĩnh lẫn DLL như trên Linux.
+
+MSVC (Developer PowerShell hoặc PowerShell thường có CMake):
+
+```powershell
+cmake -S . -B build -A x64 -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+cmake --install build --config Release --prefix C:/tblog
+```
+
+Có zlib qua vcpkg: `vcpkg install zlib:x64-windows` rồi thêm `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake` khi configure.
+
+MinGW-w64 (shell MSYS2 MINGW64, gói `mingw-w64-x86_64-gcc`, `-cmake`, `-ninja`, `-zlib`):
+
+```bash
+cmake -S . -B build -G Ninja -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON
+cmake --build build && ctest --test-dir build --output-on-failure
+```
+
+Tên file trên Windows: bản tĩnh là `tblog_static.lib` (MinGW: `libtblog_static.a`), DLL là `tblog.dll` cùng import library `tblog.lib` (MinGW: `libtblog.dll`, `libtblog.dll.a`). DLL, test và ví dụ được ghi chung vào `build/bin/` (MSVC: `build/bin/<Config>/`). Dùng `find_package(tblog)` + `tblog::tblog` thì CMake tự thêm `TBLOG_DLL` (dllimport); khi link DLL bằng tay, định nghĩa `TBLOG_DLL` trước khi include `<tblog/log.h>`. Trên MinGW thư viện được build với `__USE_MINGW_ANSI_STDIO=1`, nên `%zu`, `%lld`, `%Lf` trong `TBLOG_*` cho kết quả như trên Linux.
 
 ### Makefile (lối tắt trên Linux)
 
@@ -349,6 +373,7 @@ make -C lite test
 **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) chạy trên GitHub Actions với mỗi push và pull request vào `main`:
 
 - CMake + CTest trên Linux: GCC C++17, GCC C++11, Clang C++17, ASan+UBSan, TSan, build không có zlib (tất cả với `-Werror`).
+- CMake + CTest trên Windows: MSVC x64 Release (không zlib, kèm cài đặt + `find_package`), MSVC x64 Debug C++14 với zlib từ vcpkg, MinGW-w64 C++11; kiểm tra DLL export đúng các hàm `TBLOG_API` ([packaging/check-exports.ps1](packaging/check-exports.ps1)).
 - Cài đặt bằng `cmake --install` rồi build ví dụ từ bản đã cài qua pkg-config (tĩnh và động) và qua `find_package(tblog)` ([packaging/consumer](packaging/consumer/CMakeLists.txt)).
 - Makefile: `make test`, `make check-symbols`, `make check-install`.
 - Ranh giới nền tảng: [packaging/check-platform-boundary.sh](packaging/check-platform-boundary.sh) báo lỗi nếu code ngoài `src/platform/` include header của OS hoặc gọi thẳng API của OS.
@@ -365,7 +390,10 @@ Bộ test gồm:
 
 ## Giới hạn đã biết
 
-- **Nền tảng:** chỉ Linux. Chưa hỗ trợ Windows/macOS.
+- **Nền tảng:** Linux và Windows (x64; MSVC, MinGW-w64). macOS chưa hỗ trợ (đang làm).
+- **Windows — syslog:** không có; `syslog = true` chỉ in cảnh báo và bỏ qua sink này.
+- **Windows — crash:** bắt access violation, illegal instruction, chia cho 0, stack overflow (unhandled exception filter) và `abort()`/`assert` (SIGABRT); log trong buffer vẫn được ghi đủ kèm dòng `*** tblog: caught exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION) ***`. Call stack in ra stderr chỉ là địa chỉ (kèm base address của module) — tự tra symbol bằng WinDbg/`addr2line`. Sau đó exception được chuyển tiếp nên WER/debugger vẫn thấy; riêng `abort()` kết thúc với exit code 3. Stack overflow chỉ chắc chắn được báo trên thread gọi `tblog_init` và các thread của tblog (có dự trữ 64 KB stack bằng `SetThreadStackGuarantee`).
+- **Windows — kết thúc process:** nên gọi `tblog_shutdown()` trước khi thoát. Nếu không, handler `atexit` vẫn chạy: với bản tĩnh trong file `.exe` thì như Linux; với `tblog.dll` (hoặc bản tĩnh nằm trong một DLL khác), handler chạy lúc DLL bị gỡ, khi các thread khác đã bị dừng, nên tblog không join thread mà xả buffer ngay trên thread đang thoát qua đường crash (không khóa): log vẫn vào file và console nhưng sink của `tblog_add_sink` không nhận các dòng cuối đó. Gọi `FreeLibrary` lên `tblog.dll` khi logger đang chạy là không được hỗ trợ — hãy `tblog_shutdown()` trước.
 - **Chưa chạy thử:** port FreeRTOS/Cortex-M của tblog-lite chưa chạy trên phần cứng.
 - **Init một lần:** mỗi cặp `tblog_init`/`tblog_shutdown` giữ lại buffer của lần đó, nên ứng dụng chỉ nên init một lần.
 - **Buffer theo thread:** mỗi thread chỉ dùng phần buffer của mình, nên khi một thread bắn log dồn dập, chính sách `drop` sẽ bỏ dòng sớm hơn.
@@ -383,8 +411,9 @@ src/config/           parser, validate_config và watcher của log.conf
 src/logger/           C API, worker thread, sync thread, Pipeline (Queue -> các sink)
 src/crash/            crash handler
 src/sinks/            file (rotating file, archiver: xoay + nén), console, syslog, sink của người dùng
-src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/; mọi lời gọi OS nằm ở đây
-tests/unit/           test (tests/tiny_test.h, không cần thư viện ngoài)
+src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/ + win32/; mọi lời gọi OS nằm ở đây
+tests/unit/           test (tests/tiny_test.h + tests/test_os.h, không cần thư viện ngoài)
+tests/shared/         test link với bản động (thoát process không gọi tblog_shutdown, crash)
 bench/                benchmark latency/throughput
 examples/             basic.c, cpp_api.cpp
 packaging/            tblog.pc.in, version script, CMake package config, script kiểm tra

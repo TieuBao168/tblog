@@ -156,7 +156,15 @@ typedef struct tblog_module {
 } tblog_module;
 
 /* Lifecycle. config_path may be NULL (defaults). Returns 0 on success.
- * Calling tblog_write before tblog_init writes to stderr. */
+ * Calling tblog_write before tblog_init writes to stderr.
+ * tblog_init registers tblog_shutdown with atexit(), so a process that just
+ * exits still gets its buffered lines into the log. Windows: when that runs
+ * while the process is being torn down (tblog.dll's atexit handlers run at
+ * DLL unload, after the other threads were killed), tblog_shutdown does not
+ * join its threads but drains the buffer on the calling thread into the file
+ * and console sinks (not the tblog_add_sink sinks). Call tblog_shutdown()
+ * yourself before exiting (and before FreeLibrary of tblog.dll) to get the
+ * complete shutdown everywhere. */
 TBLOG_API int  tblog_init(const char *config_path);
 TBLOG_API void tblog_shutdown(void);  /* drain, fsync, stop worker; idempotent */
 TBLOG_API void tblog_flush(void);     /* ask the worker to flush now and wait for it */

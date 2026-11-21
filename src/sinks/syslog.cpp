@@ -23,7 +23,7 @@ pf::SyslogSeverity severity_for_line(const char *p, size_t n) {
     return pf::SyslogSeverity::Info;
 }
 
-class SyslogSink final : public Sink {
+class SyslogSink final : public LogSink {
 public:
     explicit SyslogSink(const char *ident) { pf::syslog_open(ident); }
     ~SyslogSink() override { pf::syslog_close(); }
@@ -43,12 +43,12 @@ public:
 
 }  // namespace
 
-std::unique_ptr<Sink> make_syslog_sink(const char *ident) {
+std::unique_ptr<LogSink> make_syslog_sink(const char *ident) {
     if (!pf::syslog_available()) {
         std::fprintf(stderr, "tblog: syslog is not supported on this platform, sink disabled\n");
         return nullptr;
     }
-    return std::unique_ptr<Sink>(new SyslogSink(ident));
+    return std::unique_ptr<LogSink>(new SyslogSink(ident));
 }
 
 }  // namespace tblog

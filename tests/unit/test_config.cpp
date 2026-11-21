@@ -1,10 +1,8 @@
 // Unit tests for src/config (parser + validate_config + watcher).
 #include "config/config.h"
+#include "platform/platform.h"
+#include "test_os.h"
 #include "tiny_test.h"
-
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -14,14 +12,7 @@ using namespace tblog;
 
 namespace {
 
-std::string test_dir() {
-    const char *d = std::getenv("TBLOG_TEST_DIR");
-    std::string dir = (d && *d) ? d : "build/tmp";
-    // mkdir -p
-    for (size_t i = 1; i <= dir.size(); ++i)
-        if (i == dir.size() || dir[i] == '/') ::mkdir(dir.substr(0, i).c_str(), 0755);
-    return dir;
-}
+std::string test_dir() { return tos::test_dir(); }
 
 void write_file(const std::string &p, const std::string &content) {
     FILE *f = std::fopen(p.c_str(), "wb");
@@ -36,12 +27,7 @@ bool any_contains(const std::vector<std::string> &w, const char *needle) {
     return false;
 }
 
-void set_mtime(const std::string &p, time_t sec) {
-    struct timespec ts[2];
-    ts[0].tv_sec = sec; ts[0].tv_nsec = 0;
-    ts[1].tv_sec = sec; ts[1].tv_nsec = 0;
-    ::utimensat(AT_FDCWD, p.c_str(), ts, 0);
-}
+void set_mtime(const std::string &p, time_t sec) { tos::set_mtime(p, (int64_t)sec); }
 
 const char *kExample =
     "level = INFO\n"
@@ -357,12 +343,12 @@ TEST(load_config_file) {
     EXPECT_TRUE(load_config(p.c_str(), c, &w));
     EXPECT_EQ(w.size(), size_t(1));
     EXPECT_EQ(int(c.level), int(TBLOG_LV_ERROR));
-    ::unlink(p.c_str());
+    tos::remove_file(p);
 }
 
 TEST(load_config_missing) {
     std::string p = test_dir() + "/definitely_missing_tblog.conf";
-    ::unlink(p.c_str());
+    tos::remove_file(p);
     Config c;
     c.level = TBLOG_LV_FATAL;
     c.pattern = "keep";
@@ -378,7 +364,7 @@ TEST(load_config_missing) {
 
 TEST(watcher) {
     std::string p = test_dir() + "/test_config_watch.conf";
-    ::unlink(p.c_str());
+    tos::remove_file(p);
 
     ConfigWatcher missing(p);
     EXPECT_FALSE(missing.changed());
@@ -406,7 +392,7 @@ TEST(watcher) {
     EXPECT_FALSE(w.changed());
 
     // deletion
-    ::unlink(p.c_str());
+    tos::remove_file(p);
     EXPECT_TRUE(w.changed());
     EXPECT_FALSE(w.changed());
 
@@ -420,13 +406,13 @@ TEST(watcher) {
     std::string tmp = p + ".tmp";
     write_file(tmp, "level = TRACE\n");
     set_mtime(tmp, 1000005);
-    struct stat a, b;
-    ::stat(p.c_str(), &a);
-    ::stat(tmp.c_str(), &b);
-    ::rename(tmp.c_str(), p.c_str());
-    if (a.st_ino != b.st_ino) EXPECT_TRUE(w.changed());
+    tblog::pf::FileInfo a, b;
+    tblog::pf::path_info(p, &a);
+    tblog::pf::path_info(tmp, &b);
+    tos::rename_replace(tmp, p);
+    if (a.id != b.id) EXPECT_TRUE(w.changed());
     EXPECT_FALSE(w.changed());
-    ::unlink(p.c_str());
+    tos::remove_file(p);
 }
 
 // ------------------------------------------------------------ validate_config

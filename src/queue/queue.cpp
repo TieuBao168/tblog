@@ -53,18 +53,21 @@
 #include <new>
 #include <thread>
 
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
 #define TBLOG_CPU_RELAX() _mm_pause()
 #elif defined(__aarch64__)
 #define TBLOG_CPU_RELAX() __asm__ __volatile__("yield")
+#elif defined(_M_ARM64) || defined(_M_ARM64EC)
+#include <intrin.h>
+#define TBLOG_CPU_RELAX() __yield()
 #else
 #define TBLOG_CPU_RELAX() ((void)0)
 #endif
 
 namespace tblog {
 
-#if __cplusplus < 201703L
+#if TBLOG_CPP_LEVEL < 201703L
 constexpr size_t Queue::kMaxShards;  // C++11/14: out-of-line definition
 #endif
 
@@ -125,7 +128,7 @@ std::atomic<unsigned> g_next_thread_id{0};
 
 inline unsigned this_thread_id() noexcept {
     static thread_local unsigned id = 0;  // 0 = not assigned yet; else id + 1
-    if (__builtin_expect(id == 0, 0))
+    if (TBLOG_UNLIKELY(id == 0))
         id = g_next_thread_id.fetch_add(1, std::memory_order_relaxed) + 1;
     return id - 1;
 }

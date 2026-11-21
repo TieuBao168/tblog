@@ -1,6 +1,8 @@
 // Levels & module registry.
 #include "core/levels.h"
 
+#include "core/compat.h"
+
 #include <cstddef>
 #include <cstring>
 #include <mutex>
@@ -21,10 +23,10 @@ inline tblog_level clamp(tblog_level lv) {
     return ((unsigned)lv > (unsigned)TBLOG_LV_OFF) ? TBLOG_LV_OFF : lv;
 }
 inline void store_level(tblog_module *m, tblog_level lv) {
-    __atomic_store_n(&m->level, (unsigned char)lv, __ATOMIC_RELAXED);
+    relaxed_store_u8(&m->level, (unsigned char)lv);
 }
 inline tblog_level load_level(const tblog_module *m) {
-    return (tblog_level)__atomic_load_n(&m->level, __ATOMIC_RELAXED);
+    return (tblog_level)relaxed_load_u8(&m->level);
 }
 inline bool is_root(const char *name) { return name == nullptr || name[0] == '\0'; }
 

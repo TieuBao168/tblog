@@ -16,13 +16,17 @@ concurrency:
 permissions:
   contents: read
 
-# The library is built and tested on Linux only for now (cmake-linux, install,
-# make, lite; cmake-linux also compiles tests/header_check via
-# TBLOG_BUILD_TESTS=ON). On Windows (MSVC x64/ARM64, MinGW-w64) and macOS
-# (AppleClang) the `headers` job compiles only the public headers
-# (TBLOG_HEADERS_ONLY_CHECK=ON). Full `cmake-windows` and `cmake-macos` jobs
-# replace it there once the library builds: roadmap steps 5 (Windows) and 6
-# (macOS).
+# Linux: the library is built and tested by cmake-linux (gcc / clang,
+# C++11/17, sanitizers, no zlib), install, make and lite; cmake-linux also
+# compiles tests/header_check via TBLOG_BUILD_TESTS=ON.
+# Windows: cmake-windows builds the static library and the DLL, the tests,
+# the examples, the DLL export check (packaging/check-exports.ps1) and, for
+# MSVC, installs and builds packaging/consumer with find_package: MSVC x64
+# (Release without zlib, Debug with vcpkg's zlib) and MinGW-w64 (MSYS2).
+# The `headers` job compiles only the public headers
+# (TBLOG_HEADERS_ONLY_CHECK=ON) where the library is not built yet: macOS
+# (AppleClang; full `cmake-macos` job in roadmap step 6) and MSVC ARM64
+# (cross-compiled, compile only).
 
 jobs:
   # No OS headers / OS calls outside src/platform/ (the platform layer).
@@ -102,9 +106,134 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure
 
+  # Windows: static library + DLL, every test (tests/unit against the static
+  # library, tests/shared against the DLL), the examples (as CTest smoke
+  # tests, against the DLL) and check_exports (the DLL exports exactly the
+  # TBLOG_API functions). The header check (tests/header_check) is compiled
+  # at CMAKE_CXX_STANDARD, independently of the library's TBLOG_CXX_STANDARD.
+  cmake-windows:
+    name: cmake-windows / ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: msvc x64 / Release / no zlib / install
+            kind: msvc
+            shell: pwsh
+            config: Release
+            options: -DTBLOG_WITH_ZLIB=OFF
+            vcpkg: false
+            install: true
+          - name: msvc x64 / Debug / C++14 / zlib (vcpkg) / Werror
+            kind: msvc
+            shell: pwsh
+            config: Debug
+            options: -DTBLOG_WERROR=ON -DTBLOG_CXX_STANDARD=14 -DCMAKE_CXX_STANDARD=20
+            vcpkg: true
+            install: false
+          - name: mingw-w64 gcc / Release / C++11 / zlib / Werror
+            kind: mingw
+            shell: msys2 {0}
+            config: Release
+            options: -DTBLOG_WERROR=ON -DTBLOG_CXX_STANDARD=11 -DCMAKE_CXX_STANDARD=20
+            vcpkg: false
+            install: false
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSYS2 MinGW-w64 toolchain
+        if: matrix.kind == 'mingw'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-zlib
+
+      # Classic mode with the runner's preinstalled vcpkg.
+      - name: Install zlib (vcpkg)
+        if: matrix.vcpkg
+        run: '& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install zlib:x64-windows'
+
+      - name: Configure (MSVC)
+        if: matrix.kind == 'msvc'
+        run: |
+          $extra = @()
+          if ('${{ matrix.vcpkg }}' -eq 'true') {
+            $extra += "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+            $extra += "-DVCPKG_TARGET_TRIPLET=x64-windows"
+          }
+          cmake -S . -B build -A x64 -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON `
+            -DTBLOG_BUILD_BENCH=ON ${{ matrix.options }} @extra | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ('${{ matrix.vcpkg }}' -eq 'true' -and
+              -not (Select-String -Quiet -Path configure.log -Pattern '\(zlib\): ON')) {
+            Write-Error "zlib from vcpkg was not found"; exit 1
+          }
+
+      - name: Configure (MinGW)
+        if: matrix.kind == 'mingw'
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON -DTBLOG_BUILD_BENCH=ON
+          ${{ matrix.options }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      # Also part of the Test step; run on its own so its output is in the log.
+      - name: DLL export check
+        run: ctest --test-dir build -C ${{ matrix.config }} -R check_exports -V
+
+      # find_package(tblog 0.1) from a separate CMake project against the
+      # installed tree: tblog::tblog (the DLL), tblog::tblog_static, cpp_api.
+      - name: Install + find_package consumer (packaging/consumer)
+        if: matrix.install
+        run: |
+          $prefix = "$env:RUNNER_TEMP/tblog"
+          cmake --install build --config ${{ matrix.config }} --prefix $prefix
+          if (-not (Test-Path "$prefix/lib/tblog_static.lib") -or -not (Test-Path "$prefix/lib/tblog.lib") -or
+              -not (Test-Path "$prefix/bin/tblog.dll")) {
+            Get-ChildItem -Recurse $prefix | Select-Object FullName; Write-Error "unexpected install layout"; exit 1
+          }
+          cmake -S packaging/consumer -B build-consumer -A x64 "-DCMAKE_PREFIX_PATH=$prefix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-consumer --config ${{ matrix.config }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location build-consumer/${{ matrix.config }}
+          function Run-Basic($exe) {
+            Set-Content -Encoding ascii -Path "$exe.conf" -Value "file.path = $PWD/$exe.log`nreload.watch = false"
+            & "./$exe.exe" "$exe.conf"
+            if ($LASTEXITCODE -ne 0) { Write-Error "$exe exited with $LASTEXITCODE"; exit 1 }
+            if (-not (Select-String -Quiet -Path "$exe.log" -Pattern 'started, pid-independent message hello')) {
+              Write-Error "$exe.log: start line missing"; exit 1
+            }
+            $n = @(Select-String -Path "$exe.log" -Pattern 'worker . step').Count
+            if ($n -ne 4000) { Write-Error "$exe.log: $n worker lines, expected 4000"; exit 1 }
+          }
+          Run-Basic basic_static              # needs no tblog.dll (not on PATH yet)
+          $env:PATH = "$prefix/bin;$env:PATH"
+          Run-Basic basic_default             # tblog::tblog -> tblog.dll
+          Set-Content -Encoding ascii -Path cpp_api.conf -Value "file.path = $PWD/cpp_api.log`nreload.watch = false"
+          ./cpp_api.exe cpp_api.conf 1000
+          if ($LASTEXITCODE -ne 0) { Write-Error "cpp_api exited with $LASTEXITCODE"; exit 1 }
+          if (-not (Select-String -Quiet -Path cpp_api.log -Pattern 'user 42 logged in from 10.0.0.7:8443')) {
+            Write-Error "cpp_api.log: line missing"; exit 1
+          }
+
   # Public headers only (tests/header_check, plain and with TBLOG_DLL): strict
   # warnings as errors (/W4 /WX /permissive-, or -Wall -Wextra -Wpedantic
-  # -Werror). The library itself is not built here.
+  # -Werror), where the library itself is not built (yet).
   headers:
     name: headers / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -112,24 +241,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: msvc x64 / C++14
-            os: windows-latest
-            kind: msvc
-            shell: pwsh
-            generator: -A x64
-            std: 14
-          - name: msvc x64 / C++17
-            os: windows-latest
-            kind: msvc
-            shell: pwsh
-            generator: -A x64
-            std: 17
-          - name: msvc x64 / C++20
-            os: windows-latest
-            kind: msvc
-            shell: pwsh
-            generator: -A x64
-            std: 20
           # Cross-compiled, compile only: covers the ARM64 atomics in log.h.
           - name: msvc arm64 / C++17
             os: windows-latest
@@ -137,18 +248,6 @@ jobs:
             shell: pwsh
             generator: -A ARM64
             std: 17
-          - name: mingw-w64 gcc / C++11
-            os: windows-latest
-            kind: mingw
-            shell: msys2 {0}
-            generator: -G Ninja
-            std: 11
-          - name: mingw-w64 gcc / C++20
-            os: windows-latest
-            kind: mingw
-            shell: msys2 {0}
-            generator: -G Ninja
-            std: 20
           - name: macos appleclang / C++11
             os: macos-latest
             kind: macos
@@ -166,17 +265,6 @@ jobs:
         shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install MSYS2 MinGW-w64 toolchain
-        if: matrix.kind == 'mingw'
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          update: false
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
 
       # C++: CMAKE_CXX_STANDARD; C: C99 (C11 on MSVC), set in CMakeLists.txt.
       - name: Configure

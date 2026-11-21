@@ -9,6 +9,8 @@
 //   syncer -- syncer_main: Pipeline::sync (fdatasync) every sync.interval_ms
 //             and on urgent lines
 //   crash  -- Pipeline::crash from the signal handler (src/crash/)
+//   exit   -- tblog_shutdown from atexit while the process is being torn down
+//             (Windows DLL unload): shutdown_at_exit, no joins (see below)
 #include "config/config.h"
 #include "core/compat.h"
 #include "core/formatter.h"
@@ -219,7 +221,7 @@ std::unique_ptr<Pipeline> make_pipeline(const Config &c, const std::vector<UserS
     if (!q) return nullptr;
     std::unique_ptr<Pipeline> p = tblog::make_unique<Pipeline>(std::move(q));
     if (c.file_enabled) {
-        std::unique_ptr<Sink> f = make_file_sink(c.file);
+        std::unique_ptr<LogSink> f = make_file_sink(c.file);
         if (!f) return nullptr;
         p->add_sink(std::move(f));
     }
@@ -280,7 +282,35 @@ extern "C" int tblog_init(const char *config_path) {
     return 0;
 }
 
+namespace tblog {
+namespace {
+
+// tblog_shutdown() while the process is going away (pf::process_exiting():
+// Windows, from the atexit handler of tblog.dll -- or of a static tblog inside
+// another DLL -- which runs under the loader lock after ExitProcess killed the
+// other threads). Joining the worker/syncer would deadlock or wait on threads
+// that are gone, and any lock they held stays held. So: no join, no wait, no
+// allocation; drain the queue on this thread through the lock-free crash path
+// into the crash-safe sinks (file, console). User sinks do not get these last
+// lines (as after a crash). The file's handle is closed by the OS; what was
+// written is in the OS cache and survives the process.
+void shutdown_at_exit() noexcept {
+    std::unique_lock<std::mutex> life(g_life_mu, std::try_to_lock);  // never block here
+    Runtime *rt = g_rt.exchange(nullptr, std::memory_order_acq_rel);
+    if (!rt) return;
+    uninstall_crash_handler();
+    rt->stop.store(true, std::memory_order_release);
+    rt->pipeline->crash(nullptr, 0);  // closes the queue: later appends go to stderr
+}
+
+}  // namespace
+}  // namespace tblog
+
 extern "C" void tblog_shutdown(void) {
+    if (pf::process_exiting()) {
+        shutdown_at_exit();
+        return;
+    }
     std::lock_guard<std::mutex> life(g_life_mu);
     Runtime *rt = g_rt.exchange(nullptr, std::memory_order_acq_rel);
     if (!rt) return;
@@ -294,7 +324,7 @@ extern "C" void tblog_shutdown(void) {
     }
     rt->sync_cv.notify_one();
     if (rt->syncer.joinable()) rt->syncer.join();
-    // Close the queue, final drain + flush, Sink::shutdown (fdatasync + close).
+    // Close the queue, final drain + flush, LogSink::shutdown (fdatasync + close).
     rt->pipeline->shutdown();
     g_dropped_after_shutdown.fetch_add(rt->queue->dropped(), std::memory_order_relaxed);
     g_retired->push_back(rt);  // never deleted (see g_rt)

@@ -5,7 +5,7 @@
 //
 // Implementations:
 //   src/platform/posix/*.cpp   Linux (and later macOS)
-//   src/platform/win32/*.cpp   Windows (roadmap step 5; not written yet)
+//   src/platform/win32/*.cpp   Windows 8 or later (MSVC and MinGW-w64)
 // plus one header of inline functions per platform (posix/inline.h,
 // win32/inline.h) for the few calls on the logging hot path.
 //
@@ -126,7 +126,8 @@ void sync_dir(const std::string &dir) noexcept;
 // Time
 // ============================================================================
 // Wall clock (CLOCK_REALTIME / GetSystemTimePreciseAsFileTime) in ns since
-// the Unix epoch. Inline: called once per log line.
+// the Unix epoch. Called once per log line: inline on POSIX; out of line on
+// Windows (keeps <windows.h> out of every translation unit).
 uint64_t realtime_ns() noexcept;
 // Local-time breakdown of `t` (seconds since the epoch): localtime_r /
 // localtime_s. false on failure (*out unspecified).
@@ -139,6 +140,14 @@ bool local_time(int64_t t, std::tm *out) noexcept;
 // GetCurrentThreadId on Windows), truncated to 32 bits, never 0. Not inline:
 // callers cache it per thread (ThreadContext).
 uint32_t current_thread_id() noexcept;
+
+// True once the process is going away: ExitProcess has started (other threads
+// are already terminated, possibly while holding locks) or the tblog DLL is
+// being unloaded (DLL_PROCESS_DETACH, under the loader lock: joining a thread
+// would deadlock). tblog_shutdown() then drains the queue on the calling
+// thread through the lock-free crash path instead of joining its threads.
+// POSIX: always false (atexit handlers run while every thread still runs).
+bool process_exiting() noexcept;
 
 // ============================================================================
 // Memory
@@ -163,22 +172,27 @@ void stderr_write(const char *data, size_t len) noexcept;
 // Crash handling (src/platform/<os>/crash.cpp)
 // ============================================================================
 // Called on the crashing thread from the fatal-signal / exception handler.
-// It must be async-signal-safe (no locks, no malloc, no stdio). `code` is the
-// signal number (POSIX) or exception code (Windows); `name` e.g. "SIGSEGV".
-typedef void (*CrashReporter)(int code, const char *name);
+// It must be async-signal-safe (no locks, no malloc, no stdio). `kind` says
+// what `code` is: a signal number (POSIX signals, SIGABRT on Windows) or a
+// Windows exception code (e.g. 0xC0000005); `name` e.g. "SIGSEGV" or
+// "EXCEPTION_ACCESS_VIOLATION".
+enum class CrashKind { Signal, Exception };
+typedef void (*CrashReporter)(CrashKind kind, int code, const char *name);
 
 // Installs handlers for SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL (POSIX, on an
 // alternate stack set up for the calling thread) or an unhandled-exception
-// filter + SIGABRT handler (Windows). On a crash: the first crashing thread
-// calls `reporter`, then a backtrace goes to stderr, then the previous
-// handler / default action runs so a core dump is still produced. A fault
+// filter + SIGABRT handler (Windows; the filter sees access violations,
+// illegal instructions, divide by zero, stack overflow, ...). On a crash: the
+// first crashing thread calls `reporter`, then a backtrace goes to stderr
+// (Windows: return addresses only), then the previous handler / default
+// action runs so a core dump / WER report is still produced. A fault
 // inside the reporter, or a crash on a second thread, skips the reporter.
 // Not thread-safe: the caller serialises install / uninstall.
 void crash_install(CrashReporter reporter) noexcept;
 void crash_uninstall() noexcept;  // restore previous handlers (and alt stack)
 // Gives the calling thread its own alternate signal stack (freed at thread
 // exit) so a stack overflow on it is still reported. Idempotent. Windows:
-// SetThreadStackGuarantee.
+// SetThreadStackGuarantee (room for the exception filter on overflow).
 bool crash_thread_init() noexcept;
 
 // ============================================================================

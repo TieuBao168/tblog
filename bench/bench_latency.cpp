@@ -5,13 +5,13 @@
 //                         Flooding measures a saturated logger: with the Drop
 //                         policy a fast caller path shows up as drops.
 //   TBLOG_BENCH_POLICY=P  full_policy for the run: drop (default) or block.
-// Per-call latency is measured with clock_gettime around each call, so every
+// Per-call latency is measured with std::chrono::steady_clock around each call, so every
 // number includes ~15-25 ns of timer overhead (printed as "timer").
 #include "tblog/log.h"
 
-#include <time.h>
-
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -22,9 +22,9 @@
 namespace {
 
 inline uint64_t ns() {
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
 }
 
 struct Result { double p50, p99, p999, max, lines_per_s; };

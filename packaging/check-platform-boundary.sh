@@ -20,10 +20,12 @@ headers='^[[:space:]]*#[[:space:]]*include[[:space:]]*<(unistd\.h|fcntl\.h|sys/[
 id='(^|[^A-Za-z0-9_])'
 qualified="${id}::(open|write|read|close|dup|dup2|fsync|fdatasync|ftruncate|rename|unlink|stat|lstat|fstat|mkdir|opendir|readdir|closedir|isatty|syscall|localtime_r|clock_gettime)\\("
 bare="${id}(syscall|sigaction|sigaltstack|gettid|localtime_r|gmtime_r|posix_memalign|clock_gettime|nanosleep|mmap|munmap|fsync|fdatasync|openlog|closelog|backtrace|backtrace_symbols_fd)\\(|SYS_gettid|STDERR_FILENO"
+# Win32 API / MSVC CRT calls.
+win="${id}(CreateFileW|CreateFileA|CloseHandle|WriteFile|ReadFile|GetLastError|MoveFileExW|DeleteFileW|FlushFileBuffers|GetStdHandle|GetCurrentThreadId|SetUnhandledExceptionFilter|GetSystemTimePreciseAsFileTime|_aligned_malloc|_aligned_free|localtime_s)\\("
 
 status=0
 if grep -rnE --include='*.h' --include='*.hpp' --include='*.cpp' --include='*.c' \
-        --exclude-dir=platform "$headers|$qualified|$bare" "$src"; then
+        --exclude-dir=platform "$headers|$qualified|$bare|$win" "$src"; then
     echo "check-platform-boundary: OS-specific code outside $src/platform/ (see above);" >&2
     echo "  move it behind src/platform/platform.h (tblog::pf)." >&2
     status=1

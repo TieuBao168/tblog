@@ -313,15 +313,15 @@ bool parse_config_string(const std::string &text, Config &out,
 // Returns false only if the file cannot be read; warnings do not fail it.
 bool load_config(const char *path, Config &out, std::vector<std::string> *warnings) {
     if (!path) return false;
-    FILE *f = std::fopen(path, "rb");
-    if (!f) return false;
+    // Through pf:: so that a UTF-8 path works on Windows too.
+    pf::FileHandle f = pf::file_open(path, pf::OpenMode::Read);
+    if (!f.valid()) return false;
     std::string text;
     char buf[4096];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
-    bool err = std::ferror(f) != 0;
-    std::fclose(f);
-    if (err) return false;
+    int64_t n;
+    while ((n = pf::file_read(f, buf, sizeof buf)) > 0) text.append(buf, static_cast<size_t>(n));
+    pf::file_close(f);
+    if (n < 0) return false;  // e.g. a directory (EISDIR)
     parse_config_string(text, out, warnings);
     return true;
 }

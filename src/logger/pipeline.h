@@ -35,7 +35,7 @@ public:
 
     // Setup, before the worker starts and before the crash handler is
     // installed. Null sinks are ignored. Sinks are written in this order.
-    void add_sink(std::unique_ptr<Sink> s);
+    void add_sink(std::unique_ptr<LogSink> s);
     size_t sink_count() const noexcept { return sinks_.size(); }
 
     Queue &queue() noexcept { return *queue_; }
@@ -45,7 +45,7 @@ public:
     // ---- syncer (or worker): every sink's sync().
     void sync();
     // ---- any thread, once the worker has stopped: close the queue, final
-    // drain + flush, Sink::shutdown() on every sink. Idempotent.
+    // drain + flush, LogSink::shutdown() on every sink. Idempotent.
     void shutdown();
 
     // ---- signal handler: async-signal-safe. marker may be null.
@@ -58,10 +58,10 @@ private:
     void write_note(const char *data, size_t len);
 
     std::unique_ptr<Queue> queue_;
-    std::vector<std::unique_ptr<Sink>> owned_;
-    std::vector<Sink *> sinks_;        // all, in order
-    std::vector<Sink *> crash_sinks_;  // crash_safe(), in order (read by crash())
-    std::vector<Sink *> other_sinks_;  // the rest, in order
+    std::vector<std::unique_ptr<LogSink>> owned_;
+    std::vector<LogSink *> sinks_;        // all, in order
+    std::vector<LogSink *> crash_sinks_;  // crash_safe(), in order (read by crash())
+    std::vector<LogSink *> other_sinks_;  // the rest, in order
     bool crash_stderr_ = false;
 
     std::mutex mu_;  // drain / shutdown

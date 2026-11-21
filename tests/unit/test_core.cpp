@@ -2,11 +2,15 @@
 #include "core/formatter.h"
 #include "core/levels.h"
 #include "core/thread_context.h"
+#include "test_os.h"
 #include "tiny_test.h"
 
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdarg>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <ctime>
 #include <string>
@@ -18,7 +22,7 @@ using namespace tblog;
 namespace {
 
 std::string fmt_line(const Formatter &f, size_t cap, const Record &r, const char *fmt, ...)
-    __attribute__((format(printf, 4, 5)));
+    TOS_PRINTF(4, 5);
 std::string fmt_line(const Formatter &f, size_t cap, const Record &r, const char *fmt, ...) {
     std::vector<char> buf(cap + 16, '\x7f');
     va_list ap;
@@ -42,12 +46,11 @@ Record make_rec(uint64_t ts = 0) {
     return r;
 }
 
-// Fixed timestamp: local time computed with localtime_r for comparison.
+// Fixed timestamp: local time computed with localtime_r / localtime_s for comparison.
 const uint64_t kTs = 1700000000ull * 1000000000ull + 123456789ull;
 std::string expect_date_time(uint64_t ts, bool date) {
     time_t t = (time_t)(ts / 1000000000ull);
-    struct tm tm;
-    localtime_r(&t, &tm);
+    struct tm tm = tos::local_tm(t);
     char b[32];
     if (date) strftime(b, sizeof b, "%Y-%m-%d", &tm);
     else strftime(b, sizeof b, "%H:%M:%S", &tm);
@@ -304,6 +307,36 @@ TEST(fmt_newline_always_present) {
         return std::string(buf, k);
     };
     EXPECT_EQ(call(0), std::string("? ? - \n"));
+}
+
+// The message is formatted with C99 printf semantics everywhere, matching
+// the format checking of tblog_write (gnu_printf on MinGW-w64, whose default
+// msvcrt printf would not know %zu / %lld / %hhd / %Lf).
+TEST(fmt_c99_conversions) {
+    Record r = make_rec(kTs);
+    Formatter f("%m");
+    EXPECT_EQ(fmt_line(f, 256, r, "%zu|%zd|%lld|%llu|%jd|%hhd|%hhu|%Lf|%" PRIu64 "|%" PRId64, (size_t)123,
+                       (ptrdiff_t)-5, -9000000000LL, 18446744073709551615ULL, (intmax_t)-7,
+                       (signed char)-3, (unsigned char)250, 1.5L, UINT64_MAX, INT64_MIN),
+              std::string("123|-5|-9000000000|18446744073709551615|-7|-3|250|1.500000|"
+                          "18446744073709551615|-9223372036854775808\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "[%5.2f] [%-6s] [%05d] [%x] [%#o] [%e]", 3.14159, "ab", 42, 255u, 8u, 1e10),
+              std::string("[ 3.14] [ab    ] [00042] [ff] [010] [1.000000e+10]\n"));
+}
+
+// %f prints the basename of __FILE__: '/' separates on every platform, '\\'
+// too on Windows (MSVC's __FILE__ uses it).
+TEST(fmt_file_basename_separators) {
+    Record r = make_rec(kTs);
+    Formatter f("%f");
+    r.file = "a/b\\c.cpp";
+#if defined(_WIN32)
+    EXPECT_EQ(fmt_line(f, 64, r, "x"), std::string("c.cpp\n"));
+    r.file = "C:\\src\\dir\\win.cpp";
+    EXPECT_EQ(fmt_line(f, 64, r, "x"), std::string("win.cpp\n"));
+#else
+    EXPECT_EQ(fmt_line(f, 64, r, "x"), std::string("b\\c.cpp\n"));
+#endif
 }
 
 TEST(fmt_multithreaded) {

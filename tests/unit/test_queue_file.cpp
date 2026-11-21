@@ -7,6 +7,7 @@
 #include "sinks/file_sink.h"
 #include "sinks/rotating_file.h"
 #include "sinks/sink.h"
+#include "test_os.h"
 #include "tiny_test.h"
 
 #include <algorithm>
@@ -19,40 +20,16 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
-
-#include <ftw.h>
-#include <sys/stat.h>
-#include <system_error>
 
 using namespace tblog;
 
-// Minimal POSIX stand-in for the few std::filesystem calls used here, so the
-// tests also build as C++11/14 (std::filesystem is C++17).
+// The few std::filesystem-like calls used here (std::filesystem is C++17;
+// these tests also build as C++11/14).
 namespace fs {
-inline bool exists(const std::string &p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0;
-}
-inline unsigned long long file_size(const std::string &p) {
-    struct stat st;
-    return ::stat(p.c_str(), &st) == 0 ? static_cast<unsigned long long>(st.st_size) : ~0ull;
-}
-inline int rm_entry(const char *p, const struct stat *, int, struct FTW *) { return ::remove(p); }
-inline void remove_all(const std::string &p, std::error_code &ec) {
-    ec.clear();
-    if (exists(p) && ::nftw(p.c_str(), rm_entry, 16, FTW_DEPTH | FTW_PHYS) != 0)
-        ec = std::error_code(errno, std::generic_category());
-}
-inline void remove(const std::string &p, std::error_code &ec) {
-    ec.clear();
-    if (::remove(p.c_str()) != 0) ec = std::error_code(errno, std::generic_category());
-}
-inline void create_directories(const std::string &p) {
-    for (size_t i = 1; i <= p.size(); ++i)
-        if (i == p.size() || p[i] == '/') ::mkdir(p.substr(0, i).c_str(), 0755);
-}
+inline bool exists(const std::string &p) { return tos::exists(p); }
+inline unsigned long long file_size(const std::string &p) { return tos::file_size(p); }
+inline void create_directories(const std::string &p) { tos::make_dirs(p); }
 }  // namespace fs
 
 #if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
@@ -62,22 +39,17 @@ static const int kScale = 1;
 #endif
 
 // ---------------------------------------------------------------- helpers
-static std::string base_dir() {
-    const char *d = std::getenv("TBLOG_TEST_DIR");
-    return (d && *d) ? d : "build/tmp";
-}
+static std::string base_dir() { return tos::test_dir(); }
 
 struct TempDir {
     std::string path;
     explicit TempDir(const char *name) {
-        path = base_dir() + "/queue_file_" + std::to_string(getpid()) + "_" + name;
-        std::error_code ec;
-        fs::remove_all(path, ec);
+        path = base_dir() + "/queue_file_" + std::to_string(tos::pid()) + "_" + name;
+        tos::remove_tree(path);
     }
     ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-        fs::remove(base_dir() + "/", ec);  // only if empty
+        tos::remove_tree(path);
+        tos::remove_empty_dir(base_dir());  // only if empty
     }
     std::string file(const char *f) const { return path + "/" + f; }
 };
@@ -276,12 +248,12 @@ TEST(rotating_reopen_after_external_delete) {
     o.path = d.file("app.log");
     ASSERT_TRUE(rf.open(o));
     rf.write_all("one\n", 4);
-    ::unlink(o.path.c_str());
+    tos::remove_file(o.path);
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     rf.write_all("two\n", 4);
     EXPECT_EQ(read_file(o.path), std::string("two\n"));
     // External rename (logrotate style).
-    ::rename(o.path.c_str(), d.file("moved.log").c_str());
+    tos::rename_replace(o.path, d.file("moved.log"));
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     rf.write_all("three\n", 6);
     EXPECT_EQ(read_file(o.path), std::string("three\n"));
@@ -304,7 +276,11 @@ TEST(rotating_open_failure) {
 }
 
 TEST(rotating_write_error_counts_loss) {
+#if defined(_WIN32)
+    TINY_SKIP("needs /dev/full (no Windows equivalent)");
+#else
     if (access("/dev/full", W_OK) != 0) return;
+#endif
     RotatingFile rf;
     FileOptions o;
     o.path = "/dev/full";
@@ -544,7 +520,7 @@ struct Capture {
     Pipeline *crash_from_write = nullptr;  // "signal" during the first write
 };
 
-struct CaptureSink : Sink {
+struct CaptureSink : LogSink {
     explicit CaptureSink(Capture *c) : c_(c) {}
     void write(const char *d, size_t n) override {
         c_->data.append(d, n);
@@ -564,8 +540,8 @@ struct CaptureSink : Sink {
     Capture *c_;
 };
 
-static std::unique_ptr<Sink> capture_sink(Capture *c) {
-    return std::unique_ptr<Sink>(new CaptureSink(c));
+static std::unique_ptr<LogSink> capture_sink(Capture *c) {
+    return std::unique_ptr<LogSink>(new CaptureSink(c));
 }
 
 TEST(pipeline_sinks_receive_everything) {
@@ -612,7 +588,7 @@ TEST(pipeline_batch_hooks_order) {
     b->drain();
     EXPECT_EQ(c.events, std::string("BWEF"));
     c.events.clear();
-    b->shutdown();  // final drain (flush forced) + Sink::shutdown
+    b->shutdown();  // final drain (flush forced) + LogSink::shutdown
     EXPECT_EQ(c.events, std::string("BEFS"));
     EXPECT_EQ(c.data, std::string("one\n"));
     EXPECT_EQ(read_file(o.file.path), std::string("one\n"));

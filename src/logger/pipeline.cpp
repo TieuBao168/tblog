@@ -10,9 +10,9 @@ Pipeline::Pipeline(std::unique_ptr<Queue> q) : queue_(std::move(q)) {}
 
 Pipeline::~Pipeline() { shutdown(); }
 
-void Pipeline::add_sink(std::unique_ptr<Sink> s) {
+void Pipeline::add_sink(std::unique_ptr<LogSink> s) {
     if (!s) return;
-    Sink *p = s.get();
+    LogSink *p = s.get();
     owned_.push_back(std::move(s));
     sinks_.push_back(p);
     if (p->crash_safe()) {
@@ -24,8 +24,8 @@ void Pipeline::add_sink(std::unique_ptr<Sink> s) {
 }
 
 void Pipeline::write_note(const char *data, size_t len) {
-    for (Sink *s : crash_sinks_) s->write(data, len);
-    for (Sink *s : other_sinks_) s->write(data, len);
+    for (LogSink *s : crash_sinks_) s->write(data, len);
+    for (LogSink *s : other_sinks_) s->write(data, len);
 }
 
 void Pipeline::drain(bool force_flush) {
@@ -44,14 +44,14 @@ void Pipeline::drain(bool force_flush) {
         // line taken above was appended before this clock read, so it never
         // lands in a file of an earlier period than the one in effect when
         // it was appended.
-        for (Sink *s : sinks_) s->begin_batch();
+        for (LogSink *s : sinks_) s->begin_batch();
         for (size_t i = 0; i < b.size; ++i) {
             // The crash handler already drained the queue: don't duplicate.
             if (q.crashed()) break;
             const Queue::Chunk &c = b.chunks[i];
-            for (Sink *s : crash_sinks_) s->write(c.data, c.len);
+            for (LogSink *s : crash_sinks_) s->write(c.data, c.len);
             q.mark_written(b, i);
-            for (Sink *s : other_sinks_) s->write(c.data, c.len);
+            for (LogSink *s : other_sinks_) s->write(c.data, c.len);
             wrote = true;
         }
         const uint64_t d = q.dropped();
@@ -65,15 +65,15 @@ void Pipeline::drain(bool force_flush) {
                 wrote = true;
             }
         }
-        for (Sink *s : sinks_) s->end_batch();
+        for (LogSink *s : sinks_) s->end_batch();
     }
     q.release(b);
     if (wrote || force_flush)
-        for (Sink *s : sinks_) s->flush();
+        for (LogSink *s : sinks_) s->flush();
 }
 
 void Pipeline::sync() {
-    for (Sink *s : sinks_) s->sync();
+    for (LogSink *s : sinks_) s->sync();
 }
 
 void Pipeline::shutdown() {
@@ -82,13 +82,13 @@ void Pipeline::shutdown() {
     std::lock_guard<std::mutex> lk(mu_);
     if (shut_) return;
     shut_ = true;
-    for (Sink *s : sinks_) s->shutdown();
+    for (LogSink *s : sinks_) s->shutdown();
 }
 
 // ------------------------------------------------------------------ crash
 void Pipeline::crash_visit(void *ctx, const char *data, size_t len) noexcept {
     const Pipeline *p = static_cast<const Pipeline *>(ctx);
-    for (Sink *s : p->crash_sinks_) s->crash_write(data, len);
+    for (LogSink *s : p->crash_sinks_) s->crash_write(data, len);
 }
 
 void Pipeline::crash(const char *marker, size_t len) noexcept {

@@ -104,15 +104,22 @@ int64_t file_read(FileHandle h, void *buf, size_t len) noexcept {
     }
 }
 
-bool file_sync(FileHandle h) noexcept { return ::fsync(h.native) == 0; }
-
-bool file_datasync(FileHandle h) noexcept {
 #if defined(__APPLE__)
-    return ::fsync(h.native) == 0;  // no fdatasync on macOS
-#else
-    return ::fdatasync(h.native) == 0;
-#endif
+// macOS: fsync() only moves the data to the drive, which may keep it in its
+// volatile write cache; F_FULLFSYNC also flushes that cache (what fsync /
+// fdatasync guarantee on Linux), at a cost of milliseconds per call. Some
+// file systems (network, FUSE, FAT) refuse F_FULLFSYNC: fall back to fsync.
+// There is no fdatasync, so file_sync and file_datasync are the same call.
+static bool full_fsync(int fd) noexcept {
+    if (::fcntl(fd, F_FULLFSYNC) == 0) return true;
+    return ::fsync(fd) == 0;
 }
+bool file_sync(FileHandle h) noexcept { return full_fsync(h.native); }
+bool file_datasync(FileHandle h) noexcept { return full_fsync(h.native); }
+#else
+bool file_sync(FileHandle h) noexcept { return ::fsync(h.native) == 0; }
+bool file_datasync(FileHandle h) noexcept { return ::fdatasync(h.native) == 0; }
+#endif
 
 bool file_truncate(FileHandle h, uint64_t size) noexcept {
     return ::ftruncate(h.native, static_cast<off_t>(size)) == 0;

@@ -2,10 +2,23 @@
 // what gets reported lives in src/crash/crash_handler.cpp).
 //
 // Everything reachable from crash_signal_handler() is async-signal-safe:
-// only atomics, write(), sigaction(), raise(), nanosleep(), syscall(gettid)
-// and backtrace()/backtrace_symbols_fd() (not formally AS-safe, but safe in
-// practice once libgcc has been loaded, which crash_install forces).
-// No malloc, no locks, no stdio.
+// only atomics, write(), sigaction(), raise(), nanosleep(), current_thread_id()
+// (syscall(gettid) / pthread_threadid_np), pthread_sigmask() (macOS) and
+// backtrace()/backtrace_symbols_fd() (not formally AS-safe, but safe in
+// practice once libgcc has been loaded, which crash_install forces; on macOS
+// they live in libSystem). No malloc, no locks, no stdio.
+//
+// macOS differences (the first two are the #if defined(__APPLE__) below):
+//   * XNU does not force a blocked synchronous fault signal through as Linux
+//     does, and abort() blocks every signal but SIGABRT before raising it, so
+//     a fault inside our handler (or the reporter) could spin on the faulting
+//     instruction instead of killing the process: the handler unblocks the
+//     fatal signals first.
+//   * XNU fills si_code of SIGBUS (BUS_ADRERR) and, on arm64, SIGILL for
+//     kill()/raise() too, so si_code > 0 does not prove a hardware fault:
+//     see pass_on().
+//   * A stack overflow on a secondary thread hits its guard page and arrives
+//     as SIGBUS, not SIGSEGV (it is reported as such).
 //
 // Alternate stack: sigaltstack() is PER THREAD. crash_install() sets one up
 // for the calling thread only (from static storage). A stack overflow in any
@@ -31,6 +44,9 @@
 #endif
 #ifndef TBLOG_HAVE_BACKTRACE
 #define TBLOG_HAVE_BACKTRACE 0
+#endif
+#if defined(__APPLE__)
+#include <pthread.h>  // pthread_sigmask
 #endif
 #include <signal.h>
 #include <sys/mman.h>
@@ -98,10 +114,35 @@ void pass_on(int sig, siginfo_t *info, bool chain) noexcept {
         sigemptyset(&sa.sa_mask);
     }
     sigaction(sig, &sa, nullptr);
-    if (info == nullptr || info->si_code <= 0 || sig == SIGABRT) raise(sig);
+    bool resend = info == nullptr || info->si_code <= 0 || sig == SIGABRT;
+#if defined(__APPLE__)
+    // User-sent signals have si_code SI_USER and up (0x10001...), and XNU
+    // reports raise(SIGBUS) / raise(SIGILL) with fault-like codes. Raising is
+    // always right for the default action (the signal is unblocked, see
+    // unblock_fatal_signals, so raise() terminates the process at once) and
+    // is done for SIGBUS / SIGILL too: an application handler may then see
+    // one synthetic delivery before a real fault re-faults, instead of a
+    // raised signal being lost.
+    if (!resend)
+        resend = info->si_code >= SI_USER || sig == SIGBUS || sig == SIGILL ||
+                 (!(sa.sa_flags & SA_SIGINFO) && sa.sa_handler == SIG_DFL);
+#endif
+    if (resend) raise(sig);
 }
 
+#if defined(__APPLE__)
+void unblock_fatal_signals() noexcept {
+    sigset_t set;
+    sigemptyset(&set);
+    for (int s : kSignals) sigaddset(&set, s);
+    pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
+}
+#endif
+
 void crash_signal_handler(int sig, siginfo_t *info, void *) {
+#if defined(__APPLE__)
+    unblock_fatal_signals();  // a nested fault must re-enter us, not spin
+#endif
     const long self = static_cast<long>(current_thread_id());
     long expected = 0;
     if (!g_owner_tid.compare_exchange_strong(expected, self, std::memory_order_acq_rel)) {

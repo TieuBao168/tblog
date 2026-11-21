@@ -51,7 +51,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #if defined(__APPLE__)
-#include <mach-o/dyld.h>
+#include <climits>  // PATH_MAX
+#include <mach-o/dyld.h>  // _NSGetExecutablePath
 #endif
 #endif
 
@@ -471,6 +472,11 @@ inline bool died_with(const ChildResult &r, Crash c) {
         case Crash::Bus: want = SIGBUS; break;
         case Crash::StackOverflow: want = SIGSEGV; break;
     }
+#if defined(__APPLE__)
+    // macOS: overflowing a secondary thread's stack hits its guard page,
+    // which XNU reports as SIGBUS (SIGSEGV only for the main thread).
+    if (c == Crash::StackOverflow && r.signal == SIGBUS) want = SIGBUS;
+#endif
     return !r.timed_out && !r.exited && r.signal == want;
 #endif
 }
@@ -490,9 +496,12 @@ inline std::string self_exe() {
     DWORD n = GetModuleFileNameW(nullptr, buf, 32768);
     return n ? narrow(buf) : std::string(tiny::argv0());
 #elif defined(__APPLE__)
+    // No /proc on macOS: dyld's path of the executable, made canonical.
     char buf[4096];
     uint32_t size = sizeof buf;
-    return _NSGetExecutablePath(buf, &size) == 0 ? std::string(buf) : std::string(tiny::argv0());
+    if (_NSGetExecutablePath(buf, &size) != 0) return tiny::argv0();
+    char real[PATH_MAX];
+    return ::realpath(buf, real) ? std::string(real) : std::string(buf);
 #else
     char buf[4096];
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof buf - 1);

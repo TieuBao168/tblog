@@ -1,5 +1,6 @@
 # tblog - Linux convenience build. CMake (CMakeLists.txt) is the primary,
-# CI-verified build; this Makefile mirrors it for quick work on Linux.
+# CI-verified build; this Makefile mirrors it for quick work on Linux only
+# (GNU ld flags, .so naming): on macOS and Windows use CMake.
 # `make` -> build/libtblog.a, `make test`, `make SAN=thread test`,
 # `make STD=c++11 test` (C++11/14/17),
 # `make SAN=address test`, `make bench`.
@@ -139,7 +140,7 @@ install: $(LIB) $(SHLINKS) packaging/tblog.pc.in
 	ln -sf $(SONAME) $(DESTDIR)$(LIBDIR)/libtblog.so
 	sed -e 's|@TBLOG_PC_PREFIX@|$(PREFIX)|' -e 's|@TBLOG_PC_LIBDIR@|$(PC_LIBDIR)|' \
 	    -e 's|@TBLOG_PC_INCLUDEDIR@|$(PC_INCLUDEDIR)|' -e 's|@TBLOG_VERSION@|$(VERSION)|' \
-	    -e 's|@TBLOG_PC_PRIVATE_LIBS@|$(strip $(LIB_LIBS))|' \
+	    -e 's|@TBLOG_PC_CXX_LIBS@|-lstdc++|' -e 's|@TBLOG_PC_PRIVATE_LIBS@|$(strip $(LIB_LIBS))|' \
 	    packaging/tblog.pc.in > $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
 	chmod 644 $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
 

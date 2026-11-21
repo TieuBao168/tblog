@@ -23,9 +23,14 @@ permissions:
 # the examples, the DLL export check (packaging/check-exports.ps1) and, for
 # MSVC, installs and builds packaging/consumer with find_package: MSVC x64
 # (Release without zlib, Debug with vcpkg's zlib) and MinGW-w64 (MSYS2).
+# macOS: cmake-macos builds the static library and the dylib with AppleClang,
+# the tests, the examples, the bench and the Mach-O export check
+# (packaging/check-symbols.sh) on arm64 (Release + -Werror, ASan+UBSan, TSan)
+# and x86_64 (Release, C++11, no zlib); the arm64 Release entry also installs and
+# builds against the installed tree (pkg-config via check-install.sh, and
+# packaging/consumer with find_package, checking @rpath/libtblog.0.dylib).
 # The `headers` job compiles only the public headers
-# (TBLOG_HEADERS_ONLY_CHECK=ON) where the library is not built yet: macOS
-# (AppleClang; full `cmake-macos` job in roadmap step 6) and MSVC ARM64
+# (TBLOG_HEADERS_ONLY_CHECK=ON) where the library is not built: MSVC ARM64
 # (cross-compiled, compile only).
 
 jobs:
@@ -231,9 +236,116 @@ jobs:
             Write-Error "cpp_api.log: line missing"; exit 1
           }
 
+  # macOS (AppleClang): static library + dylib, every test (tests/unit against
+  # the static library, tests/shared against the dylib), the examples (CTest
+  # smoke tests, against the dylib), check_symbols (the dylib exports exactly
+  # the tblog_* functions; not in sanitizer builds) and the bench (build
+  # only). zlib from the SDK, except in the no-zlib entry.
+  # x86_64: macos-15-intel (the macos-13 image was retired in December 2025).
+  cmake-macos:
+    name: cmake-macos / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arm64 / Release / Werror / install
+            os: macos-latest
+            config: Release
+            options: -DTBLOG_WERROR=ON
+            zlib: true
+            install: true
+          - name: arm64 / ASan+UBSan
+            os: macos-latest
+            config: RelWithDebInfo
+            options: -DTBLOG_SANITIZE=address,undefined
+            zlib: true
+            install: false
+          - name: arm64 / TSan
+            os: macos-latest
+            config: RelWithDebInfo
+            options: -DTBLOG_SANITIZE=thread
+            zlib: true
+            install: false
+          # C++11 library; public-header check (tests/header_check) at C++20.
+          - name: x86_64 / Release / C++11 / no zlib
+            os: macos-15-intel
+            config: Release
+            options: -DTBLOG_WITH_ZLIB=OFF -DTBLOG_CXX_STANDARD=11 -DCMAKE_CXX_STANDARD=20
+            zlib: false
+            install: false
+    env:
+      UBSAN_OPTIONS: print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.config }} \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/tblog" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON -DTBLOG_BUILD_BENCH=ON \
+            ${{ matrix.options }} | tee configure.log
+          if [ "${{ matrix.zlib }}" = true ] && ! grep -q '(zlib): ON' configure.log; then
+            echo "zlib from the macOS SDK was not found"; exit 1
+          fi
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      # examples/basic.c against the installed tree via pkg-config (or the
+      # script's built-in .pc reader), static and shared (-rpath).
+      - name: Install + pkg-config consumer (packaging/check-install.sh)
+        if: matrix.install
+        env:
+          BUILD: build
+          CC: cc
+          CFLAGS: -O2 -std=c99 -Wall -Wextra -Werror -pthread
+          LDFLAGS: -pthread
+        run: |
+          cmake --install build
+          ls -l "$RUNNER_TEMP/tblog/lib"
+          TBLOG_INSTALLED_PREFIX="$RUNNER_TEMP/tblog" sh packaging/check-install.sh
+
+      # find_package(tblog 0.1) from a separate CMake project. The shared
+      # consumers must load @rpath/libtblog.0.dylib through the LC_RPATH CMake
+      # gives them (no DYLD_LIBRARY_PATH).
+      - name: find_package consumer (packaging/consumer)
+        if: matrix.install
+        run: |
+          PREFIX="$RUNNER_TEMP/tblog"
+          cmake -S packaging/consumer -B build-consumer -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PREFIX"
+          cmake --build build-consumer
+          cd build-consumer
+          unset DYLD_LIBRARY_PATH
+          # (to files, then grep: no early-exit grep -q under pipefail)
+          for exe in basic_default cpp_api; do
+            otool -L "$exe" > "$exe.libs"; cat "$exe.libs"
+            grep -q '@rpath/libtblog\.0\.dylib' "$exe.libs"
+            otool -l "$exe" > "$exe.loads"
+            grep -A2 LC_RPATH "$exe.loads" > "$exe.rpaths"; cat "$exe.rpaths"
+            grep -q "path $PREFIX/lib " "$exe.rpaths"
+          done
+          otool -L basic_static > basic_static.libs
+          if tail -n +2 basic_static.libs | grep libtblog; then
+            echo "basic_static depends on libtblog.dylib"; exit 1
+          fi
+          for exe in basic_default basic_static; do
+            printf 'file.path = %s\nreload.watch = false\n' "$PWD/$exe.log" > "$exe.conf"
+            "./$exe" "$exe.conf"
+            grep -q 'started, pid-independent message hello' "$exe.log"
+            n=$(grep -c 'worker . step' "$exe.log")
+            test "$n" -eq 4000
+          done
+          printf 'file.path = %s\nreload.watch = false\n' "$PWD/cpp_api.log" > cpp_api.conf
+          ./cpp_api cpp_api.conf 1000
+          grep -q 'user 42 logged in from 10.0.0.7:8443' cpp_api.log
+
   # Public headers only (tests/header_check, plain and with TBLOG_DLL): strict
-  # warnings as errors (/W4 /WX /permissive-, or -Wall -Wextra -Wpedantic
-  # -Werror), where the library itself is not built (yet).
+  # warnings as errors (/W4 /WX /permissive-), where the library itself is
+  # not built: MSVC ARM64.
   headers:
     name: headers / ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -248,18 +360,6 @@ jobs:
             shell: pwsh
             generator: -A ARM64
             std: 17
-          - name: macos appleclang / C++11
-            os: macos-latest
-            kind: macos
-            shell: bash
-            generator: ''
-            std: 11
-          - name: macos appleclang / C++20
-            os: macos-latest
-            kind: macos
-            shell: bash
-            generator: ''
-            std: 20
     defaults:
       run:
         shell: ${{ matrix.shell }}

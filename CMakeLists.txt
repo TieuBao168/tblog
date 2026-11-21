@@ -1,6 +1,6 @@
-# tblog — CMake build. This is the primary build (verified in CI on Linux and
-# Windows, see .github/workflows/ci.yml); the Makefile is a Linux-only
-# convenience.
+# tblog — CMake build. This is the primary build (verified in CI on Linux,
+# macOS and Windows, see .github/workflows/ci.yml); the Makefile is a
+# Linux-only convenience.
 #
 #   cmake -S . -B build-cmake -DTBLOG_BUILD_TESTS=ON
 #   cmake --build build-cmake -j8 && (cd build-cmake && ctest --output-on-failure)
@@ -12,7 +12,13 @@
 # Windows (MinGW-w64, MSYS2 MINGW64 shell):
 #   cmake -S . -B build -G Ninja -DTBLOG_BUILD_TESTS=ON && cmake --build build
 #
-# Library files: Linux/macOS libtblog.a + libtblog.so; Windows tblog_static.lib
+# macOS (AppleClang, Xcode command line tools; zlib comes with the SDK):
+#   cmake -S . -B build -DTBLOG_BUILD_TESTS=ON && cmake --build build -j8
+#   ctest --test-dir build --output-on-failure
+#
+# Library files: Linux libtblog.a + libtblog.so.0.1.0 (soname libtblog.so.0);
+# macOS libtblog.a + libtblog.0.1.0.dylib (install name
+# @rpath/libtblog.0.dylib); Windows tblog_static.lib
 # + tblog.dll / tblog.lib (MSVC) or libtblog_static.a + libtblog.dll /
 # libtblog.dll.a (MinGW): the static library and the DLL's import library
 # must not share a name.
@@ -21,7 +27,7 @@
 # or add_subdirectory(tblog) and link tblog::tblog.
 #
 # Header check only (compile the public headers, build nothing else; what the
-# macOS and Windows ARM64 CI jobs use):
+# Windows ARM64 CI job uses):
 #   cmake -S . -B build-hc -DTBLOG_HEADERS_ONLY_CHECK=ON [-DCMAKE_CXX_STANDARD=20]
 #   cmake --build build-hc
 cmake_minimum_required(VERSION 3.10)
@@ -283,7 +289,19 @@ if(WIN32)
   target_compile_definitions(tblog_shared PRIVATE TBLOG_BUILDING_DLL INTERFACE TBLOG_DLL)
   set_target_properties(tblog_shared PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TBLOG_BIN_DIR}")
 endif()
-if(NOT APPLE AND NOT WIN32)
+if(APPLE)
+  # libtblog.0.1.0.dylib + libtblog.0.dylib + libtblog.dylib, install name
+  # @rpath/libtblog.0.dylib (executables find it through their LC_RPATH).
+  # Export the tblog_* C API only, like tblog.map on Linux (ld64 has no
+  # version scripts; packaging/tblog.exp is an exported-symbols list).
+  set(TBLOG_EXP "${CMAKE_CURRENT_SOURCE_DIR}/packaging/tblog.exp")
+  set_target_properties(tblog_shared PROPERTIES MACOSX_RPATH ON LINK_DEPENDS "${TBLOG_EXP}")
+  target_link_libraries(tblog_shared PRIVATE "-Wl,-exported_symbols_list,${TBLOG_EXP}")
+  if(NOT TBLOG_SANITIZE)
+    # ld64's default, stated explicitly: like --no-undefined on Linux.
+    target_link_libraries(tblog_shared PRIVATE "-Wl,-undefined,error")
+  endif()
+elseif(NOT WIN32)
   # Export the tblog_* C API only (also hides std:: template instantiations).
   set(TBLOG_MAP "${CMAKE_CURRENT_SOURCE_DIR}/packaging/tblog.map")
   target_link_libraries(tblog_shared PRIVATE "-Wl,--version-script=${TBLOG_MAP}")
@@ -310,7 +328,8 @@ if(TBLOG_BUILD_TESTS)
   set(TBLOG_TEST_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-tmp")
 
   # TSan aborts with "unexpected memory mapping" under high-entropy ASLR on new
-  # kernels; run its binaries with ASLR disabled (same as the Makefile).
+  # Linux kernels; run its binaries with ASLR disabled (same as the Makefile).
+  # macOS needs nothing.
   set(TBLOG_TEST_RUNNER)
   if(TBLOG_SANITIZE MATCHES "thread" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_program(TBLOG_SETARCH setarch)
@@ -356,10 +375,10 @@ if(TBLOG_BUILD_TESTS)
       TIMEOUT 300)
   endforeach()
 
-  # The .so must export exactly the tblog_* functions that libtblog.a defines
-  # (`make check-symbols`). ELF only; skipped in sanitizer builds, whose
-  # instrumentation is not part of the exported API.
-  if(NOT WIN32 AND NOT APPLE AND NOT TBLOG_SANITIZE)
+  # The .so / .dylib must export exactly the tblog_* functions that libtblog.a
+  # defines (`make check-symbols`). ELF and Mach-O; skipped in sanitizer
+  # builds, whose instrumentation is not part of the exported API.
+  if(NOT WIN32 AND NOT TBLOG_SANITIZE)
     set(_tblog_nm "${CMAKE_NM}")
     if(NOT _tblog_nm)
       find_program(TBLOG_NM_EXECUTABLE nm)
@@ -485,6 +504,12 @@ foreach(kind LIBDIR INCLUDEDIR)
   endif()
 endforeach()
 set(TBLOG_VERSION ${PROJECT_VERSION})
+# The C++ runtime a static link needs: libc++ on macOS, libstdc++ elsewhere.
+if(APPLE)
+  set(TBLOG_PC_CXX_LIBS "-lc++")
+else()
+  set(TBLOG_PC_CXX_LIBS "-lstdc++")
+endif()
 if(TBLOG_HAVE_ZLIB)
   set(TBLOG_PC_PRIVATE_LIBS "-lz")
 else()

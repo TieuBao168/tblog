@@ -1,6 +1,6 @@
 # tblog
 
-Thư viện log bất đồng bộ cho ứng dụng C/C++ trên Linux và Windows (MSVC, MinGW-w64). Thread gọi log không bao giờ chạm vào đĩa: việc ghi file, fsync, xoay file và nén file cũ đều nằm ở thread nền.
+Thư viện log bất đồng bộ cho ứng dụng C/C++ trên Linux, macOS (Apple Silicon và Intel) và Windows (MSVC, MinGW-w64). Thread gọi log không bao giờ chạm vào đĩa: việc ghi file, fsync, xoay file và nén file cũ đều nằm ở thread nền.
 
 - **API C thuần** (`<tblog/log.h>`), dùng được từ C99 và mọi chuẩn C++; thêm **API C++ dạng `{}`** (`<tblog/tblog.hpp>`).
 - **Ghi qua buffer**: thread gọi log chỉ chép dòng vào buffer của nó; worker gom lại và ghi theo lô.
@@ -58,7 +58,7 @@ Mỗi dòng log mặc định có dạng:
 
 ## Build
 
-Yêu cầu: Linux (GCC hoặc Clang) hoặc Windows 8+ (MSVC 2019+ hoặc MinGW-w64), compiler hỗ trợ C++11 trở lên (MSVC: C++14), CMake ≥ 3.10. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
+Yêu cầu: Linux (GCC hoặc Clang), macOS 12+ (AppleClang của Xcode / Command Line Tools) hoặc Windows 8+ (MSVC 2019+ hoặc MinGW-w64), compiler hỗ trợ C++11 trở lên (MSVC: C++14), CMake ≥ 3.10. zlib là tùy chọn (cần cho nén gzip; không có zlib thì không nén được).
 
 ### CMake (cách build chính)
 
@@ -76,10 +76,10 @@ Kết quả nằm trong `build-cmake/`: `libtblog.a`, `libtblog.so.0.1.0` cùng 
 | `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` trỏ tới bản động (`OFF`: bản tĩnh). Cả hai bản luôn được build và cài. |
 | `TBLOG_CXX_STANDARD` | `17` | Chuẩn C++ dùng để build thư viện: 11, 14 hoặc 17. Ứng dụng dùng thư viện không bị ràng buộc theo chuẩn này. |
 | `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
-| `TBLOG_BUILD_TESTS` | `OFF` | Build test và đăng ký với CTest (mỗi file `tests/unit/*.cpp` và `tests/shared/*.cpp` là một test, thêm `check_symbols` trên Linux, `check_exports` trên Windows, và chạy thử các ví dụ nếu bật `TBLOG_BUILD_EXAMPLES`) |
+| `TBLOG_BUILD_TESTS` | `OFF` | Build test và đăng ký với CTest (mỗi file `tests/unit/*.cpp` và `tests/shared/*.cpp` là một test, thêm `check_symbols` trên Linux và macOS, `check_exports` trên Windows, và chạy thử các ví dụ nếu bật `TBLOG_BUILD_EXAMPLES`) |
 | `TBLOG_BUILD_EXAMPLES` | `OFF` | Build `examples/basic.c` và `examples/cpp_api.cpp` |
 | `TBLOG_BUILD_BENCH` | `OFF` | Build `bench/bench_latency` (chạy từ thư mục gốc của repo) |
-| `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` hoặc `address,undefined`. Áp dụng cho thư viện, test, ví dụ và bench. Với `thread`, CTest tự chạy test qua `setarch -R`, vì TSan không chạy được khi ASLR bật trên kernel mới. |
+| `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` hoặc `address,undefined`. Áp dụng cho thư viện, test, ví dụ và bench. Với `thread`, trên Linux CTest tự chạy test qua `setarch -R`, vì TSan không chạy được khi ASLR bật trên kernel mới (macOS không cần). |
 | `TBLOG_WERROR` | `OFF` | Coi warning là lỗi (CI bật option này) |
 
 Mỗi cấu hình nên dùng một thư mục build riêng, ví dụ:
@@ -90,6 +90,18 @@ cmake --build build-tsan -j8 && (cd build-tsan && ctest --output-on-failure)
 ```
 
 Cross-compile: dùng toolchain file của CMake như thường lệ (`-DCMAKE_TOOLCHAIN_FILE=...`).
+
+### macOS
+
+Hỗ trợ macOS 12 trở lên, arm64 (Apple Silicon) và x86_64, với AppleClang (`xcode-select --install`). zlib có sẵn trong SDK. Build y như trên Linux:
+
+```bash
+cmake -S . -B build -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON
+cmake --build build -j8 && ctest --test-dir build --output-on-failure
+cmake --install build --prefix /usr/local
+```
+
+Tên file: `libtblog.a` và `libtblog.0.1.0.dylib` (cùng symlink `libtblog.0.dylib`, `libtblog.dylib`), install name `@rpath/libtblog.0.dylib`: chương trình dùng `find_package(tblog)` được CMake thêm sẵn rpath; khi link tay thì thêm `-Wl,-rpath,<prefix>/lib`. Dylib chỉ export các hàm `tblog_*` ([packaging/tblog.exp](packaging/tblog.exp)). Makefile chỉ dành cho Linux, trên macOS dùng CMake.
 
 ### Windows (MSVC và MinGW-w64)
 
@@ -373,6 +385,7 @@ make -C lite test
 **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)) chạy trên GitHub Actions với mỗi push và pull request vào `main`:
 
 - CMake + CTest trên Linux: GCC C++17, GCC C++11, Clang C++17, ASan+UBSan, TSan, build không có zlib (tất cả với `-Werror`).
+- CMake + CTest trên macOS: arm64 Release (`-Werror`, kèm cài đặt + pkg-config + `find_package`, kiểm tra `@rpath/libtblog.0.dylib`), arm64 ASan+UBSan, arm64 TSan, x86_64 Release C++11 không zlib; kiểm tra dylib export đúng các hàm `tblog_*`.
 - CMake + CTest trên Windows: MSVC x64 Release (không zlib, kèm cài đặt + `find_package`), MSVC x64 Debug C++14 với zlib từ vcpkg, MinGW-w64 C++11; kiểm tra DLL export đúng các hàm `TBLOG_API` ([packaging/check-exports.ps1](packaging/check-exports.ps1)).
 - Cài đặt bằng `cmake --install` rồi build ví dụ từ bản đã cài qua pkg-config (tĩnh và động) và qua `find_package(tblog)` ([packaging/consumer](packaging/consumer/CMakeLists.txt)).
 - Makefile: `make test`, `make check-symbols`, `make check-install`.
@@ -390,7 +403,9 @@ Bộ test gồm:
 
 ## Giới hạn đã biết
 
-- **Nền tảng:** Linux và Windows (x64; MSVC, MinGW-w64). macOS chưa hỗ trợ (đang làm).
+- **Nền tảng:** Linux, macOS 12+ (arm64, x86_64) và Windows (x64; MSVC, MinGW-w64).
+- **macOS — sync:** `fsync` trên macOS chỉ đẩy dữ liệu xuống ổ đĩa, ổ vẫn có thể giữ trong cache; tblog dùng `fcntl(F_FULLFSYNC)` (quay về `fsync` nếu file system không hỗ trợ) để log thật sự nằm trên đĩa như `fdatasync` trên Linux. Mỗi lần sync vì vậy chậm hơn (cỡ mili giây): `sync.interval_ms`, `sync.on_level` tốn hơn (ở thread nền) và `tblog_flush()` chờ lâu hơn; các lệnh `TBLOG_*` không bị ảnh hưởng.
+- **macOS — crash:** như Linux; riêng stack overflow trên thread phụ được báo là `SIGBUS` (macOS báo lỗi chạm guard page bằng SIGBUS). Call stack in ra stderr theo định dạng của macOS (`0   app   0x... func + 24`).
 - **Windows — syslog:** không có; `syslog = true` chỉ in cảnh báo và bỏ qua sink này.
 - **Windows — crash:** bắt access violation, illegal instruction, chia cho 0, stack overflow (unhandled exception filter) và `abort()`/`assert` (SIGABRT); log trong buffer vẫn được ghi đủ kèm dòng `*** tblog: caught exception 0xC0000005 (EXCEPTION_ACCESS_VIOLATION) ***`. Call stack in ra stderr chỉ là địa chỉ (kèm base address của module) — tự tra symbol bằng WinDbg/`addr2line`. Sau đó exception được chuyển tiếp nên WER/debugger vẫn thấy; riêng `abort()` kết thúc với exit code 3. Stack overflow chỉ chắc chắn được báo trên thread gọi `tblog_init` và các thread của tblog (có dự trữ 64 KB stack bằng `SetThreadStackGuarantee`).
 - **Windows — kết thúc process:** nên gọi `tblog_shutdown()` trước khi thoát. Nếu không, handler `atexit` vẫn chạy: với bản tĩnh trong file `.exe` thì như Linux; với `tblog.dll` (hoặc bản tĩnh nằm trong một DLL khác), handler chạy lúc DLL bị gỡ, khi các thread khác đã bị dừng, nên tblog không join thread mà xả buffer ngay trên thread đang thoát qua đường crash (không khóa): log vẫn vào file và console nhưng sink của `tblog_add_sink` không nhận các dòng cuối đó. Gọi `FreeLibrary` lên `tblog.dll` khi logger đang chạy là không được hỗ trợ — hãy `tblog_shutdown()` trước.
@@ -411,11 +426,11 @@ src/config/           parser, validate_config và watcher của log.conf
 src/logger/           C API, worker thread, sync thread, Pipeline (Queue -> các sink)
 src/crash/            crash handler
 src/sinks/            file (rotating file, archiver: xoay + nén), console, syslog, sink của người dùng
-src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/ + win32/; mọi lời gọi OS nằm ở đây
+src/platform/         lớp nền tảng tblog::pf (platform.h) + posix/ (Linux, macOS) + win32/; mọi lời gọi OS nằm ở đây
 tests/unit/           test (tests/tiny_test.h + tests/test_os.h, không cần thư viện ngoài)
 tests/shared/         test link với bản động (thoát process không gọi tblog_shutdown, crash)
 bench/                benchmark latency/throughput
 examples/             basic.c, cpp_api.cpp
-packaging/            tblog.pc.in, version script, CMake package config, script kiểm tra
+packaging/            tblog.pc.in, version script (tblog.map) / export list (tblog.exp), CMake package config, script kiểm tra
 lite/                 tblog-lite cho vi điều khiển
 ```

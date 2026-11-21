@@ -279,7 +279,7 @@ TEST(rotating_write_error_counts_loss) {
 #if defined(_WIN32)
     TINY_SKIP("needs /dev/full (no Windows equivalent)");
 #else
-    if (access("/dev/full", W_OK) != 0) return;
+    if (access("/dev/full", W_OK) != 0) TINY_SKIP("needs /dev/full (Linux; not on macOS)");
 #endif
     RotatingFile rf;
     FileOptions o;

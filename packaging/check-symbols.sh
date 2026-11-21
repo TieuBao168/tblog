@@ -1,8 +1,10 @@
 #!/bin/sh
-# Usage: check-symbols.sh libtblog.a libtblog.so.X.Y.Z
+# Usage: check-symbols.sh libtblog.a libtblog.so.X.Y.Z      (Linux, ELF)
+#        check-symbols.sh libtblog.a libtblog.X.Y.Z.dylib   (macOS, Mach-O)
 # Fails unless the shared library exports exactly the global tblog_* functions
 # defined in the static archive (a public function missing TBLOG_API in the
 # header is hidden by -fvisibility=hidden and shows up here as "missing").
+# Mach-O: C symbols carry a leading underscore, removed before comparing.
 set -eu
 NM=${NM:-nm}
 archive=$1
@@ -10,11 +12,21 @@ shlib=$2
 tmp=${TMPDIR:-/tmp}/tblog-syms.$$
 trap 'rm -f "$tmp".a "$tmp".so' EXIT
 
-# Global (upper-case type) tblog_* definitions in the archive.
-"$NM" --defined-only "$archive" 2>/dev/null |
-    awk 'NF == 3 && $2 ~ /^[A-Z]$/ && $3 ~ /^tblog_/ { print $3 }' | sort -u > "$tmp".a
-# Everything the .so exports.
-"$NM" -D --defined-only "$shlib" | awk 'NF >= 3 { print $3 }' | sort -u > "$tmp".so
+if [ "$(uname -s)" = Darwin ]; then
+    # nm -g: external symbols only, -U: no undefined ones (cctools and llvm-nm).
+    "$NM" -g -U "$archive" 2>/dev/null |
+        awk 'NF == 3 && $2 ~ /^[A-Z]$/ && $3 ~ /^_tblog_/ { print substr($3, 2) }' | sort -u > "$tmp".a
+    # Everything the .dylib exports (the Mach-O header symbol aside).
+    "$NM" -g -U "$shlib" |
+        awk 'NF >= 3 && $3 !~ /^__mh_/ { print (substr($3, 1, 1) == "_" ? substr($3, 2) : $3) }' |
+        sort -u > "$tmp".so
+else
+    # Global (upper-case type) tblog_* definitions in the archive.
+    "$NM" --defined-only "$archive" 2>/dev/null |
+        awk 'NF == 3 && $2 ~ /^[A-Z]$/ && $3 ~ /^tblog_/ { print $3 }' | sort -u > "$tmp".a
+    # Everything the .so exports.
+    "$NM" -D --defined-only "$shlib" | awk 'NF >= 3 { print $3 }' | sort -u > "$tmp".so
+fi
 
 status=0
 extra=$(grep -v '^tblog_' "$tmp".so || true)

@@ -233,6 +233,10 @@ TEST(crash_backtrace_goes_to_stderr) {
     EXPECT_TRUE(contains(r.err, "*** tblog: stack (return addresses):"));
     EXPECT_TRUE(contains(r.err, "  #0"));
     EXPECT_TRUE(contains(r.err, "[0x"));
+#elif defined(__APPLE__)
+    // macOS backtrace_symbols_fd: "0   test_crash_sinks   0x0000000102f1c3a8 func + 24".
+    EXPECT_TRUE(contains(r.err, " 0x"));
+    EXPECT_TRUE(contains(r.err, "test_crash_sinks"));
 #elif !defined(TBLOG_NO_BACKTRACE) && __has_include(<execinfo.h>)
     // backtrace_symbols_fd prints lines like "binary(func+0x..)[0x...]".
     EXPECT_TRUE(contains(r.err, "[0x"));
@@ -511,6 +515,13 @@ TINY_CHILD(stack_overflow_in_thread) {
 TEST(crash_stack_overflow_in_thread_with_altstack) {
     Run r = run_scenario("stack_overflow_in_thread");
     EXPECT_TRUE(died_with(r, Crash::StackOverflow));
+#if defined(__APPLE__)
+    // Guard-page hit on a secondary thread: SIGBUS on macOS (see tos::died_with).
+    if (r.r.signal == SIGBUS) {
+        EXPECT_EQ(r.report, std::string(kPending) + expected_msg(Crash::Bus));
+        return;
+    }
+#endif
     EXPECT_EQ(r.report, std::string(kPending) + expected_msg(Crash::StackOverflow));
 }
 

@@ -9,6 +9,11 @@
 # With TBLOG_INSTALLED_PREFIX=/abs/prefix (e.g. after `cmake --install`, with
 # libdir = <prefix>/lib) it skips both `make install` steps and checks that
 # tree instead; $BUILD is then only the scratch directory.
+#
+# macOS (Mach-O): only the TBLOG_INSTALLED_PREFIX mode (the Makefile is
+# Linux-only). The static link names libtblog.a by path (ld64 has no -l:),
+# the shared one gets -rpath <prefix>/lib (the install name is
+# @rpath/libtblog.0.dylib), and otool -D / -L / -l replace readelf -d and ldd.
 set -eu
 : "${BUILD:?}" "${MAKE:=make}" "${CC:=cc}" "${CFLAGS:=}" "${LDFLAGS:=}" "${RUNNER:=}"
 : "${PKG_CONFIG:=pkg-config}" "${TBLOG_INSTALLED_PREFIX:=}"
@@ -22,6 +27,12 @@ mkdir -p "$work"
 
 say() { printf '=== check-install: %s\n' "$*"; }
 fail() { printf 'check-install: FAIL: %s\n' "$*" >&2; exit 1; }
+
+darwin=0
+[ "$(uname -s)" = Darwin ] && darwin=1
+if [ $darwin -eq 1 ] && [ -z "$TBLOG_INSTALLED_PREFIX" ]; then
+    fail "macOS: the Makefile is Linux-only; cmake --install, then set TBLOG_INSTALLED_PREFIX"
+fi
 
 # ---- pkg-config (or a minimal stand-in) -------------------------------------
 pc_builtin() {
@@ -90,8 +101,15 @@ for f in include/tblog/log.h lib/libtblog.a lib/pkgconfig/tblog.pc; do
     [ -e "$prefix/$f" ] || fail "install is missing $f"
 done
 fi
-[ "$(readlink "$prefix/lib/libtblog.so")" = libtblog.so.0 ] || fail "libtblog.so symlink"
-[ "$(readlink "$prefix/lib/libtblog.so.0")" = libtblog.so.0.1.0 ] || fail "libtblog.so.0 symlink"
+if [ $darwin -eq 1 ]; then
+    [ "$(readlink "$prefix/lib/libtblog.dylib")" = libtblog.0.dylib ] || fail "libtblog.dylib symlink"
+    [ "$(readlink "$prefix/lib/libtblog.0.dylib")" = libtblog.0.1.0.dylib ] || fail "libtblog.0.dylib symlink"
+    otool -D "$prefix/lib/libtblog.0.1.0.dylib" | grep -qx '@rpath/libtblog\.0\.dylib' ||
+        fail "install name of libtblog.0.1.0.dylib is not @rpath/libtblog.0.dylib"
+else
+    [ "$(readlink "$prefix/lib/libtblog.so")" = libtblog.so.0 ] || fail "libtblog.so symlink"
+    [ "$(readlink "$prefix/lib/libtblog.so.0")" = libtblog.so.0.1.0 ] || fail "libtblog.so.0 symlink"
+fi
 say "pkg-config --cflags --libs tblog:          $(pc --cflags --libs tblog)"
 say "pkg-config --static --cflags --libs tblog: $(pc --static --cflags --libs tblog)"
 
@@ -106,25 +124,49 @@ run_example() {  # $1 = binary, $2 = log file; extra env is passed by caller
 
 # ---- (a) static --------------------------------------------------------------
 say "(a) static link"
-# With both libtblog.a and libtblog.so in libdir, -ltblog picks the .so; ask
-# the linker for the archive by name.
-static_flags=$(pc --static --cflags --libs tblog | sed 's/-ltblog\b/-l:libtblog.a/')
+# With both libtblog.a and the shared library in libdir, -ltblog picks the
+# shared one; ask the linker for the archive by name (GNU ld) or path (ld64).
+if [ $darwin -eq 1 ]; then
+    static_lib=$prefix/lib/libtblog.a
+else
+    static_lib=-l:libtblog.a
+fi
+static_flags=
+for w in $(pc --static --cflags --libs tblog); do
+    [ "$w" = -ltblog ] && w=$static_lib
+    static_flags="$static_flags $w"
+done
 # shellcheck disable=SC2086
 $CC $CFLAGS "$top/examples/basic.c" $static_flags $LDFLAGS -o "$work/basic_static"
-if readelf -d "$work/basic_static" | grep -q 'NEEDED.*libtblog'; then
+if [ $darwin -eq 1 ]; then
+    if otool -L "$work/basic_static" | tail -n +2 | grep -q libtblog; then
+        fail "basic_static depends on libtblog.dylib"
+    fi
+elif readelf -d "$work/basic_static" | grep -q 'NEEDED.*libtblog'; then
     fail "basic_static depends on libtblog.so"
 fi
 run_example "$work/basic_static" "$work/static.log"
 
 # ---- (b) shared --------------------------------------------------------------
 say "(b) shared link"
-# shellcheck disable=SC2086
-$CC $CFLAGS "$top/examples/basic.c" $(pc --cflags --libs tblog) $LDFLAGS -o "$work/basic_shared"
-readelf -d "$work/basic_shared" | grep -q 'NEEDED.*\[libtblog\.so\.0\]' ||
-    fail "basic_shared does not depend on libtblog.so.0"
-LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-export LD_LIBRARY_PATH
-run_example "$work/basic_shared" "$work/shared.log"
-ldd "$work/basic_shared" | grep -q "$prefix/lib/libtblog.so.0" || fail "loader did not pick the installed .so"
+if [ $darwin -eq 1 ]; then
+    # shellcheck disable=SC2086
+    $CC $CFLAGS "$top/examples/basic.c" $(pc --cflags --libs tblog) $LDFLAGS \
+        -Wl,-rpath,"$prefix/lib" -o "$work/basic_shared"
+    otool -L "$work/basic_shared" | grep -q '@rpath/libtblog\.0\.dylib' ||
+        fail "basic_shared does not depend on @rpath/libtblog.0.dylib"
+    otool -l "$work/basic_shared" | grep -q "path $prefix/lib " ||
+        fail "basic_shared has no LC_RPATH $prefix/lib"
+    run_example "$work/basic_shared" "$work/shared.log"
+else
+    # shellcheck disable=SC2086
+    $CC $CFLAGS "$top/examples/basic.c" $(pc --cflags --libs tblog) $LDFLAGS -o "$work/basic_shared"
+    readelf -d "$work/basic_shared" | grep -q 'NEEDED.*\[libtblog\.so\.0\]' ||
+        fail "basic_shared does not depend on libtblog.so.0"
+    LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH
+    run_example "$work/basic_shared" "$work/shared.log"
+    ldd "$work/basic_shared" | grep -q "$prefix/lib/libtblog.so.0" || fail "loader did not pick the installed .so"
+fi
 
 say "OK (static + shared examples built from the installed tree and ran)"

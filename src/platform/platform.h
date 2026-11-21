@@ -4,7 +4,8 @@
 // packaging/check-platform-boundary.sh).
 //
 // Implementations:
-//   src/platform/posix/*.cpp   Linux (and later macOS)
+//   src/platform/posix/*.cpp   Linux and macOS 12+ (the few differences are
+//                              #if defined(__APPLE__) / __linux__ in place)
 //   src/platform/win32/*.cpp   Windows 8 or later (MSVC and MinGW-w64)
 // plus one header of inline functions per platform (posix/inline.h,
 // win32/inline.h) for the few calls on the logging hot path.
@@ -77,8 +78,16 @@ bool file_write_crash(FileHandle h, const void *data, size_t len) noexcept;
 // file, -1 on error.
 int64_t file_read(FileHandle h, void *buf, size_t len) noexcept;
 
-bool file_sync(FileHandle h) noexcept;      // data + metadata (fsync / FlushFileBuffers)
-bool file_datasync(FileHandle h) noexcept;  // data only (fdatasync; fsync on macOS; FlushFileBuffers)
+// Make written data durable: on stable storage when the call returns.
+//   Linux    file_sync = fsync (data + metadata), file_datasync = fdatasync.
+//   macOS    both fcntl(F_FULLFSYNC), falling back to fsync where the file
+//            system refuses it. Plain fsync on macOS leaves the data in the
+//            drive's write cache; F_FULLFSYNC flushes that too, so it is
+//            slower (milliseconds per call: sync.interval_ms / sync.on_level
+//            cost more there, but only on the syncer thread).
+//   Windows  both FlushFileBuffers.
+bool file_sync(FileHandle h) noexcept;
+bool file_datasync(FileHandle h) noexcept;
 bool file_truncate(FileHandle h, uint64_t size) noexcept;
 
 // Identity of a file (dev + inode on POSIX; volume serial + file index on

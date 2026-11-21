@@ -1,0 +1,5 @@
+# ld64 exported-symbols list for libtblog.dylib (macOS): the Mach-O
+# counterpart of tblog.map. Export the public C API only (C symbols carry a
+# leading underscore); -fvisibility=hidden already hides the C++ internals,
+# this also hides the std:: template instantiations of libc++ headers.
+_tblog_*

@@ -9,10 +9,15 @@
 //   not write it again), write it to the other sinks -> "tblog: N lines
 //   dropped" note if the drop counter moved -> every sink: end_batch() ->
 //   release the buffers -> flush() every sink if anything was written (or
-//   force_flush). Once the queue crashed, nothing is written any more.
+//   force_flush). Every write to a crash-safe sink is bracketed by
+//   Queue::begin_write() / end_write(), so a crash handler waits for the one
+//   in flight and then drains exactly the rest. Once the queue crashed,
+//   nothing is written here any more.
 //
 // crash() (async-signal-safe): Queue::crash_drain() into every crash-safe
-// sink, in sink order, then the crash marker to the same sinks.
+// sink, in sink order, then the crash marker to the same sinks. Lines logged
+// after that are written synchronously by the logging thread to the same
+// sinks (after the marker), through crash_visit.
 #pragma once
 
 #include "queue/queue.h"
@@ -49,13 +54,14 @@ public:
     void shutdown();
 
     // ---- signal handler: async-signal-safe. marker may be null.
-    void crash(const char *marker, size_t len) noexcept;
+    // others_running = false (process exit, the other threads are gone): do
+    // not wait for the worker's write in flight / appends in progress.
+    void crash(const char *marker, size_t len, bool others_running = true) noexcept;
     // True if a crash-safe sink writes to stderr (it then gets the marker).
     bool crash_covers_stderr() const noexcept { return crash_stderr_; }
 
 private:
     static void crash_visit(void *ctx, const char *data, size_t len) noexcept;
-    void write_note(const char *data, size_t len);
 
     std::unique_ptr<Queue> queue_;
     std::vector<std::unique_ptr<LogSink>> owned_;

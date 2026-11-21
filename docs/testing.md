@@ -36,9 +36,9 @@ Test không cần thư viện ngoài: `tests/tiny_test.h` (khung test), `tests/t
 | `test_config` | `tests/unit/test_config.cpp` | bản tĩnh | Parser, `validate_config`, watcher, key đã bỏ |
 | `test_core` | `tests/unit/test_core.cpp` | bản tĩnh | Level, module, thread context, formatter |
 | `test_cpp_api` | `tests/unit/test_cpp_api.cpp` | bản tĩnh | API `{}`, `Logger`, kiểu tự định nghĩa, dấu lỗi (phải build được ở C++11) |
-| `test_crash_sinks` | `tests/unit/test_crash_sinks.cpp` | bản tĩnh | Crash handler qua Pipeline + Queue thật, console, syslog |
+| `test_crash_sinks` | `tests/unit/test_crash_sinks.cpp` | bản tĩnh | Crash handler qua Pipeline + Queue thật, console, syslog; process con dùng cả thư viện (4 thread log, thread thứ 5 crash): mọi dòng đã trả về có trong file và console đúng một lần |
 | `test_integration` | `tests/unit/test_integration.cpp` | bản tĩnh | Đầu cuối qua API C: SIGSEGV giữ đủ log, hot-reload, `tblog_add_sink`, `file = false` |
-| `test_queue_file` | `tests/unit/test_queue_file.cpp` | bản tĩnh | Queue (thứ tự, drop/block, đánh thức, crash drain), RotatingFile, Pipeline |
+| `test_queue_file` | `tests/unit/test_queue_file.cpp` | bản tĩnh | Queue (thứ tự, drop/block, đánh thức, crash drain, ghi đồng bộ sau crash, chunk đang ghi dở lúc crash), RotatingFile, Pipeline |
 | `test_rotation_time` | `tests/unit/test_rotation_time.cpp` | bản tĩnh | Xoay theo ngày/giờ với đồng hồ giả, giữ file, nén gzip và khôi phục sau crash |
 | `test_shared_exit` | `tests/shared/test_shared_exit.cpp` | bản động | Thoát process không gọi `tblog_shutdown` (Windows: đường DLL unload), crash trong DLL/.so |
 | `example_basic`, `example_cpp_api` | `examples/*` | `tblog::tblog` | Ví dụ chạy được với một `log.conf` trong thư mục nháp |

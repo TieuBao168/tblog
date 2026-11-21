@@ -23,11 +23,6 @@ void Pipeline::add_sink(std::unique_ptr<LogSink> s) {
     }
 }
 
-void Pipeline::write_note(const char *data, size_t len) {
-    for (LogSink *s : crash_sinks_) s->write(data, len);
-    for (LogSink *s : other_sinks_) s->write(data, len);
-}
-
 void Pipeline::drain(bool force_flush) {
     std::lock_guard<std::mutex> lk(mu_);
     if (shut_) return;
@@ -39,29 +34,37 @@ void Pipeline::drain(bool force_flush) {
     q.take(b);
 
     bool wrote = false;
-    if (!q.crashed()) {
+    // The crash-safe sinks are written only between q.begin_write() and
+    // q.end_write(): a crash handler waits for the write in flight and then
+    // drains exactly what is left; once the queue crashed begin_write() fails
+    // and nothing more is written here (no duplicates).
+    if (q.begin_write()) {
         // Time rotation (FileSink) is decided here, AFTER the take: every
         // line taken above was appended before this clock read, so it never
         // lands in a file of an earlier period than the one in effect when
         // it was appended.
         for (LogSink *s : sinks_) s->begin_batch();
+        q.end_write();
         for (size_t i = 0; i < b.size; ++i) {
-            // The crash handler already drained the queue: don't duplicate.
-            if (q.crashed()) break;
+            if (!q.begin_write()) break;  // crashed: the handler drains the rest
             const Queue::Chunk &c = b.chunks[i];
             for (LogSink *s : crash_sinks_) s->write(c.data, c.len);
             q.mark_written(b, i);
+            q.end_write();
             for (LogSink *s : other_sinks_) s->write(c.data, c.len);
             wrote = true;
         }
         const uint64_t d = q.dropped();
-        if (d != reported_dropped_ && !q.crashed()) {
+        if (d != reported_dropped_ && q.begin_write()) {
             char line[64];
             int m = std::snprintf(line, sizeof line, "tblog: %llu lines dropped\n",
                                   static_cast<unsigned long long>(d - reported_dropped_));
             reported_dropped_ = d;
+            if (m > 0)
+                for (LogSink *s : crash_sinks_) s->write(line, static_cast<size_t>(m));
+            q.end_write();
             if (m > 0) {
-                write_note(line, static_cast<size_t>(m));
+                for (LogSink *s : other_sinks_) s->write(line, static_cast<size_t>(m));
                 wrote = true;
             }
         }
@@ -91,9 +94,10 @@ void Pipeline::crash_visit(void *ctx, const char *data, size_t len) noexcept {
     for (LogSink *s : p->crash_sinks_) s->crash_write(data, len);
 }
 
-void Pipeline::crash(const char *marker, size_t len) noexcept {
-    queue_->crash_drain(&crash_visit, this);
-    if (marker && len) crash_visit(this, marker, len);
+void Pipeline::crash(const char *marker, size_t len, bool others_running) noexcept {
+    // Drained lines, then the marker; later appends write synchronously
+    // through crash_visit (after the marker). A second call: its marker only.
+    queue_->crash_drain(&crash_visit, this, marker, len, others_running);
 }
 
 }  // namespace tblog

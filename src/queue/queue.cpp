@@ -25,28 +25,84 @@
 //   holds whole lines. The buffer the worker is writing is published per shard
 //   in `pending` with `pending_done` = bytes already handed to every
 //   crash-safe sink (mark_written()).
-//   crash_drain() takes NO lock (the crashing thread may own a spinlock) and
-//   visits, for every shard in order:
-//     1. pending buffer [pending_done, len)   (older data first)
-//     2. active  buffer [0, len)
-//   What can be lost: the line being memcpy'd at the moment of the crash
-//   (its len is not yet published), lines appended by other threads after the
-//   handler read `len`. What can be duplicated: a chunk whose write to the
-//   crash-safe sinks was in progress in the worker (pending_done is only
-//   advanced after every crash-safe sink returned), or data racing with a
-//   concurrent worker swap. After crash_drain() the queue is "dead": append()
-//   returns false and the worker writes nothing more (Pipeline checks
-//   crashed() before each chunk), so data is not written a second time.
+//
+//   Guarantee: a line whose append() returned true before the process died
+//   is in every crash-safe sink, whole, exactly once, except in the bounded
+//   fallbacks listed at the end.
+//
+//   crash_drain() (the handler; it never blocks unboundedly, takes no mutex):
+//     1. crashed_ = true (seq_cst), the visitor is published, closed_ = true.
+//     2. Claims writer_ (CAS 0 -> own thread id), waiting up to ~2 s for the
+//        worker to finish the write it is in. The worker writes the
+//        crash-safe sinks only while it holds writer_ (begin_write ..
+//        end_write) and calls mark_written() before releasing it, so once the
+//        claim succeeds pending_done is exact: the chunk in flight is neither
+//        lost nor written twice. begin_write() re-checks crashed_ after its
+//        CAS, so once the handler is waiting the worker starts no new write.
+//     3. Barrier: try-locks every shard spinlock (bounded: ~50 ms in total,
+//        shared by all shards) and releases it at once. Appends that saw
+//        closed_ == false inside their critical section have then published
+//        their `len`; every later one sees closed_ (closed_ is stored before
+//        the lock is taken, the lock orders them). take() checks crashed_
+//        under the same lock and swaps nothing once the handler passed, so
+//        `active` / `pending` are stable from here on.
+//     4. Visits, for every shard in order:
+//          pending buffer [pending_done, len)   (older data first)
+//          active  buffer [0, len)
+//        then the tail (the crash marker), sets crash_done_ and releases
+//        writer_.
+//   append() after the crash: closed_ is checked before the shard lock is
+//   taken (the one extra load of the hot path; closed_ is read-only in normal
+//   operation, so the line stays shared in every cache) and again under it.
+//   Either check routes to write_after_crash(), outside every shard lock:
+//   wait for crash_done_ (the drained lines and the marker come first), claim
+//   writer_ (serializes post-crash lines: never interleaved), visit the line,
+//   release writer_, return true. So the line is written before the call
+//   returns; lines written this way come AFTER the marker. Never taking a
+//   shard lock there matters: the crashing thread may have died holding one,
+//   and may log again from a chained application handler.
+//   Interleavings:
+//     * worker mid-write when the crash hits: the handler waits in step 2,
+//       then drains from the exact pending_done.
+//     * worker between two chunks: its begin_write() fails (writer_ taken or
+//       crashed_ seen); the chunks it did not write stay published (release()
+//       keeps them) and the handler drains them.
+//     * append inside its critical section: the barrier waits for it; it
+//       returns true and its line is drained.
+//     * append between the pre-lock check and the lock: sees closed_ under the
+//       lock and goes to write_after_crash().
+//     * append blocked by full_policy = block: wait_for_swap() returns on
+//       closed_ (within its 50 ms poll) and the line goes to
+//       write_after_crash().
+//     * the crashing thread logs again (chained application handler, after
+//       the drain): write_after_crash(); a thread that already holds writer_
+//       (a signal handler interrupting a post-crash write) writes without
+//       waiting for itself.
+//     * a second crash on another thread: the platform handler parks it (it
+//       never re-enters crash_drain); post-crash writers it blocked are
+//       bounded (below).
+//   Bounded fallbacks (documented residual windows):
+//     * the worker holds writer_ longer than ~2 s (stuck sink, or blocked on
+//       a lock the crashing thread holds) or the crash is ON the worker inside
+//       a crash-safe write: the handler drains from pending_done anyway, so
+//       part of that one chunk may appear twice (and a torn line).
+//     * a shard lock held for the whole barrier budget (the crashing thread
+//       itself crashed inside append, or a holder descheduled ~50 ms): a line
+//       committed after the handler read that shard is lost.
+//     * write_after_crash() waits at most ~5 s for the drain and the claim,
+//       then writes anyway (could interleave with a stuck handler); it never
+//       deadlocks. The process may die while it writes: that call never
+//       returned, so its line was not acknowledged.
 //   The handler may still be walking the shards while the worker finishes
 //   its cycle, so once crashed: the worker never take()s again (no buffer is
 //   handed back to producers under the handler's feet), and release() keeps
-//   every chunk that was not mark_written() published as `pending` (the old
-//   backend reset them, and a handler that reached such a shard after the
-//   worker lost its oldest lines).
+//   every chunk that was not mark_written() published as `pending`.
 #include "queue/queue.h"
 
 #include "core/compat.h"
+#include "platform/platform.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +121,12 @@
 #define TBLOG_CPU_RELAX() ((void)0)
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define TBLOG_COLD __declspec(noinline)
+#else
+#define TBLOG_COLD __attribute__((noinline, cold))
+#endif
+
 namespace tblog {
 
 #if TBLOG_CPP_LEVEL < 201703L
@@ -77,8 +139,53 @@ namespace {
 TBLOG_ASSERT_LOCK_FREE(size_t);
 TBLOG_ASSERT_LOCK_FREE(int);
 TBLOG_ASSERT_LOCK_FREE(bool);
+TBLOG_ASSERT_LOCK_FREE(uint32_t);
+TBLOG_ASSERT_LOCK_FREE(void *);
 
 constexpr size_t kMinShardSize = 64u << 10;
+
+// Wait budgets of the crash paths (see "Crash safety").
+constexpr unsigned kWorkerWaitMs = 2000;    // handler: the worker's write in flight
+constexpr unsigned kAppendWaitMs = 50;      // handler: appends inside a shard lock (all shards)
+constexpr unsigned kAfterCrashWaitMs = 5000;  // post-crash append: drain + claim
+
+// Bounded back-off for the crash paths: 256 pauses, 256 yields, then 1 ms
+// sleeps until `budget_ms` of steady-clock time has passed. step() returns
+// false once the budget is used up (budget 0: after the first probe).
+// Async-signal-safe in practice: pause, sched_yield / SwitchToThread,
+// nanosleep / Sleep and clock_gettime / QueryPerformanceCounter only.
+class Backoff {
+public:
+    explicit Backoff(unsigned budget_ms) noexcept : budget_ms_(budget_ms) {}
+    bool step() noexcept {
+        if (budget_ms_ == 0) return false;
+        if (n_ < 256) {
+            ++n_;
+            TBLOG_CPU_RELAX();
+            return true;
+        }
+        if (n_ < 512) {
+            ++n_;
+            std::this_thread::yield();
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (n_ == 512) {
+            ++n_;
+            deadline_ = now + std::chrono::milliseconds(budget_ms_);
+        } else if (now >= deadline_) {
+            budget_ms_ = 0;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return true;
+    }
+
+private:
+    unsigned budget_ms_;
+    unsigned n_ = 0;
+    std::chrono::steady_clock::time_point deadline_{};
+};
 
 class SpinLock {
 public:
@@ -97,6 +204,18 @@ public:
     void unlock() noexcept {
         locked_.store(false, std::memory_order_relaxed);
         flag_.clear(std::memory_order_release);
+    }
+    // Crash handler: give up when `bo` is used up (the holder may be the
+    // crashing thread itself).
+    bool try_lock(Backoff &bo) noexcept {
+        for (;;) {
+            if (!locked_.load(std::memory_order_relaxed) &&
+                !flag_.test_and_set(std::memory_order_acquire)) {
+                locked_.store(true, std::memory_order_relaxed);
+                return true;
+            }
+            if (!bo.step()) return false;
+        }
     }
 
 private:
@@ -192,6 +311,8 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
         dropped_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+    // Closed / crashed: never touch the shard lock (a crashed thread may hold it).
+    if (TBLOG_UNLIKELY(closed_.load(std::memory_order_relaxed))) return append_closed(data, len);
     Shard &sh = shards_[this_thread_id() & mask_];
     for (;;) {
         size_t used = 0;
@@ -199,7 +320,8 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
         bool ok = false;
         {
             SpinGuard g(sh.spin);
-            if (closed_.load(std::memory_order_relaxed)) return false;
+            // Re-checked under the lock: close() / crash_drain() barriers.
+            if (TBLOG_UNLIKELY(closed_.load(std::memory_order_relaxed))) goto closed;
             Buffer &b = sh.bufs[sh.active.load(std::memory_order_relaxed)];
             used = b.len.load(std::memory_order_relaxed);
             if (used + len <= cap_) {
@@ -223,8 +345,19 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
             dropped_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        if (!wait_for_swap(sh, gen)) return false;  // closed
+        if (!wait_for_swap(sh, gen)) break;  // closed
     }
+closed:  // outside the shard lock (the guard's scope was left)
+    return append_closed(data, len);
+}
+
+// Cold: the queue is closed (shutdown: drop) or crashed (write it now).
+TBLOG_COLD bool Queue::append_closed(const char *data, size_t len) noexcept {
+    // Pairs with crash_drain()'s seq_cst store of closed_ (after crashed_ and
+    // the visitor): a closed_ seen by a relaxed load implies both.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!crashed_.load(std::memory_order_acquire)) return false;
+    return write_after_crash(data, len);
 }
 
 // ------------------------------------------------------------------ worker
@@ -250,6 +383,10 @@ size_t Queue::take(Batch &out) noexcept {
     for (size_t i = 0; i < nshards_; ++i) {
         Shard &sh = shards_[i];
         SpinGuard g(sh.spin);
+        // A crash handler passed (or is about to pass) its barrier: leave
+        // every shard as it found it. The lock orders this load after the
+        // handler's store when the handler took this lock first.
+        if (crashed_.load(std::memory_order_relaxed)) break;
         int a = sh.active.load(std::memory_order_relaxed);
         size_t n = sh.bufs[a].len.load(std::memory_order_relaxed);
         if (n == 0) continue;
@@ -268,6 +405,25 @@ size_t Queue::take(Batch &out) noexcept {
     if (out.size) wake_blocked();
     return out.size;
 }
+
+bool Queue::begin_write() noexcept {
+    uint32_t cur = 0;
+    // Before a crash only the worker claims writer_, so the CAS cannot fail;
+    // after one, the handler or a post-crash append may hold it.
+    if (!writer_.compare_exchange_strong(cur, pf::current_thread_id(), std::memory_order_seq_cst,
+                                         std::memory_order_relaxed))
+        return false;
+    // The handler sets crashed_ before it tries to claim writer_: seen here,
+    // write nothing (it is waiting for us); not seen, the handler finds
+    // writer_ taken and waits until end_write().
+    if (crashed_.load(std::memory_order_seq_cst)) {
+        writer_.store(0, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+void Queue::end_write() noexcept { writer_.store(0, std::memory_order_release); }
 
 void Queue::mark_written(const Batch &b, size_t i) noexcept {
     shards_[b.shard[i]].pending_done.store(b.chunks[i].len, std::memory_order_release);
@@ -310,9 +466,44 @@ void Queue::close() noexcept {
 }
 
 // ------------------------------------------------------------------ crash
-bool Queue::crash_drain(void (*visit)(void *, const char *, size_t), void *ctx) noexcept {
-    if (crashed_.exchange(true, std::memory_order_acq_rel)) return false;
-    closed_.store(true, std::memory_order_release);  // lock-free: no new appends
+namespace {
+enum class Claim { Failed, Claimed, Nested };
+
+// Claim `writer` for thread `self`, backing off with `bo`. Nested: `self`
+// already holds it (a handler running on the thread that is writing).
+Claim claim_writer(std::atomic<uint32_t> &writer, uint32_t self, Backoff &bo) noexcept {
+    for (;;) {
+        uint32_t cur = 0;
+        if (writer.compare_exchange_strong(cur, self, std::memory_order_seq_cst,
+                                           std::memory_order_relaxed))
+            return Claim::Claimed;
+        if (cur == self) return Claim::Nested;
+        if (!bo.step()) return Claim::Failed;
+    }
+}
+}  // namespace
+
+bool Queue::crash_drain(void (*visit)(void *, const char *, size_t), void *ctx, const char *tail,
+                        size_t tail_len, bool others_running) noexcept {
+    if (crashed_.exchange(true, std::memory_order_seq_cst)) {
+        // Not the first: just the tail, after the first drain (post-crash way).
+        if (tail && tail_len) write_after_crash(tail, tail_len);
+        return false;
+    }
+    crash_ctx_.store(ctx, std::memory_order_relaxed);
+    crash_visit_.store(visit, std::memory_order_release);
+    closed_.store(true, std::memory_order_seq_cst);  // no new appends into the buffers
+
+    // 1. The worker's write in flight (if any) completes; then the sinks are ours.
+    const uint32_t self = pf::current_thread_id();
+    Backoff wait_worker(others_running ? kWorkerWaitMs : 0);
+    const Claim claim = claim_writer(writer_, self, wait_worker);
+    // 2. Barrier: appends inside their critical section publish their line.
+    Backoff wait_appends(others_running ? kAppendWaitMs : 0);
+    for (size_t i = 0; i < nshards_; ++i)
+        if (shards_[i].spin.try_lock(wait_appends)) shards_[i].spin.unlock();
+
+    // 3. Whatever has not reached the crash-safe sinks, oldest first.
     for (size_t i = 0; i < nshards_; ++i) {
         Shard &sh = shards_[i];
         // Read `active` BEFORE `pending`: the worker publishes pending
@@ -330,7 +521,33 @@ bool Queue::crash_drain(void (*visit)(void *, const char *, size_t), void *ctx) 
             if (end) visit(ctx, sh.bufs[a].data, end);
         }
     }
+    // 4. The marker, then let the post-crash appends in (in claim order).
+    if (tail && tail_len) visit(ctx, tail, tail_len);
+    crash_done_.store(true, std::memory_order_release);
+    // Nested: the crash is on the thread that was writing (the worker); that
+    // write never resumes, so the claim is released as well. Likewise when
+    // the other threads are gone (process exit): a holder died with it.
+    if (claim != Claim::Failed || !others_running) writer_.store(0, std::memory_order_release);
     return true;
+}
+
+// A line appended after the crash (any thread, normal context; also the
+// crashing thread itself, e.g. from a chained application signal handler).
+// Lock-free: it must not take any lock the crashing thread might hold.
+bool Queue::write_after_crash(const char *data, size_t len) noexcept {
+    Backoff bo(kAfterCrashWaitMs);
+    // The drained lines and the marker first (bounded: never deadlock on a
+    // handler that is stuck or gone).
+    while (!crash_done_.load(std::memory_order_acquire) && bo.step()) {
+    }
+    // One writer at a time, so lines are never interleaved. Nested: this
+    // thread already writes (a signal handler interrupted it): don't wait
+    // for ourselves.
+    const Claim claim = claim_writer(writer_, pf::current_thread_id(), bo);
+    void (*visit)(void *, const char *, size_t) = crash_visit_.load(std::memory_order_acquire);
+    if (visit) visit(crash_ctx_.load(std::memory_order_relaxed), data, len);
+    if (claim == Claim::Claimed) writer_.store(0, std::memory_order_release);
+    return visit != nullptr;
 }
 
 // ------------------------------------------------------------------ private

@@ -5,7 +5,8 @@
 // report_crash() runs inside the fatal-signal handler: everything reachable
 // from it must be async-signal-safe (atomics, pf::stderr_write,
 // Pipeline::crash -> Queue::crash_drain + LogSink::crash_write). No malloc, no
-// locks, no stdio.
+// locks, no stdio. crash_drain's waits (for the worker's write in flight and
+// appends inside a shard lock) are bounded spins / yields / nanosleeps.
 #include "crash/crash_handler.h"
 
 #include "core/compat.h"

@@ -620,13 +620,15 @@ TEST(pipeline_crash_writes_buffered_then_marker) {
     EXPECT_TRUE(b->queue().crashed());
     std::string got = read_file(o.file.path);
     EXPECT_TRUE(got == expect + m);  // drained lines first, then the marker
-    // Dead after crash: nothing more written, no duplicates at shutdown; a
-    // second crash() drains nothing (only its marker).
-    EXPECT_FALSE(b->queue().append("after\n", 6, TBLOG_LV_INFO));
+    // After the crash an append is written at once, synchronously, after the
+    // marker; the worker writes nothing more (no duplicates at shutdown); a
+    // second crash() drains nothing (only its marker; none here).
+    EXPECT_TRUE(b->queue().append("after\n", 6, TBLOG_LV_INFO));
+    EXPECT_TRUE(read_file(o.file.path) == got + "after\n");
     b->crash(nullptr, 0);
     b->drain(true);
     b->shutdown();
-    EXPECT_TRUE(read_file(o.file.path) == got);
+    EXPECT_TRUE(read_file(o.file.path) == got + "after\n");
 }
 
 TEST(pipeline_crash_during_flush_no_duplicates) {
@@ -728,7 +730,10 @@ TEST(queue_crash_drain_pending_then_active) {
     Visited v2;
     EXPECT_FALSE(q->crash_drain(&visit_into, &v2));  // once only
     EXPECT_EQ(v2.calls, 0);
-    EXPECT_FALSE(q->append("C\n", 2, TBLOG_LV_INFO));  // dead
+    // Not buffered any more: written at once, through the first visitor.
+    EXPECT_TRUE(q->append("C\n", 2, TBLOG_LV_INFO));
+    EXPECT_EQ(v.data, std::string("A1\nA2\nB1\nC\n"));
+    EXPECT_EQ(v.calls, 3);
     q->release(b);
 
     // mark_written(): the pending chunk reached the crash-safe sinks, so the
@@ -904,9 +909,213 @@ TEST(queue_crash_drains_all_shards) {
     std::string got = read_file(o.file.path);
     EXPECT_TRUE(got.size() > before);
     EXPECT_EQ(verify_lines(got, T, 2 * N, true), static_cast<long>(T) * 2 * N);
-    EXPECT_FALSE(b->queue().append("after\n", 6, TBLOG_LV_INFO));
+    EXPECT_TRUE(b->queue().append("after\n", 6, TBLOG_LV_INFO));  // written at once
     b->shutdown();
-    EXPECT_TRUE(read_file(o.file.path) == got);
+    EXPECT_TRUE(read_file(o.file.path) == got + "after\n");
+}
+
+// ---------------------------------------------------------------- after a crash
+// Once crash_drain() started, append() no longer buffers: it waits for the
+// drain (and its tail, the marker) and then writes the line itself through
+// the drain's visitor, one thread at a time.
+
+TEST(queue_append_after_crash_written_after_drain_and_tail) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    EXPECT_TRUE(q->append("A\n", 2, TBLOG_LV_INFO));
+    Visited v;
+    EXPECT_TRUE(q->crash_drain(&visit_into, &v, "M\n", 2));
+    EXPECT_EQ(v.data, std::string("A\nM\n"));
+    bool ok = false;
+    std::thread([&] { ok = q->append("other thread\n", 13, TBLOG_LV_INFO); }).join();
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(q->append("same thread\n", 12, TBLOG_LV_INFO));
+    EXPECT_EQ(v.data, std::string("A\nM\nother thread\nsame thread\n"));
+    // A second drain writes only its tail, the post-crash way.
+    Visited v2;
+    EXPECT_FALSE(q->crash_drain(&visit_into, &v2, "M2\n", 3));
+    EXPECT_EQ(v2.calls, 0);
+    EXPECT_EQ(v.data, std::string("A\nM\nother thread\nsame thread\nM2\n"));
+    Queue::Batch b;
+    EXPECT_EQ(q->take(b), size_t(0));  // nothing was buffered after the crash
+    EXPECT_EQ(q->dropped(), 0ull);
+}
+
+// An append that arrives while the drain is still running (the handler is
+// slow) waits for it: its line comes after the drained data and the marker,
+// and the call does not return before it is written.
+struct SlowVisit {
+    std::string data;
+    int calls = 0;
+    std::atomic<bool> draining{false};
+    std::atomic<bool> appender_in{false};
+    std::atomic<bool> appender_done{false};
+    bool returned_early = false;
+};
+static void slow_visit(void *ctx, const char *data, size_t len) {
+    SlowVisit *v = static_cast<SlowVisit *>(ctx);
+    if (v->calls++ == 0) {
+        v->draining.store(true);
+        while (!v->appender_in.load()) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        v->returned_early = v->appender_done.load();
+    }
+    v->data.append(data, len);
+}
+
+TEST(queue_append_waits_for_running_drain) {
+    QueueOptions qo;
+    auto q = Queue::create(qo);
+    ASSERT_TRUE(q != nullptr);
+    EXPECT_TRUE(q->append("A1\n", 3, TBLOG_LV_INFO));
+    EXPECT_TRUE(q->append("A2\n", 3, TBLOG_LV_INFO));
+    SlowVisit v;
+    bool ok = false;
+    std::thread appender([&] {
+        while (!v.draining.load()) std::this_thread::yield();
+        v.appender_in.store(true);
+        ok = q->append("late\n", 5, TBLOG_LV_INFO);
+        v.appender_done.store(true);
+    });
+    EXPECT_TRUE(q->crash_drain(&slow_visit, &v, "MARK\n", 5));
+    appender.join();
+    EXPECT_TRUE(ok);
+    EXPECT_FALSE(v.returned_early);
+    EXPECT_EQ(v.data, std::string("A1\nA2\nMARK\nlate\n"));
+}
+
+// The chunk in flight: the worker is inside a crash-safe sink's write() when
+// the crash handler starts. The handler waits for that write, then drains
+// exactly what is left: every line once, the marker last.
+struct SlowSafeSink : LogSink {
+    Queue *q = nullptr;
+    std::string data;
+    std::string events;  // W = write() returned, C = crash_write()
+    std::atomic<bool> in_write{false};
+    bool first = true;
+    void write(const char *d, size_t n) override {
+        if (first) {
+            first = false;
+            in_write.store(true);
+            while (!q->crashed()) std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+        data.append(d, n);
+        events += 'W';
+    }
+    bool crash_safe() const noexcept override { return true; }
+    void crash_write(const char *d, size_t n) noexcept override {
+        data.append(d, n);
+        events += 'C';
+    }
+};
+
+TEST(pipeline_crash_waits_for_write_in_flight_no_duplicates) {
+    QueueOptions qo;
+    Pipeline p(Queue::create(qo));
+    SlowSafeSink *s = new SlowSafeSink;
+    s->q = &p.queue();
+    p.add_sink(std::unique_ptr<LogSink>(s));
+    // Two threads: two shards, i.e. two chunks (one if the machine has a
+    // single shard).
+    const int T = 2, N = 200;
+    for (int t = 0; t < T; ++t)
+        std::thread([&, t] {
+            char line[128];
+            for (int i = 0; i < N; ++i) {
+                int n = make_line(line, t, i);
+                EXPECT_TRUE(p.queue().append(line, n, TBLOG_LV_INFO));
+            }
+        }).join();
+    std::thread worker([&] { p.drain(); });
+    while (!s->in_write.load()) std::this_thread::yield();
+    const char m[] = "*** tblog: caught signal 11 (SIGSEGV) ***\n";
+    p.crash(m, sizeof m - 1);
+    worker.join();
+    // The first chunk by the worker (completed before the handler went on),
+    // everything else by the handler, then the marker.
+    EXPECT_EQ(s->events.substr(0, 1), std::string("W"));
+    EXPECT_TRUE(s->events.find('W', 1) == std::string::npos);  // the worker stopped
+    const size_t at = s->data.find("***");
+    ASSERT_TRUE(at != std::string::npos);
+    EXPECT_EQ(s->data.substr(at), std::string(m));
+    EXPECT_EQ(verify_lines(s->data.substr(0, at), T, N, false), static_cast<long>(T) * N);
+    // Exactly once each (verify_lines checks order; count the total).
+    EXPECT_EQ(split_lines(s->data.substr(0, at)).size(), static_cast<size_t>(T) * N);
+}
+
+// Real threads, real worker, real file: 4 threads log while another thread
+// "crashes"; they keep logging after the crash. Every line whose append()
+// returned true is in the file exactly once, in each thread's order, the
+// marker exactly once. Repeated: the interesting interleavings are races.
+TEST(pipeline_crash_while_threads_log_loses_nothing) {
+    TempDir d("crash_race");
+    const int T = 4;
+    const int rounds = 20 / kScale < 2 ? 2 : 20 / kScale;
+    const char m[] = "*** tblog: caught signal 11 (SIGSEGV) ***\n";
+    long total_lines = 0;
+    for (int r = 0; r < rounds; ++r) {
+        PipeOptions o;
+        const std::string name = "r" + std::to_string(r) + ".log";
+        o.file.path = d.file(name.c_str());
+        o.file.max_size = 1ull << 40;
+        o.buffer_size = 256u << 10;  // small shards: frequent swaps, chunks in flight
+        o.policy = FullPolicy::Block;  // no drops: every line is acknowledged
+        auto b = make_pipe(o);
+        ASSERT_TRUE(b != nullptr);
+        Worker w(b.get());
+        std::atomic<bool> stop{false};
+        std::vector<long> acked(T, 0);
+        std::vector<std::thread> th;
+        for (int t = 0; t < T; ++t)
+            th.emplace_back([&, t] {
+                char line[128];
+                const auto start = std::chrono::steady_clock::now();
+                for (long i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+                    // ~500k lines/s per thread.
+                    while (std::chrono::steady_clock::now() - start < std::chrono::microseconds(2 * i)) {
+                    }
+                    int n = make_line(line, t, static_cast<int>(i));
+                    if (!b->queue().append(line, n, TBLOG_LV_INFO)) {
+                        EXPECT_TRUE(false);
+                        break;
+                    }
+                    acked[t] = i + 1;
+                }
+            });
+        tos::sleep_ms(5 + (r % 5) * 4);
+        b->crash(m, sizeof m - 1);
+        tos::sleep_ms(10);  // the threads keep logging after the crash
+        stop.store(true);
+        for (auto &x : th) x.join();
+        w.join();
+        const std::string got = read_file(o.file.path);
+        std::vector<long> next(T, 0);
+        long bad = 0, markers = 0, order = 0;
+        for (const std::string &l : split_lines(got)) {
+            if (l + "\n" == m) {
+                ++markers;
+                continue;
+            }
+            int t, s;
+            if (!parse_line(l, &t, &s) || t >= T) {
+                ++bad;
+                continue;
+            }
+            if (s != next[t]) ++order;  // lost, duplicated or reordered
+            next[t] = s + 1;
+        }
+        EXPECT_EQ(bad, 0L);
+        EXPECT_EQ(markers, 1L);
+        EXPECT_EQ(order, 0L);
+        for (int t = 0; t < T; ++t) {
+            EXPECT_EQ(next[t], acked[t]);
+            total_lines += acked[t];
+        }
+        b->shutdown();
+    }
+    std::printf("  %d rounds, %ld lines\n", rounds, total_lines);
 }
 
 // ---------------------------------------------------------------- benchmark

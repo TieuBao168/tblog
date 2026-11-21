@@ -130,18 +130,19 @@ Số dòng mất khi process chết (trung bình / lớn nhất của 20 lần t
 
 | Kịch bản | `fprintf` | `fprintf` + `fflush` | tblog |
 |---|---|---|---|
-| SIGSEGV trên thread đang log | 22 / 39 | 0 | 0 |
-| SIGSEGV trên thread khác, 4 thread đang log | 17 / 40 | 0 | 508 / 1 098 |
+| SIGSEGV trên thread đang log | 21 / 41 | 0 | 0 |
+| SIGSEGV trên thread khác, 4 thread đang log | 21 / 38 | 0 | 0 |
 | `abort`, `assert`, exception không ai bắt, `exit` | 0 | 0 | 0 |
-| Stack overflow | 22 / 38 | 0 | 0 |
-| `kill -9` / `TerminateProcess`, 4 thread | 20 / 40 | 0 | 4 424 / 7 727 |
-| `_Exit` (không chạy `atexit`) | 0 | 0 | 953 / 1 811 |
+| Stack overflow | 20 / 38 | 0 | 0 |
+| `kill -9` / `TerminateProcess`, 4 thread | 23 / 39 | 0 | 3 660 / 7 432 |
+| `_Exit` (không chạy `atexit`) | 0 | 0 | 955 / 1 830 |
+
+Khi crash, không dòng nào bị ghi lặp. Sau khi handler đã xả buffer, thread khác log tiếp thì dòng được ghi thẳng vào file (và console) trước khi lệnh trả về, nằm sau dòng `*** tblog: caught ... ***`.
 
 Điểm yếu, đo được ở trên:
 
 - `fprintf` của MinGW chậm bất thường; `snprintf` + `fwrite` một thread chỉ chậm hơn tblog khoảng 20% (381 so với 321 ns). Trên glibc / MSVC chưa đo ở máy này.
-- `kill -9`, `_Exit`: tblog mất phần còn trong buffer, tới khoảng 1 900 dòng mỗi thread (khoảng 100 ms log), so với tối đa 40 của `fprintf`.
-- Crash trên một thread trong khi thread khác vẫn log: các dòng ghi sau lúc handler xả buffer bị mất; một chunk có thể bị ghi lặp.
+- `kill -9`, `_Exit`: tblog mất phần còn trong buffer, tới 1 858 dòng mỗi thread (khoảng 100 ms log), so với tối đa 39 của `fprintf`.
 - Trần khoảng 4–5 M dòng/s (một thread nền ghi file). Vượt trần với `full_policy = drop` (mặc định): bỏ tới 26% số dòng ở 16 thread; dùng `block` nếu cần đủ.
 - Mất điện: không biến thể nào an toàn tuyệt đối (tblog fsync mỗi giây; `fprintf` không fsync).
 

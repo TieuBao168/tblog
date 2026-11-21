@@ -12,10 +12,13 @@
 //   * sync(): the syncer thread (sync.interval_ms, urgent lines) and the
 //     worker (tblog_flush), CONCURRENTLY with write(); a sink that implements
 //     it must synchronise with its own write path.
-//   * crash_safe() / crash_write(): from the fatal-signal handler, possibly
-//     while the worker is inside write() on another thread (or on the
-//     crashing thread itself). crash_write() must be async-signal-safe: no
-//     locks, no allocation, no stdio. Only called when crash_safe() is true.
+//   * crash_safe() / crash_write(): from the fatal-signal handler, and after
+//     a crash from any thread that logs (one call at a time, serialized by
+//     the Queue). The handler waits (bounded) for the worker's write() in
+//     flight, so the two overlap only if that write is stuck (or the crash
+//     is on the worker inside write()). crash_write() must be
+//     async-signal-safe: no locks, no allocation, no stdio. Only called when
+//     crash_safe() is true.
 //
 // Per worker cycle: begin_batch(); write(chunk) for each chunk (zero or more,
 // each holds one or more complete lines, in queue order); end_batch(); then

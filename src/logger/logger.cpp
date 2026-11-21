@@ -300,7 +300,10 @@ void shutdown_at_exit() noexcept {
     if (!rt) return;
     uninstall_crash_handler();
     rt->stop.store(true, std::memory_order_release);
-    rt->pipeline->crash(nullptr, 0);  // closes the queue: later appends go to stderr
+    // No waiting for the other threads (they are gone or must not be
+    // waited for). Closes the queue: a later append through a stale runtime
+    // pointer is written directly to the crash-safe sinks.
+    rt->pipeline->crash(nullptr, 0, false);
 }
 
 }  // namespace
@@ -372,7 +375,9 @@ extern "C" void tblog_write(tblog_module *m, tblog_level lv, const char *file, i
 
     if (!rt || !rt->queue->append(tc.scratch, static_cast<uint32_t>(n), lv)) {
         // Not initialised / already shut down -> stderr. (A full buffer under
-        // the Drop policy also lands here only when the queue is stopped.)
+        // the Drop policy also lands here only when the queue is stopped.
+        // After a crash append() writes the line to the crash-safe sinks
+        // itself and returns true.)
         if (!rt || rt->stop.load(std::memory_order_relaxed)) pf::stderr_write(tc.scratch, n);
     }
 

@@ -72,7 +72,7 @@ Viết ra trước khi đo, theo cách mỗi biến thể hoạt động:
 - **`fprintf_buffered`**: dòng nằm trong buffer stdio của process (4 KB, khoảng 40 dòng) cho tới khi buffer đầy. Process chết mà không qua đường thoát bình thường của thư viện C (crash, `kill -9`) thì mất phần trong buffer: **0–40 dòng**, và dòng cuối file thường bị cắt dở (buffer được ghi ra theo khối 4 KB, không theo dòng). `exit()` xả mọi stream: không mất. `abort()` và `_Exit()` theo chuẩn C không bắt buộc xả stream (tùy thư viện C).
 - **`fprintf_flush`**: mỗi lệnh trả về khi dòng đã nằm trong OS (page cache), và page cache vẫn còn khi process chết kiểu gì đi nữa: **0 dòng** ở mọi kịch bản, kể cả `kill -9`. Không bảo vệ khi mất điện (không fsync).
 - **tblog**: dòng nằm trong buffer RAM của tblog tới khi thread nền ghi ra (mỗi `flush.interval_ms` = 200 ms, hoặc khi shard của thread đầy 75%).
-  - Crash mà handler bắt được (SIGSEGV, `abort`, `assert`, exception không ai bắt, stack overflow trên thread có alternate stack / stack guarantee): handler xả buffer: **0 dòng**, trừ các dòng mà *thread khác* ghi sau khi handler đã đọc buffer, trong lúc process còn đang chết. Một chunk đang ghi dở lúc crash có thể bị ghi lặp (xem [architecture.md](architecture.md#độ-bền-của-log)).
+  - Crash mà handler bắt được (SIGSEGV, `abort`, `assert`, exception không ai bắt, stack overflow trên thread có alternate stack / stack guarantee): handler chờ lần ghi đang dở của thread nền xong rồi xả phần còn lại của buffer: **0 dòng, không lặp**. Thread khác log sau khi handler đã bắt đầu xả thì không đưa vào buffer nữa: lệnh log chờ handler xả xong, rồi tự ghi dòng của nó thẳng vào file (và console) trước khi trả về, sau dòng báo crash. Nên cả *thread khác* đang log trong lúc process chết cũng **0 dòng** (xem [architecture.md](architecture.md#độ-bền-của-log)).
   - `kill -9` / `TerminateProcess`, `_Exit`: không có code nào chạy, mất **toàn bộ phần còn trong buffer**. Ở đây mỗi thread có shard riêng 256 KB (buffer 4 MB chia cho 16 shard, máy có 16 CPU logic), thread nền được đánh thức khi shard đầy 75% = 192 KB ≈ 1 900 dòng 102 byte; ở 20 000 dòng/giây mỗi thread, shard đầy 75% sau khoảng 96 ms, sớm hơn 200 ms. Nên kỳ vọng: **0 đến khoảng 1 900 dòng mỗi thread**, trung bình khoảng một nửa.
   - `exit()` / `return` từ `main`: `tblog_init` đã đăng ký `tblog_shutdown` với `atexit`: không mất.
   - Mất điện: cả ba biến thể đều chưa chắc đã fsync. tblog fsync mỗi `sync.interval_ms` (1 s) và với mỗi dòng ≥ `sync.on_level`; `fprintf` không bao giờ fsync, việc ghi xuống đĩa tùy OS. Không đo được bằng chương trình này.
@@ -86,9 +86,9 @@ Viết ra trước khi đo, theo cách mỗi biến thể hoạt động:
 | OS | Windows 11 Home 26H2 (10.0.26300), cắm điện, power plan Balanced |
 | Ổ đĩa | NVMe SSD (Samsung MZVL81T0HELB), NTFS; thư mục tạm `%TEMP%` trên ổ C: |
 | Compiler | MinGW-w64 g++ 15.1.0 (MSYS2 `mingw64`, CRT `msvcrt`), `-O2 -std=c++17 -D__USE_MINGW_ANSI_STDIO=1` |
-| tblog | `libtblog_static.a` (`-O2 -fvisibility=hidden`, có zlib), commit `334fb5f` + mã nguồn `bench/` chưa commit |
+| tblog | `libtblog_static.a` (`-O2 -fvisibility=hidden`, có zlib); `bench_vs_printf`: commit `334fb5f` + mã nguồn `bench/` chưa commit; `bench_crash_loss`: commit `ca40b53` + bản sửa đường crash (ghi đồng bộ sau crash) chưa commit |
 | Ngày | 2026-11-21 (UTC) |
-| Thời gian chạy | `bench_vs_printf`: 539 s; `bench_crash_loss`: 123 s (600 process con) |
+| Thời gian chạy | `bench_vs_printf`: 539 s; `bench_crash_loss`: 121 s (600 process con) |
 
 Đây là **một máy, một lần đo**, trên laptop đang chạy các chương trình khác, không cố định tần số CPU. Khoảng min–max trong bảng cho thấy độ nhiễu; ví dụ end-to-end của tblog dao động ±20–40% giữa các lần chạy. Bộ đếm TSC trên CPU này tăng theo bước khoảng 10 ns, nên latency mỗi lệnh có độ phân giải 10 ns (một cặp lần đọc tốn 10 ns, đã nằm trong số đo).
 
@@ -159,31 +159,31 @@ Dropped lines (full_policy = drop, median per run of 1 M): tblog_drop 2 thr: 14.
 
 | scenario | threads | fprintf_buffered | fprintf_flush | tblog |
 |---|---|---|---|---|
-| segv_main | 1 | 21.9 / 39 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
-| segv_other_thread | 4 | 17.4 / 40 (100%) | 0.0 / 0 (0%) | 507.8 / 1098 (100%) |
+| segv_main | 1 | 20.7 / 41 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
+| segv_other_thread | 4 | 21.2 / 38 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
 | abort | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
 | assert | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
 | uncaught_exception | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
-| stack_overflow | 1 | 21.6 / 38 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
-| stack_overflow_thread | 1 | 23.4 / 39 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
-| kill_hard | 4 | 20.1 / 40 (100%) | 0.0 / 0 (0%) | 4424.3 / 7727 (100%) |
+| stack_overflow | 1 | 20.5 / 38 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
+| stack_overflow_thread | 1 | 22.6 / 39 (100%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
+| kill_hard | 4 | 23.1 / 39 (100%) | 0.0 / 0 (0%) | 3660.1 / 7432 (100%) |
 | exit | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 0.0 / 0 (0%) |
-| _Exit | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 952.5 / 1811 (100%) |
+| _Exit | 1 | 0.0 / 0 (0%) | 0.0 / 0 (0%) | 955.3 / 1830 (100%) |
 
 Outcome as expected / tblog crash marker present / duplicates, corrupt, torn lines (sums over trials) / time from the fatal action to the end of the process (mean, max):
 
 | scenario | expected outcome | fprintf_buffered | fprintf_flush | tblog |
 |---|---|---|---|---|
-| segv_main | exit 0xC0000005 (access violation) | 20/20; 0, 0, 20; 1.8 / 2.7 ms | 20/20; 0, 0, 0; 1.6 / 2.2 ms | 20/20 marker 20/20; 0, 0, 0; 4.8 / 12.2 ms |
-| segv_other_thread | exit 0xC0000005 (access violation) | 20/20; 0, 0, 19; 2.3 / 9.0 ms | 20/20; 0, 0, 0; 1.9 / 2.7 ms | 20/20 marker 20/20; 3883, 0, 0; 11.0 / 22.1 ms |
-| abort | exit 3 (abort) | 20/20; 0, 0, 0; 17.4 / 71.2 ms | 20/20; 0, 0, 0; 14.7 / 56.6 ms | 20/20 marker 20/20; 0, 0, 0; 15.5 / 53.6 ms |
-| assert | exit 3 (abort) | 20/20; 0, 0, 0; 17.6 / 82.9 ms | 20/20; 0, 0, 0; 22.2 / 82.7 ms | 20/20 marker 20/20; 0, 0, 0; 21.7 / 92.3 ms |
-| uncaught_exception | exit 3 (abort) | 20/20; 0, 0, 0; 19.7 / 77.3 ms | 20/20; 0, 0, 0; 12.9 / 18.0 ms | 20/20 marker 20/20; 1941, 0, 0; 32.5 / 115.3 ms |
-| stack_overflow | exit 0xC00000FD (stack overflow) | 20/20; 0, 0, 20; 3.1 / 3.9 ms | 20/20; 0, 0, 0; 3.1 / 4.2 ms | 20/20 marker 20/20; 0, 0, 0; 13.7 / 60.3 ms |
-| stack_overflow_thread | exit 0xC00000FD (stack overflow) | 20/20; 0, 0, 20; 3.0 / 4.1 ms | 20/20; 0, 0, 0; 3.0 / 3.8 ms | 20/20 marker 20/20; 0, 0, 0; 7.5 / 10.9 ms |
-| kill_hard | exit 137 (TerminateProcess) | 20/20; 0, 0, 20; 2.1 / 6.4 ms | 20/20; 0, 0, 0; 1.7 / 2.8 ms | 20/20 marker 0/20; 0, 0, 0; 6.8 / 98.4 ms |
-| exit | exit 0 | 20/20; 0, 0, 0; 15.5 / 73.2 ms | 20/20; 0, 0, 0; 11.0 / 14.2 ms | 20/20 marker 0/20; 0, 0, 0; 18.7 / 167.4 ms |
-| _Exit | exit 0 | 20/20; 0, 0, 0; 12.6 / 17.1 ms | 20/20; 0, 0, 0; 11.9 / 16.8 ms | 20/20 marker 0/20; 0, 0, 0; 9.6 / 15.7 ms |
+| segv_main | exit 0xC0000005 (access violation) | 20/20; 0, 0, 19; 1.9 / 5.1 ms | 20/20; 0, 0, 0; 1.6 / 2.4 ms | 20/20 marker 20/20; 0, 0, 0; 4.6 / 18.6 ms |
+| segv_other_thread | exit 0xC0000005 (access violation) | 20/20; 0, 0, 20; 1.8 / 3.3 ms | 20/20; 0, 0, 0; 1.5 / 2.1 ms | 20/20 marker 20/20; 0, 0, 0; 7.3 / 14.2 ms |
+| abort | exit 3 (abort) | 20/20; 0, 0, 0; 14.4 / 67.0 ms | 20/20; 0, 0, 0; 14.0 / 71.3 ms | 20/20 marker 20/20; 0, 0, 0; 11.8 / 17.6 ms |
+| assert | exit 3 (abort) | 20/20; 0, 0, 0; 14.2 / 17.8 ms | 20/20; 0, 0, 0; 13.7 / 18.8 ms | 20/20 marker 20/20; 0, 0, 0; 13.7 / 25.7 ms |
+| uncaught_exception | exit 3 (abort) | 20/20; 0, 0, 0; 15.6 / 55.3 ms | 20/20; 0, 0, 0; 12.0 / 19.1 ms | 20/20 marker 20/20; 0, 0, 0; 15.5 / 24.9 ms |
+| stack_overflow | exit 0xC00000FD (stack overflow) | 20/20; 0, 0, 20; 2.8 / 3.7 ms | 20/20; 0, 0, 0; 2.8 / 3.8 ms | 20/20 marker 20/20; 0, 0, 0; 16.5 / 68.0 ms |
+| stack_overflow_thread | exit 0xC00000FD (stack overflow) | 20/20; 0, 0, 20; 2.8 / 4.8 ms | 20/20; 0, 0, 0; 2.7 / 3.6 ms | 20/20 marker 20/20; 0, 0, 0; 8.5 / 19.5 ms |
+| kill_hard | exit 137 (TerminateProcess) | 20/20; 0, 0, 20; 1.8 / 3.2 ms | 20/20; 0, 0, 0; 2.5 / 17.8 ms | 20/20 marker 0/20; 0, 0, 0; 1.7 / 2.4 ms |
+| exit | exit 0 | 20/20; 0, 0, 0; 12.8 / 63.4 ms | 20/20; 0, 0, 0; 11.5 / 18.2 ms | 20/20 marker 0/20; 0, 0, 0; 17.3 / 92.8 ms |
+| _Exit | exit 0 | 20/20; 0, 0, 0; 14.5 / 75.0 ms | 20/20; 0, 0, 0; 11.1 / 17.2 ms | 20/20 marker 0/20; 0, 0, 0; 7.6 / 14.7 ms |
 
 (*torn*: dòng cuối file bị cắt dở. Thời gian "fatal action → process end" đo từ ngay trước lệnh gây chết, hoặc lúc process cha gọi kill, tới khi process cha thấy process con đã kết thúc.)
 
@@ -192,10 +192,10 @@ Mọi process con kết thúc đúng như kịch bản (600/600), tblog ghi dòn
 ### Giải thích các kết quả bất ngờ
 
 - **`fprintf_buffered` không mất gì với `abort`, `assert`, exception không ai bắt, `_Exit`**, trái với kỳ vọng. Trên MinGW-w64 với CRT `msvcrt.dll`, các đường đó kết thúc bằng `ExitProcess`, và `msvcrt.dll` xả mọi stream khi DLL được gỡ lúc process thoát. Chỉ những cách chết không qua `ExitProcess` mới làm mất buffer stdio: exception phần cứng không ai bắt (`segv_*`, `stack_overflow*`) và `TerminateProcess`. Trên glibc, `abort()` không xả stream (từ glibc 2.27) và `_Exit` cũng không, nên kết quả trên Linux sẽ khác: chưa đo trên máy này.
-- **tblog mất 508 dòng trung bình (tối đa 1 098) ở `segv_other_thread`**, nhiều hơn `fprintf_buffered` (17). Handler xả buffer ngay khi bắt được crash (mọi dòng acknowledged trước dòng báo crash đều có trong file), nhưng 4 thread kia vẫn chạy và vẫn log trong lúc Windows kết thúc process: trung bình 11 ms, tối đa 22 ms ở tblog (handler còn in call stack ra stderr). Các dòng đó được acknowledged nhưng không bao giờ được ghi. Số dòng mất tỉ lệ với khoảng thời gian đó (ví dụ trong JSON: 32 dòng khi process chết sau 4.1 ms, 896 dòng khi sau 20.3 ms). `fprintf_flush` không mất gì vì mỗi dòng đã ở trong OS lúc lệnh trả về; `fprintf_buffered` chỉ mất phần trong buffer 4 KB dùng chung.
-- **tblog ghi lặp dòng**: 3 883 dòng lặp (tổng của 20 lần thử) ở `segv_other_thread` và 1 941 ở `uncaught_exception`. Đó là trường hợp đã ghi trong [architecture.md](architecture.md#độ-bền-của-log): một chunk thread nền đang ghi dở lúc crash được handler ghi lại. Không mất dòng, nhưng ai đọc log cần biết có thể có lặp ở cuối file.
+- **`segv_other_thread`: tblog không mất dòng nào, không lặp dòng nào**, dù 4 thread kia vẫn chạy và vẫn log trong lúc Windows kết thúc process (trung bình 7.3 ms, tối đa 14.2 ms sau lệnh gây crash). Khi handler đã bắt đầu xả, lệnh log của các thread đó không đưa dòng vào buffer nữa mà chờ handler xả xong rồi tự ghi dòng thẳng vào file trước khi trả về, sau dòng báo crash. `fprintf_buffered` mất trung bình 21 dòng (tối đa 38), phần trong buffer 4 KB dùng chung. Tổng 2 dòng *beyond_ack* (ở 2 lần thử): dòng đã ghi xong vào file nhưng process chết trước khi lệnh log của nó kịp trả về; không tính là mất.
+- **Không lặp dòng ở mọi kịch bản**: handler chờ thread nền ghi xong chunk đang ghi dở (nếu có) rồi xả tiếp đúng từ byte mà thread nền đã ghi tới; sau đó thread nền không ghi gì thêm (xem [architecture.md](architecture.md#độ-bền-của-log)).
 - **`stack_overflow_thread` của tblog không mất gì trên Windows**, dù thread đó không phải thread gọi `tblog_init`: filter của Windows vẫn chạy được trên phần stack còn lại. Trên Linux/macOS, thread không có alternate signal stack thì handler không chạy được khi tràn stack; chưa đo ở đây.
-- **`kill_hard` tblog: trung bình 4 424, tối đa 7 727 dòng** (4 thread), tức tối đa khoảng 1 930 dòng mỗi thread, đúng bằng 75% của một shard 256 KB như dự đoán. `_Exit` (1 thread): trung bình 953, tối đa 1 811.
+- **`kill_hard` tblog: trung bình 3 660, tối đa 7 432 dòng** (4 thread), tức tối đa 1 858 dòng mỗi thread, gần bằng 75% của một shard 256 KB (khoảng 1 900 dòng) như dự đoán. `_Exit` (1 thread): trung bình 955, tối đa 1 830.
 
 ## Khi nào tblog tốt hơn printf / khi nào không
 
@@ -203,8 +203,8 @@ Dựa trên các bảng trên (một máy Windows, MinGW-w64):
 
 - **Thread gọi log nhanh hơn ở mọi số thread**: p50 321–571 ns so với 2–19 µs của `fprintf`, và p99 dưới 1 µs so với tới hàng trăm µs khi nhiều thread tranh nhau một `FILE*`. Nếu điều quan trọng là thread làm việc không bị log làm chậm, tblog tốt hơn rõ.
 - **Một thread, cùng cách format**: khoảng cách nhỏ hơn nhiều so với `fprintf` của MinGW. `snprintf` + `fwrite` chỉ chậm hơn tblog khoảng 20% ở p50 (381 so với 321 ns) và đạt 1.17 M dòng/s end-to-end so với 1.75 M. Trên nền tảng có `fprintf` nhanh (glibc, UCRT), một chương trình một thread dùng `fprintf` có buffer có thể ngang hoặc nhanh hơn tblog: chưa đo ở đây, hãy chạy `bench.yml`.
-- **`kill -9`, OOM killer, `TerminateProcess`, `_Exit`: tblog mất nhiều hơn hẳn**. Tới gần 2 000 dòng mỗi thread (khoảng 100 ms log) so với tối đa 40 dòng của `fprintf_buffered` và 0 của `fprintf_flush`. Nếu process hay bị giết từ bên ngoài và từng dòng cuối đều quan trọng, `fprintf` + `fflush` mỗi dòng an toàn hơn; với tblog, giảm `flush.interval_ms` hoặc `buffer.size` để thu nhỏ cửa sổ đó, hoặc gọi `tblog_flush()` ở các điểm quan trọng.
-- **Crash trên một thread trong khi thread khác vẫn log: tblog mất các dòng ghi sau lúc xả** (trung bình 508, tối đa 1 098 ở đây), nhiều hơn `fprintf_buffered`. Với crash trên chính thread đang log (`segv_main`, `abort`, `assert`, exception, stack overflow), tblog không mất dòng nào, trong khi `fprintf_buffered` mất tới 40 dòng và để lại một dòng cụt.
+- **`kill -9`, OOM killer, `TerminateProcess`, `_Exit`: tblog mất nhiều hơn hẳn**. Tới gần 2 000 dòng mỗi thread (khoảng 100 ms log) so với tối đa 39 dòng của `fprintf_buffered` và 0 của `fprintf_flush`. Nếu process hay bị giết từ bên ngoài và từng dòng cuối đều quan trọng, `fprintf` + `fflush` mỗi dòng an toàn hơn; với tblog, giảm `flush.interval_ms` hoặc `buffer.size` để thu nhỏ cửa sổ đó, hoặc gọi `tblog_flush()` ở các điểm quan trọng.
+- **Crash mà handler bắt được (SIGSEGV, `abort`, `assert`, exception, stack overflow), trên thread đang log hay trên một thread khác trong khi các thread khác vẫn log: tblog không mất dòng nào và không lặp**, như `fprintf_flush`, trong khi `fprintf_buffered` mất tới 41 dòng và để lại một dòng cụt. Các dòng log sau lúc crash nằm sau dòng `*** tblog: caught ... ***`.
 - **Flood vượt trần của thread nền** (khoảng 4–5 M dòng/s ở đây): với `full_policy = drop` (mặc định) tblog bỏ dòng (tới 26% ở 16 thread) mà lệnh log vẫn trả về bình thường; số dòng bỏ chỉ thấy qua `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file. `fprintf` không bao giờ bỏ dòng, chỉ chậm lại. Cần mọi dòng thì dùng `full_policy = block`.
 - **Mất điện**: không biến thể nào ở đây an toàn tuyệt đối. tblog fsync định kỳ (1 s) và ngay với dòng ≥ `sync.on_level`; `fprintf` (kể cả `fflush`) không fsync. Không đo.
 - **Lệnh bị lọc theo level**: cả hai dưới 1 ns, không có khác biệt thực tế.

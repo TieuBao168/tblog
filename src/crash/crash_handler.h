@@ -9,9 +9,11 @@
 // to stderr (unless a crash-safe sink of the pipeline writes to stderr), then
 // pipeline->crash(same line): the queue's buffered lines are drained into
 // every crash-safe sink (FileSink, ConsoleSink), in sink order, followed by
-// the marker. Then backtrace to stderr and the previous handler / default
-// action, so a core dump / WER report is still produced. The pipeline may be
-// replaced by calling install again; nullptr disables the pipeline part.
+// the marker; lines that other threads log from then on are written by those
+// threads themselves, synchronously, after the marker (Queue::append). Then
+// backtrace to stderr and the previous handler / default action, so a core
+// dump / WER report is still produced. The pipeline may be replaced by
+// calling install again; nullptr disables the pipeline part.
 #pragma once
 
 namespace tblog {

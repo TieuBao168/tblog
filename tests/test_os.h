@@ -1,6 +1,6 @@
 // Portable OS helpers for the unit tests (POSIX and Windows): scratch
 // directories, files, environment, time, threads with a given stack size,
-// stderr redirection and child processes.
+// stderr redirection, child processes and memory shared with them.
 //
 // Child processes re-execute the test binary itself on a TINY_CHILD scenario
 // (tiny_test.h) instead of fork()ing a copy, so the same test code runs on
@@ -45,6 +45,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -372,6 +373,58 @@ struct RawFile {
     }
 #endif
     void write(const char *s) const noexcept { write(s, std::strlen(s)); }
+};
+
+// A small file mapped shared (MapViewOfFile / mmap MAP_SHARED) between a
+// parent and its child: progress counters the child stores with plain atomic
+// stores and the parent reads after the child died. The parent opens it with
+// create = true (sized and zeroed), the child with create = false.
+class SharedFile {
+public:
+    SharedFile() = default;
+    SharedFile(const SharedFile &) = delete;
+    SharedFile &operator=(const SharedFile &) = delete;
+    bool open(const std::string &path, size_t size, bool create) {
+        size_ = size;
+#if defined(_WIN32)
+        file_ = CreateFileW(wide(path).c_str(), GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            create ? CREATE_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) return false;
+        map_ = CreateFileMappingW(file_, nullptr, PAGE_READWRITE, 0, (DWORD)size, nullptr);
+        if (!map_) return false;
+        p_ = MapViewOfFile(map_, FILE_MAP_ALL_ACCESS, 0, 0, size);
+#else
+        fd_ = ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? O_CREAT | O_TRUNC : 0), 0644);
+        if (fd_ < 0) return false;
+        if (create && ::ftruncate(fd_, (off_t)size) != 0) return false;
+        void *p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        p_ = p == MAP_FAILED ? nullptr : p;
+#endif
+        if (p_ && create) std::memset(p_, 0, size);
+        return p_ != nullptr;
+    }
+    void *data() const { return p_; }
+    ~SharedFile() {
+#if defined(_WIN32)
+        if (p_) UnmapViewOfFile(p_);
+        if (map_) CloseHandle(map_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+#else
+        if (p_) ::munmap(p_, size_);
+        if (fd_ >= 0) ::close(fd_);
+#endif
+    }
+
+private:
+    void *p_ = nullptr;
+    size_t size_ = 0;
+#if defined(_WIN32)
+    HANDLE file_ = INVALID_HANDLE_VALUE;
+    HANDLE map_ = nullptr;
+#else
+    int fd_ = -1;
+#endif
 };
 
 // Redirects the process's stderr (fd 2 / STD_ERROR_HANDLE) into `path` for

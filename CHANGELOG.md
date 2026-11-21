@@ -23,5 +23,7 @@
 ### Sửa
 
 - Không còn mất dòng khi crash xảy ra đúng lúc thread nền đang ghi một lô.
+- **Crash trên một thread trong khi các thread khác vẫn log: không còn mất dòng.** Trước đây các dòng mà thread khác log sau lúc handler xả buffer (trong vài ms process còn đang chết) được báo là đã log nhưng không bao giờ được ghi: hàng trăm dòng mỗi lần. Giờ, khi handler đã bắt đầu xả, lệnh log chờ handler xong rồi tự ghi dòng thẳng vào file và console trước khi trả về (sau dòng `*** tblog: caught ... ***`, từng dòng một, không xen nhau). Đo lại (`bench_crash_loss`, 20 lần thử, 4 thread × 20 000 dòng/giây, thread thứ 5 crash): **0 dòng mất**, 0 dòng lặp ([docs/benchmarks.md](docs/benchmarks.md#kết-quả-mất-log)).
+- **Crash không còn ghi lặp chunk đang ghi dở.** Handler chờ thread nền ghi xong lần ghi đang dở (có chặn thời gian) rồi xả tiếp đúng từ byte đã ghi tới; sau đó thread nền không ghi gì thêm. Đo lại: 0 dòng lặp ở mọi kịch bản (trước đây thỉnh thoảng lặp cả một chunk, ở `segv_other_thread` và `uncaught_exception`).
 - `make install` cài cả `include/tblog/detail/format.hpp` (trước đó thiếu, nên `<tblog/tblog.hpp>` không dùng được từ bản cài bằng Makefile); `make uninstall` gỡ nó.
 - Khi được nhúng bằng `add_subdirectory` / FetchContent: tblog không còn ghi đè `CMAKE_BUILD_TYPE` của project cha, nhận các option đặt bằng `set()` trước đó (CMP0077), và trên Windows ghi `tblog.dll` vào `CMAKE_RUNTIME_OUTPUT_DIRECTORY` của project cha nếu có.

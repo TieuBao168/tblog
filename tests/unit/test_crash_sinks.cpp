@@ -1,5 +1,6 @@
 // Tests for src/crash/crash_handler.cpp (through a real Pipeline and Queue),
-// src/sinks/console.cpp, src/sinks/syslog.cpp
+// src/sinks/console.cpp, src/sinks/syslog.cpp, and of the whole library
+// (tblog_init) when another thread crashes while threads log.
 //
 // Crash tests run in a child process (tos::run_child re-executes this binary
 // on a TINY_CHILD scenario). The child reports what the crash handler made
@@ -12,14 +13,17 @@
 #include "platform/platform.h"
 #include "queue/queue.h"
 #include "sinks/sink.h"
+#include "tblog/log.h"
 #include "test_os.h"
 #include "tiny_test.h"
 
 #include <atomic>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 using tos::Crash;
 
@@ -502,6 +506,130 @@ TEST(crash_in_other_thread_reported) {
     Run r = run_scenario("segv_in_other_thread");
     EXPECT_TRUE(died_with(r, Crash::Segv));
     EXPECT_EQ(r.report, std::string(kPending) + expected_msg(Crash::Segv));
+}
+
+// ---- the full library (tblog_init, worker, file + console sinks): 4 threads
+// log at 20k lines/s each while a 5th thread crashes. After each TBLOG_INFO
+// returns, the thread stores the line's index in memory shared with the
+// parent, which then checks that every acknowledged line is in the log file
+// and on the console (stderr), whole and exactly once.
+namespace {
+constexpr int kLogThreads = 4;
+struct alignas(64) AckSlot {
+    std::atomic<long long> v;
+};
+struct Progress {
+    int delay_ms;  // set by the parent: when the 5th thread crashes
+    AckSlot acked[kLogThreads];
+};
+static_assert(sizeof(Progress) <= 4096, "Progress must fit the mapping");
+}  // namespace
+
+TINY_CHILD(log_threads_crash_other) {
+    const std::string dir = tos::child_arg();
+    tos::SharedFile shm;
+    if (!shm.open(dir + "/progress.bin", 4096, false)) std::_Exit(91);
+    Progress *pr = static_cast<Progress *>(shm.data());
+    if (tblog_init((dir + "/log.conf").c_str()) != 0) std::_Exit(92);
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kLogThreads; ++t)
+        ts.emplace_back([pr, t] {
+            const uint64_t start = tos::mono_ns();
+            for (long long i = 1; i < 100000000; ++i) {
+                while (tos::mono_ns() < start + static_cast<uint64_t>(i) * 50000u) {
+                }
+                TBLOG_INFO("crashline t%d i%lld", t, i);
+                pr->acked[t].v.store(i, std::memory_order_release);  // the call returned
+            }
+        });
+    const int delay = pr->delay_ms;
+    std::thread crasher([delay] {
+        tos::sleep_ms(delay);
+        null_deref();
+    });
+    crasher.join();
+    for (auto &x : ts) x.join();
+}
+
+namespace {
+// Counts "crashline t<k> i<n>" lines of `text`: every acknowledged index must
+// be there exactly once (later ones at most once), in increasing order per
+// thread. Returns the number of problems (printed).
+long check_acked(const char *what, const std::string &text, const Progress &pr) {
+    std::vector<std::vector<int>> seen(kLogThreads);
+    std::vector<long long> acked(kLogThreads), last(kLogThreads, 0);
+    for (int t = 0; t < kLogThreads; ++t) {
+        acked[t] = pr.acked[t].v.load();
+        seen[t].assign(static_cast<size_t>(acked[t]) + 2, 0);
+    }
+    long problems = 0, beyond = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        if (nl == std::string::npos) nl = text.size();  // torn last line: not acknowledged
+        const std::string l = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        const size_t at = l.find("crashline t");
+        if (at == std::string::npos) continue;
+        int t = -1;
+        long long i = 0;
+        if (std::sscanf(l.c_str() + at, "crashline t%d i%lld", &t, &i) != 2 || t < 0 || t >= kLogThreads) {
+            ++problems;
+            continue;
+        }
+        if (i <= last[t]) ++problems;  // duplicate or out of order
+        last[t] = i;
+        if (i > acked[t]) {
+            ++beyond;
+            continue;
+        }
+        ++seen[t][static_cast<size_t>(i)];
+    }
+    long missing = 0, dups = 0;
+    for (int t = 0; t < kLogThreads; ++t)
+        for (long long i = 1; i <= acked[t]; ++i) {
+            const int c = seen[t][static_cast<size_t>(i)];
+            if (c == 0) ++missing;
+            if (c > 1) dups += c - 1;
+        }
+    if (missing || dups || problems)
+        std::printf("  %s: acked %lld/%lld/%lld/%lld, missing %ld, duplicates %ld, order/format %ld, beyond %ld\n",
+                    what, acked[0], acked[1], acked[2], acked[3], missing, dups, problems, beyond);
+    return missing + dups + problems;
+}
+}  // namespace
+
+TEST(crash_other_thread_every_acknowledged_line_once) {
+    const int reps = 5;
+    long long total = 0;
+    for (int rep = 0; rep < reps; ++rep) {
+        const std::string dir = tos::test_dir() + "/race_" + std::to_string(tos::pid()) + "_" +
+                                std::to_string(rep);
+        tos::remove_tree(dir);
+        tos::make_dirs(dir);
+        tos::write_file(dir + "/log.conf", "file.path = " + dir + "/app.log\nconsole = true\n"
+                                           "console.color = false\nreload.watch = false\n");
+        tos::SharedFile shm;
+        ASSERT_TRUE(shm.open(dir + "/progress.bin", 4096, true));
+        Progress *pr = static_cast<Progress *>(shm.data());
+        pr->delay_ms = 30 + rep * 25;
+        const tos::ChildResult r = tos::run_child("log_threads_crash_other", dir, dir + "/err.txt");
+        EXPECT_TRUE(tos::died_with(r, Crash::Segv));
+        if (!tos::died_with(r, Crash::Segv)) std::printf("  child: %s\n", tos::describe(r).c_str());
+        const std::string file = tos::read_file(dir + "/app.log");
+        long long acked = 0;
+        for (int t = 0; t < kLogThreads; ++t) acked += pr->acked[t].v.load();
+        EXPECT_TRUE(acked > 0);
+        total += acked;
+        EXPECT_EQ(check_acked("file", file, *pr), 0L);
+        EXPECT_EQ(check_acked("console", r.err, *pr), 0L);
+        const std::string m = expected_msg(Crash::Segv);
+        size_t markers = 0;
+        for (size_t p = 0; (p = file.find(m, p)) != std::string::npos; ++p) ++markers;
+        EXPECT_EQ(markers, size_t(1));
+        tos::remove_tree(dir);
+    }
+    std::printf("  %d children, %lld acknowledged lines\n", reps, total);
 }
 
 TINY_CHILD(stack_overflow_in_thread) {

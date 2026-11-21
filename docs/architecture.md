@@ -25,7 +25,7 @@ thread nén (khi file.compress=gzip)  nén file đã xoay thành .gz
 
 - **Thread gọi log** chỉ làm: so level, format bằng `vsnprintf` vào buffer 1024 byte của thread, rồi chép vào shard của nó dưới một spinlock rất ngắn. Trường hợp thường không có system call, không cấp phát, không gọi hàm ảo. Chỉ thread đầu tiên làm shard vượt 75% (hoặc dòng khẩn) trả giá một lần đánh thức worker.
 - **Queue** (`src/queue/`): N shard (lũy thừa của 2, ≥ số CPU, tối đa 16), mỗi shard hai buffer. Mỗi thread được gán một shard cố định (round-robin) nên dòng của nó luôn đúng thứ tự. Worker trả các shard theo thứ tự shard, nên dòng của các thread khác nhau trong một lô có thể lệch thứ tự thời gian tối đa khoảng một `flush.interval_ms`.
-- **Pipeline** (`src/logger/pipeline.*`): một Queue và danh sách sink theo thứ tự file, console, syslog, sink riêng. Mỗi chunk được ghi vào các sink "crash-safe" (file, console) trước, đánh dấu đã ghi, rồi mới tới các sink còn lại.
+- **Pipeline** (`src/logger/pipeline.*`): một Queue và danh sách sink theo thứ tự file, console, syslog, sink riêng. Mỗi chunk được ghi vào các sink "crash-safe" (file, console) trước, đánh dấu đã ghi, rồi mới tới các sink còn lại. Worker chỉ ghi vào sink crash-safe khi đang giữ "quyền ghi" của Queue (một biến atomic, không phải khóa), để crash handler biết lần ghi nào đang dở.
 - **Sink** (`src/sinks/`): `FileSink` (file + `RotatingFile` xoay theo dung lượng/giờ + `Archiver` đặt tên, giữ file, nén), console, syslog, `CallbackSink` cho `tblog_add_sink`.
 - **Thread sync** tách riêng để một ổ đĩa chậm không làm worker ngừng đổi buffer.
 
@@ -45,7 +45,7 @@ Worker và thread sync có alternate signal stack riêng (POSIX) / `SetThreadSta
 |---|---|
 | `tblog_shutdown()`, `return` từ `main`, `exit()` | Đủ: mọi dòng được ghi vào mọi sink, fsync, đóng file |
 | `tblog_flush()` trả về | Mọi dòng đã có trước lời gọi đã nằm trong sink và đã fsync |
-| Crash: SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL; Windows: SEH exception, `abort()` | Signal handler xả buffer vào file và console, rồi ghi dòng `*** tblog: caught signal 11 (SIGSEGV) ***`. Có thể mất dòng đang được chép đúng lúc crash và dòng của thread khác ghi sau khi handler đã đọc buffer; một chunk đang ghi dở có thể bị lặp lại. Syslog và sink riêng không nhận phần xả này. |
+| Crash: SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL; Windows: SEH exception, `abort()` | Signal handler xả buffer vào file và console, rồi ghi dòng `*** tblog: caught signal 11 (SIGSEGV) ***`. Mọi dòng mà lệnh log đã trả về trước khi process chết đều có trong file và console, nguyên vẹn, đúng một lần, kể cả dòng của các thread khác vẫn đang log trong lúc process chết: sau khi handler bắt đầu xả, lệnh log không đưa dòng vào buffer nữa mà chờ handler xong rồi tự ghi dòng thẳng vào file / console trước khi trả về (nên các dòng này nằm **sau** dòng báo crash). Chỉ dòng mà lệnh log chưa kịp trả về mới có thể mất. Syslog và sink riêng không nhận các dòng này. Chi tiết và các giới hạn: [Crash handling](#crash-handling). |
 | `TBLOG_FATAL` | Dòng FATAL được ghi và fsync, rồi `abort()` (như trên) |
 | `kill -9`, OOM killer, `TerminateProcess`, `_exit()` | **Mất** phần còn trong buffer: tối đa khoảng một `flush.interval_ms` (hoặc tới khi shard đầy 75%). Dữ liệu đã ghi xuống file thì nằm trong page cache của OS và không mất. Số đo: [benchmarks.md](benchmarks.md#kết-quả-mất-log). |
 | Mất điện, kernel panic | Mất phần chưa được fsync: tối đa khoảng một `sync.interval_ms` cộng một `flush.interval_ms`. Dòng ≥ `sync.on_level` kích hoạt fsync ngay sau khi được ghi. `sync.interval_ms = 0`: chỉ sync theo `sync.on_level`, `tblog_flush` và lúc shutdown. |
@@ -55,6 +55,15 @@ macOS dùng `fcntl(F_FULLFSYNC)` cho fsync (xem [platforms.md](platforms.md#maco
 ## Crash handling
 
 `tblog_init` cài handler; `tblog_shutdown` gỡ và khôi phục handler cũ. Thứ tự khi crash: dòng báo crash ra stderr (khi không có console sink; có console thì dòng báo đi qua nó, sau các dòng được xả), xả buffer + dòng báo crash vào file và console, call stack ra stderr, rồi chuyển cho handler cũ / hành động mặc định, nên core dump hay Windows Error Reporting vẫn diễn ra. Mọi việc trong handler đều async-signal-safe: không malloc, không khóa, không stdio. Chỉ thread crash đầu tiên làm báo cáo; crash thứ hai (hoặc crash bên trong handler) bỏ qua phần báo cáo.
+
+Xả buffer khi crash (`Queue::crash_drain`, chú thích "Crash safety" trong `src/queue/queue.cpp`):
+
+1. Đánh dấu queue đã crash và đóng nó.
+2. Chờ worker ghi xong lần ghi đang dở vào sink crash-safe (nếu có; tối đa khoảng 2 s), rồi giữ quyền ghi. Worker đánh dấu chunk đã ghi trước khi trả quyền ghi, nên handler xả tiếp đúng từ byte worker đã ghi tới: không mất, không lặp. Từ lúc đó worker không ghi gì nữa.
+3. Chờ các lệnh log đang ở giữa đoạn chép vào shard chép xong (thử từng spinlock của shard, tổng cộng tối đa khoảng 50 ms, không bao giờ chờ mãi: thread giữ khóa có thể chính là thread crash).
+4. Xả phần còn lại của mọi shard, ghi dòng báo crash, rồi mở cho các lệnh log sau crash.
+
+Lệnh log sau crash (bất kỳ thread nào, kể cả thread crash khi log lại từ handler của ứng dụng được gọi tiếp) không động tới spinlock của shard: chờ bước 4 xong, giữ quyền ghi (từng dòng một, không xen nhau), ghi dòng vào file và console bằng đường ghi không khóa, rồi trả về. Chi phí ở đường thường: một lần đọc thêm một cờ atomic (`closed_`, chỉ đọc khi chạy bình thường) trước spinlock. Giới hạn còn lại, đều có chặn thời gian và không bao giờ treo: worker giữ quyền ghi quá khoảng 2 s (sink bị kẹt) hoặc chính worker crash giữa lúc ghi vào sink crash-safe thì phần đầu của chunk đó có thể bị lặp; một spinlock bị giữ suốt khoảng 50 ms thì dòng được chép xong sau lúc handler đọc shard đó có thể mất; lệnh log sau crash chờ handler tối đa khoảng 5 s rồi ghi luôn. Khi thoát process trên Windows (`shutdown_at_exit`, các thread khác đã bị dừng) không có bước chờ nào.
 
 | | Linux | macOS | Windows |
 |---|---|---|---|

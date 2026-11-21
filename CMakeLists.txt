@@ -35,6 +35,11 @@ if(POLICY CMP0092)
   # MSVC: no default /W3 in CMAKE_<LANG>_FLAGS, so /W4 does not trigger D9025.
   cmake_policy(SET CMP0092 NEW)
 endif()
+if(POLICY CMP0077)
+  # option() honours a normal variable of the same name, so a parent project
+  # can set(TBLOG_BUILD_SHARED OFF) before add_subdirectory(tblog).
+  cmake_policy(SET CMP0077 NEW)
+endif()
 project(tblog VERSION 0.1.0 LANGUAGES C CXX)
 
 option(TBLOG_HEADERS_ONLY_CHECK "Configure only the public-header compile check (no library, tests or install)" OFF)
@@ -114,7 +119,10 @@ endif()
 set(TBLOG_SANITIZE "" CACHE STRING "Sanitizers: empty, address, thread, undefined or address,undefined")
 set_property(CACHE TBLOG_SANITIZE PROPERTY STRINGS "" address thread undefined "address,undefined")
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+# Default build type only when tblog is the top-level project (never change a
+# parent project's CMAKE_BUILD_TYPE from add_subdirectory / FetchContent).
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND
+   NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
@@ -159,8 +167,14 @@ list(APPEND TBLOG_SOURCES ${TBLOG_PLATFORM_SOURCES})
 # Where an executable of kind `subdir` (tests, examples, bench) is written.
 # Windows: tblog.dll and every executable share one directory, bin/, so they
 # find the DLL without PATH changes (multi-config generators add the
-# configuration: bin/Release/...).
-set(TBLOG_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
+# configuration: bin/Release/...). A parent project that sets
+# CMAKE_RUNTIME_OUTPUT_DIRECTORY gets tblog.dll there, next to its own
+# executables.
+if(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+  set(TBLOG_BIN_DIR "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+else()
+  set(TBLOG_BIN_DIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
+endif()
 function(tblog_runtime_dir target subdir)
   if(WIN32)
     set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TBLOG_BIN_DIR}")
@@ -467,6 +481,16 @@ if(TBLOG_BUILD_BENCH)
     CXX_STANDARD ${TBLOG_CXX_STANDARD}
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
+  if(TBLOG_BUILD_TESTS AND NOT WIN32)
+    # Smoke test (not a measurement): a short run must succeed. POSIX only:
+    # the bench prepares its directories with `rm -rf` / `mkdir -p`.
+    set(_dir "${TBLOG_TEST_DIR}/bench_latency")
+    file(MAKE_DIRECTORY "${_dir}")
+    add_test(NAME bench_latency_smoke
+      COMMAND ${TBLOG_TEST_RUNNER} $<TARGET_FILE:bench_latency> 2000
+      WORKING_DIRECTORY "${_dir}")
+    set_tests_properties(bench_latency_smoke PROPERTIES TIMEOUT 300)
+  endif()
 endif()
 
 # ---- install + package config -------------------------------------------------

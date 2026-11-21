@@ -1,6 +1,7 @@
 # tblog-lite: C99 logging for microcontrollers. Host build and tests.
 #   make            -> build/libtblog_lite.a (core + printf, host)
 #   make test       -> printf (int + float), ring, ISR, strip, port syntax checks
+#                      (fails if a tests/test_*.c is not part of TESTS)
 #   make test-asan  -> same tests with -fsanitize=address,undefined
 #   make size       -> footprint of -Os objects (host x86-64, and Cortex-M
 #                      if arm-none-eabi-gcc is on PATH)
@@ -61,12 +62,14 @@ demo: $(B)/demo
 
 TESTS := $(B)/test_printf $(B)/test_printf_float $(B)/test_ring $(B)/test_ring_small $(B)/test_isr
 
+# Every tests/test_*.c must be built into at least one of $(TESTS) (a binary
+# named after it, possibly with a suffix such as test_ring_small), so a new
+# test file cannot be forgotten by `make test`.
+UNLISTED_TESTS := $(foreach t,$(wildcard tests/test_*.c),$(if $(filter $(B)/$(basename $(notdir $(t)))%,$(TESTS)),,$(t)))
+
 test: $(TESTS) check-ports
-	./$(B)/test_printf
-	./$(B)/test_printf_float
-	./$(B)/test_ring
-	./$(B)/test_ring_small
-	./$(B)/test_isr
+	@if [ -n "$(strip $(UNLISTED_TESTS))" ]; then echo "tblog-lite: not in TESTS: $(UNLISTED_TESTS)"; exit 1; fi
+	@set -e; for t in $(TESTS); do echo "=== $$t"; ./$$t; done
 	sh tests/check_strip.sh $(CC) $(B)/strip
 	@echo "tblog-lite: all tests passed$(if $(SAN), (sanitizers))"
 

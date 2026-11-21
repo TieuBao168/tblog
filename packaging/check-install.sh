@@ -3,7 +3,8 @@
 # then builds examples/basic.c against it through pkg-config:
 #   (a) static:  pkg-config --static --cflags --libs, -ltblog -> -l:libtblog.a
 #   (b) shared:  pkg-config --cflags --libs, run with LD_LIBRARY_PATH
-# and runs both. Also checks a DESTDIR staged install + uninstall.
+# and runs both. Also checks a DESTDIR staged install + uninstall (every
+# public header, include/tblog/detail/ too, and nothing left behind).
 # Falls back to a tiny built-in .pc reader if pkg-config is not installed.
 #
 # With TBLOG_INSTALLED_PREFIX=/abs/prefix (e.g. after `cmake --install`, with
@@ -83,8 +84,8 @@ if [ -z "$TBLOG_INSTALLED_PREFIX" ]; then
 say "DESTDIR install/uninstall"
 stage=$root/stage
 $MAKE --no-print-directory install PREFIX=/opt/tblog DESTDIR="$stage" >/dev/null
-for f in include/tblog/log.h lib/libtblog.a lib/libtblog.so.0.1.0 lib/libtblog.so.0 \
-         lib/libtblog.so lib/pkgconfig/tblog.pc; do
+for f in include/tblog/log.h include/tblog/tblog.hpp include/tblog/detail/format.hpp \
+         lib/libtblog.a lib/libtblog.so.0.1.0 lib/libtblog.so.0 lib/libtblog.so lib/pkgconfig/tblog.pc; do
     [ -e "$stage/opt/tblog/$f" ] || fail "DESTDIR install is missing $f"
 done
 grep -qx 'prefix=/opt/tblog' "$stage/opt/tblog/lib/pkgconfig/tblog.pc" || fail "bad prefix in staged tblog.pc"
@@ -97,7 +98,8 @@ say "install PREFIX=$prefix"
 $MAKE --no-print-directory install PREFIX="$prefix" >/dev/null
 else
 say "checking the existing install in $prefix"
-for f in include/tblog/log.h lib/libtblog.a lib/pkgconfig/tblog.pc; do
+for f in include/tblog/log.h include/tblog/tblog.hpp include/tblog/detail/format.hpp \
+         lib/libtblog.a lib/pkgconfig/tblog.pc; do
     [ -e "$prefix/$f" ] || fail "install is missing $f"
 done
 fi

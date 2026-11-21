@@ -3,6 +3,9 @@
 //
 // TINY_SKIP("reason") ends the current test as skipped (printed as
 // "[ SKIP ] name (reason)", counted apart from passes and failures).
+// With the environment variable TBLOG_TEST_NO_SKIP set (to anything but "" or
+// "0") a skip is a failure instead: CI sets it on Linux, where every test
+// must really run (printed as "[ FAIL ] name (skipped: reason; ...)").
 //
 // Child scenarios: TINY_CHILD(name) { ... } registers code that only runs
 // when the test binary is started as `<binary> --tiny-child=name` (see
@@ -50,6 +53,11 @@ inline int run_child_case(const char *name) {
     return 2;
 }
 
+inline bool no_skip() {
+    const char *v = std::getenv("TBLOG_TEST_NO_SKIP");
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
 inline int run(int argc, char **argv) {
     argv0() = argc > 0 ? argv[0] : "";
     static const char kChild[] = "--tiny-child=";
@@ -62,7 +70,11 @@ inline int run(int argc, char **argv) {
         skipped() = false;
         std::printf("[ RUN  ] %s\n", c.name);
         c.fn();
-        if (skipped() && failures() == before) {
+        if (skipped() && failures() == before && no_skip()) {
+            ++failures();
+            std::printf("[ FAIL ] %s (skipped: %s; TBLOG_TEST_NO_SKIP is set)\n", c.name,
+                        skip_reason().c_str());
+        } else if (skipped() && failures() == before) {
             std::printf("[ SKIP ] %s (%s)\n", c.name, skip_reason().c_str());
             ++skips;
         } else {

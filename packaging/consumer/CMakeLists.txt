@@ -1,11 +1,22 @@
-# Minimal downstream project used by CI to check the installed CMake package:
-#   cmake -S packaging/consumer -B build-consumer -DCMAKE_PREFIX_PATH=<tblog prefix>
+# Minimal downstream project used by CI to check how other projects consume
+# tblog. Builds the examples against:
+#   - the *installed* tblog (find_package), by default:
+#       cmake -S packaging/consumer -B build-consumer -DCMAKE_PREFIX_PATH=<tblog prefix>
+#   - the source tree added as a subdirectory (no install), with
+#     -DTBLOG_SOURCE_DIR=<tblog checkout>:
+#       cmake -S packaging/consumer -B build-subdir -DTBLOG_SOURCE_DIR=$PWD
 #   cmake --build build-consumer
-# Builds the examples against the *installed* tblog (not the source tree).
 cmake_minimum_required(VERSION 3.10)
 project(tblog_consumer LANGUAGES C CXX)
 
-find_package(tblog 0.1 REQUIRED)
+if(TBLOG_SOURCE_DIR)
+  # Like add_subdirectory(third_party/tblog) or FetchContent_MakeAvailable(tblog).
+  # Executables and (Windows) tblog.dll in one directory, so they run as built.
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+  add_subdirectory("${TBLOG_SOURCE_DIR}" tblog)
+else()
+  find_package(tblog 0.1 REQUIRED)
+endif()
 
 set(TBLOG_EXAMPLES_DIR "${CMAKE_CURRENT_LIST_DIR}/../../examples")
 

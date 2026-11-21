@@ -127,13 +127,15 @@ INSTALL      ?= install
 NM           ?= nm
 PKG_CONFIG   ?= pkg-config
 HEADERS      := $(wildcard include/tblog/*.h include/tblog/*.hpp)
+DETAIL_HDRS  := $(wildcard include/tblog/detail/*.hpp)
 # .pc paths are written relative to ${prefix} when they live under PREFIX.
 PC_LIBDIR     = $(patsubst $(PREFIX)/%,$${prefix}/%,$(LIBDIR))
 PC_INCLUDEDIR = $(patsubst $(PREFIX)/%,$${prefix}/%,$(INCLUDEDIR))
 
 install: $(LIB) $(SHLINKS) packaging/tblog.pc.in
-	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)/tblog $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PKGCONFIGDIR)
+	$(INSTALL) -d $(DESTDIR)$(INCLUDEDIR)/tblog/detail $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PKGCONFIGDIR)
 	$(INSTALL) -m 644 $(HEADERS) $(DESTDIR)$(INCLUDEDIR)/tblog/
+	$(INSTALL) -m 644 $(DETAIL_HDRS) $(DESTDIR)$(INCLUDEDIR)/tblog/detail/
 	$(INSTALL) -m 644 $(LIB) $(DESTDIR)$(LIBDIR)/
 	$(INSTALL) -m 755 $(SHLIB) $(DESTDIR)$(LIBDIR)/
 	ln -sf libtblog.so.$(VERSION) $(DESTDIR)$(LIBDIR)/$(SONAME)
@@ -145,7 +147,9 @@ install: $(LIB) $(SHLINKS) packaging/tblog.pc.in
 	chmod 644 $(DESTDIR)$(PKGCONFIGDIR)/tblog.pc
 
 uninstall:
-	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/tblog/,$(notdir $(HEADERS)))
+	rm -f $(addprefix $(DESTDIR)$(INCLUDEDIR)/tblog/,$(notdir $(HEADERS))) \
+	      $(addprefix $(DESTDIR)$(INCLUDEDIR)/tblog/detail/,$(notdir $(DETAIL_HDRS)))
+	-rmdir $(DESTDIR)$(INCLUDEDIR)/tblog/detail 2>/dev/null
 	-rmdir $(DESTDIR)$(INCLUDEDIR)/tblog 2>/dev/null
 	rm -f $(DESTDIR)$(LIBDIR)/libtblog.a $(DESTDIR)$(LIBDIR)/libtblog.so.$(VERSION) \
 	      $(DESTDIR)$(LIBDIR)/$(SONAME) $(DESTDIR)$(LIBDIR)/libtblog.so \

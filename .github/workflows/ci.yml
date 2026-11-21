@@ -16,13 +16,17 @@ concurrency:
 permissions:
   contents: read
 
+# Changes to Markdown files and docs/ alone do not trigger CI (paths-ignore);
+# log.conf, the workflow itself and every other file do.
+#
 # Linux: the library is built and tested by cmake-linux (gcc / clang,
-# C++11/17, sanitizers, no zlib), install, make and lite; cmake-linux also
-# compiles tests/header_check via TBLOG_BUILD_TESTS=ON.
+# C++11/17, sanitizers, no zlib), alpine (musl), install, make and lite;
+# cmake-linux also compiles tests/header_check via TBLOG_BUILD_TESTS=ON.
 # Windows: cmake-windows builds the static library and the DLL, the tests,
 # the examples, the DLL export check (packaging/check-exports.ps1) and, for
-# MSVC, installs and builds packaging/consumer with find_package: MSVC x64
-# (Release without zlib, Debug with vcpkg's zlib) and MinGW-w64 (MSYS2).
+# MSVC, installs and builds packaging/consumer with find_package and with
+# add_subdirectory: MSVC x64 (Release without zlib, Debug with vcpkg's zlib)
+# and MinGW-w64 (MSYS2).
 # macOS: cmake-macos builds the static library and the dylib with AppleClang,
 # the tests, the examples, the bench and the Mach-O export check
 # (packaging/check-symbols.sh) on arm64 (Release + -Werror, ASan+UBSan, TSan)
@@ -32,6 +36,16 @@ permissions:
 # The `headers` job compiles only the public headers
 # (TBLOG_HEADERS_ONLY_CHECK=ON) where the library is not built: MSVC ARM64
 # (cross-compiled, compile only).
+#
+# Coverage guards, in every CMake job that runs the tests:
+#   * packaging/check-test-inventory.cmake: the registered CTest tests must be
+#     exactly tests/unit/*.cpp + tests/shared/*.cpp + the examples + the
+#     checks that configuration calls for (a test cannot drop out unnoticed).
+#   * packaging/report-skips.sh: lists every skipped test case (also in the
+#     job summary). Linux jobs set TBLOG_TEST_NO_SKIP=1, which makes a skip a
+#     failure (tests/tiny_test.h): on Linux every test must really run.
+#   * lite/Makefile: `make -C lite test` fails if a lite/tests/test_*.c is not
+#     built and run by it.
 
 jobs:
   # No OS headers / OS calls outside src/platform/ (the platform layer).
@@ -83,6 +97,7 @@ jobs:
             options: -DTBLOG_WITH_ZLIB=OFF
     env:
       UBSAN_OPTIONS: print_stacktrace=1
+      TBLOG_TEST_NO_SKIP: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -110,6 +125,13 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+
+      - name: Test inventory
+        run: cmake -DBUILD_DIR=build -P packaging/check-test-inventory.cmake
+
+      - name: Skipped tests
+        if: always()
+        run: sh packaging/report-skips.sh build
 
   # Windows: static library + DLL, every test (tests/unit against the static
   # library, tests/shared against the DLL), the examples (as CTest smoke
@@ -196,9 +218,17 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
 
+      - name: Skipped tests
+        if: always()
+        shell: bash
+        run: sh packaging/report-skips.sh build
+
       # Also part of the Test step; run on its own so its output is in the log.
       - name: DLL export check
         run: ctest --test-dir build -C ${{ matrix.config }} -R check_exports -V
+
+      - name: Test inventory
+        run: cmake -DBUILD_DIR=build -DCONFIG=${{ matrix.config }} -P packaging/check-test-inventory.cmake
 
       # find_package(tblog 0.1) from a separate CMake project against the
       # installed tree: tblog::tblog (the DLL), tblog::tblog_static, cpp_api.
@@ -229,6 +259,31 @@ jobs:
           Run-Basic basic_static              # needs no tblog.dll (not on PATH yet)
           $env:PATH = "$prefix/bin;$env:PATH"
           Run-Basic basic_default             # tblog::tblog -> tblog.dll
+          Set-Content -Encoding ascii -Path cpp_api.conf -Value "file.path = $PWD/cpp_api.log`nreload.watch = false"
+          ./cpp_api.exe cpp_api.conf 1000
+          if ($LASTEXITCODE -ne 0) { Write-Error "cpp_api exited with $LASTEXITCODE"; exit 1 }
+          if (-not (Select-String -Quiet -Path cpp_api.log -Pattern 'user 42 logged in from 10.0.0.7:8443')) {
+            Write-Error "cpp_api.log: line missing"; exit 1
+          }
+
+      # The source tree as a subdirectory of packaging/consumer (no install):
+      # tblog.dll lands in the consumer's CMAKE_RUNTIME_OUTPUT_DIRECTORY.
+      - name: add_subdirectory consumer (packaging/consumer)
+        if: matrix.install
+        run: |
+          cmake -S packaging/consumer -B build-subdir -A x64 "-DTBLOG_SOURCE_DIR=$PWD" -DTBLOG_WITH_ZLIB=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-subdir --config ${{ matrix.config }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Set-Location build-subdir/bin/${{ matrix.config }}
+          if (-not (Test-Path tblog.dll)) { Get-ChildItem; Write-Error "tblog.dll not next to the executables"; exit 1 }
+          foreach ($exe in @('basic_default', 'basic_static')) {
+            Set-Content -Encoding ascii -Path "$exe.conf" -Value "file.path = $PWD/$exe.log`nreload.watch = false"
+            & "./$exe.exe" "$exe.conf"
+            if ($LASTEXITCODE -ne 0) { Write-Error "$exe exited with $LASTEXITCODE"; exit 1 }
+            $n = @(Select-String -Path "$exe.log" -Pattern 'worker . step').Count
+            if ($n -ne 4000) { Write-Error "$exe.log: $n worker lines, expected 4000"; exit 1 }
+          }
           Set-Content -Encoding ascii -Path cpp_api.conf -Value "file.path = $PWD/cpp_api.log`nreload.watch = false"
           ./cpp_api.exe cpp_api.conf 1000
           if ($LASTEXITCODE -ne 0) { Write-Error "cpp_api exited with $LASTEXITCODE"; exit 1 }
@@ -294,6 +349,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Test inventory
+        run: cmake -DBUILD_DIR=build -P packaging/check-test-inventory.cmake
+
+      - name: Skipped tests
+        if: always()
+        run: sh packaging/report-skips.sh build
 
       # examples/basic.c against the installed tree via pkg-config (or the
       # script's built-in .pc reader), static and shared (-rpath).
@@ -430,9 +492,62 @@ jobs:
           ./cpp_api cpp_api.conf 1000
           grep -q 'user 42 logged in from 10.0.0.7:8443' cpp_api.log
 
+      # The source tree as a subdirectory of packaging/consumer (no install),
+      # what add_subdirectory / FetchContent users get.
+      - name: add_subdirectory consumer (packaging/consumer)
+        run: |
+          cmake -S packaging/consumer -B build-subdir -G Ninja -DTBLOG_SOURCE_DIR="$PWD"
+          cmake --build build-subdir
+          cd build-subdir/bin
+          for exe in basic_default basic_static; do
+            printf 'file.path = %s\nreload.watch = false\n' "$PWD/$exe.log" > "$exe.conf"
+            "./$exe" "$exe.conf"
+            n=$(grep -c 'worker . step' "$exe.log")
+            test "$n" -eq 4000
+          done
+          printf 'file.path = %s\nreload.watch = false\n' "$PWD/cpp_api.log" > cpp_api.conf
+          ./cpp_api cpp_api.conf 1000
+          grep -q 'user 42 logged in from 10.0.0.7:8443' cpp_api.log
+
+  # Linux with musl libc (Alpine container): the whole CTest suite, including
+  # the crash tests without <execinfo.h> (no stack dump on musl).
+  alpine:
+    name: alpine (musl) / gcc / C++17 / Werror
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    env:
+      TBLOG_TEST_NO_SKIP: '1'
+    steps:
+      - name: Install packages
+        run: apk add --no-cache build-base cmake ninja zlib-dev linux-headers git
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DTBLOG_BUILD_TESTS=ON -DTBLOG_BUILD_EXAMPLES=ON -DTBLOG_BUILD_BENCH=ON
+          -DTBLOG_WERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Test inventory
+        run: cmake -DBUILD_DIR=build -P packaging/check-test-inventory.cmake
+
+      - name: Skipped tests
+        if: always()
+        run: sh packaging/report-skips.sh build
+
   make:
     name: make / test + check-symbols + check-install
     runs-on: ubuntu-latest
+    env:
+      TBLOG_TEST_NO_SKIP: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -461,3 +576,8 @@ jobs:
 
       - name: make -C lite test-asan
         run: make -C lite test-asan
+
+      # The host demo (the same application code as with full tblog) and the
+      # footprint report (host -Os; Cortex-M only if arm-none-eabi-gcc exists).
+      - name: make -C lite demo size
+        run: make -C lite demo size

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <mutex>
+#include <type_traits>
 
 namespace tblog {
 namespace {
@@ -57,7 +58,11 @@ tblog_module *get_or_create_locked(const char *name) {
 
 const char *level_name(tblog_level lv) {
     static const char *const kNames[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL", "OFF"};
-    unsigned i = (unsigned)lv;
+    // Read the raw value: a caller may pass any integer (C enums are ints), and
+    // loading an out-of-range enum is undefined (UBSan -fsanitize=enum).
+    std::underlying_type<tblog_level>::type raw;
+    std::memcpy(&raw, &lv, sizeof raw);
+    const unsigned i = static_cast<unsigned>(raw);
     return i <= (unsigned)TBLOG_LV_OFF ? kNames[i] : "UNKNOWN";
 }
 

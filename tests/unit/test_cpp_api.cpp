@@ -543,10 +543,10 @@ TEST(module_variants_and_call_site) {
 TEST(multithread) {
     const std::string dir = fresh("mt");
     ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-    const int kThreads = 8, kPerThread = 10000;
+    static constexpr int kThreads = 8, kPerThread = 10000;  // static: no capture (MSVC C3493, clang -Wunused-lambda-capture)
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t)
-        ts.emplace_back([t, kPerThread] {
+        ts.emplace_back([t] {
             tblog::Logger lg("mt");
             const std::string tag = "s" + std::to_string(t);
             for (int i = 0; i < kPerThread; ++i) {

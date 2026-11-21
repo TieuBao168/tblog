@@ -70,7 +70,24 @@
 #define TOS_NOINLINE __attribute__((noinline))
 #endif
 
+// A deliberate fault must reach tblog's crash handler: under
+// -fsanitize=undefined with -fno-sanitize-recover (the CI sanitizer jobs)
+// UBSan's null check would abort the process first. Functions that fault on
+// purpose turn UBSan off for themselves.
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 8)
+#define TBLOG_TEST_NO_UBSAN __attribute__((no_sanitize("undefined")))
+#else
+#define TBLOG_TEST_NO_UBSAN
+#endif
+
 namespace tos {
+
+// Store through a null pointer (SIGSEGV / access violation), invisible to
+// the optimizer (both volatiles) and to UBSan.
+TBLOG_TEST_NO_UBSAN TOS_NOINLINE inline void fault_null_store() {
+    volatile int *volatile p = nullptr;
+    *p = 1;
+}
 
 #if defined(_WIN32)
 inline std::wstring wide(const std::string &s) {

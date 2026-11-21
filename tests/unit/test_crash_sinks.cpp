@@ -34,10 +34,7 @@ tos::RawFile g_report;  // child side: the report file (path = tos::child_arg())
 
 void open_report() { g_report = tos::RawFile::open_append(tos::child_arg()); }
 
-void null_deref() {
-    volatile int *volatile p = nullptr;
-    *p = 42;
-}
+void null_deref() { tos::fault_null_store(); }
 
 // Simulated faults for the crash kinds other than SIGSEGV / abort().
 void trigger(Crash c) {

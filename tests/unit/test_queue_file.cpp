@@ -772,7 +772,10 @@ TEST(queue_release_after_crash_keeps_unwritten) {
     ReleasingVisitor v{q.get(), &b, std::string()};
     EXPECT_TRUE(q->crash_drain(&visit_and_release, &v));
     if (n != 2) std::printf("  (single shard: the two-shard race is not exercised)\n");
-    EXPECT_EQ(v.data, std::string("A\nB\n"));
+    // Each line exactly once. Their order is the shards' order, which depends
+    // on how many shards this machine has and which ids the two threads got
+    // (lines of different threads have no defined order).
+    EXPECT_TRUE(v.data == "A\nB\n" || v.data == "B\nA\n");
     q->release(b);
 }
 

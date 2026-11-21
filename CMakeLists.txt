@@ -311,10 +311,9 @@ if(APPLE)
   set(TBLOG_EXP "${CMAKE_CURRENT_SOURCE_DIR}/packaging/tblog.exp")
   set_target_properties(tblog_shared PROPERTIES MACOSX_RPATH ON LINK_DEPENDS "${TBLOG_EXP}")
   target_link_libraries(tblog_shared PRIVATE "-Wl,-exported_symbols_list,${TBLOG_EXP}")
-  if(NOT TBLOG_SANITIZE)
-    # ld64's default, stated explicitly: like --no-undefined on Linux.
-    target_link_libraries(tblog_shared PRIVATE "-Wl,-undefined,error")
-  endif()
+  # No -Wl,-undefined,error: undefined symbols are already an error by default
+  # in ld64 (the equivalent of --no-undefined on Linux), and the new linker
+  # warns that the flag is deprecated.
 elseif(NOT WIN32)
   # Export the tblog_* C API only (also hides std:: template instantiations).
   set(TBLOG_MAP "${CMAKE_CURRENT_SOURCE_DIR}/packaging/tblog.map")

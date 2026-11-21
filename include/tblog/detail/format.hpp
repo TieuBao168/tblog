@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <ostream>
 #include <streambuf>
 #include <string>
@@ -323,8 +324,16 @@ inline void format_float(Sink &s, long double v, int kind, const FormatSpec &sp)
 
     const std::size_t start = s.size();
     if (shortest) {
-        // Shortest of %.{6..9|15..17|18..21}g that round-trips.
-        static const int lo[3] = {6, 15, 18}, hi[3] = {9, 17, 21};
+        // Shortest %.Ng that round-trips, N from digits10 to max_digits10 of the
+        // type: 6..9 (float), 15..17 (double), and for long double whatever it
+        // is here (18..21 for x87, 15..17 where it is double, e.g. macOS arm64
+        // and MSVC; 33..36 for IEEE quad).
+        static const int lo[3] = {std::numeric_limits<float>::digits10,
+                                  std::numeric_limits<double>::digits10,
+                                  std::numeric_limits<long double>::digits10};
+        static const int hi[3] = {std::numeric_limits<float>::max_digits10,
+                                  std::numeric_limits<double>::max_digits10,
+                                  std::numeric_limits<long double>::max_digits10};
         char buf[64];
         int n = 0;
         for (int p = lo[kind]; p <= hi[kind]; ++p) {

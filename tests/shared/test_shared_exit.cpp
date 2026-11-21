@@ -87,8 +87,7 @@ TEST(explicit_shutdown_then_exit) {
 TINY_CHILD(crash_after_logging) {
     if (tblog_init(config(tos::child_arg()).c_str()) != 0) std::_Exit(2);
     for (int i = 0; i < 2000; ++i) TBLOG_INFO("line %d", i);
-    volatile int *volatile p = nullptr;
-    *p = 1;
+    tos::fault_null_store();
 }
 TEST(crash_keeps_lines) {
     const std::string dir = fresh("crash");

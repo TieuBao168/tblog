@@ -64,7 +64,7 @@ std::string config(const std::string &dir, const std::string &extra = "") {
 TEST(multithread) {
     const std::string dir = fresh("mt");
     ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-    constexpr int kThreads = 8, kPerThread = 20000;
+    static constexpr int kThreads = 8, kPerThread = 20000;  // static: no lambda capture needed (MSVC C3493)
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t)
         ts.emplace_back([t] {
@@ -161,7 +161,7 @@ TINY_CHILD(user_sink_order) {
     static Captured cap;
     ASSERT_TRUE(tblog_add_sink(capture_write, capture_flush, &cap) == 0);
     ASSERT_TRUE(tblog_init(config(dir).c_str()) == 0);
-    constexpr int kThreads = 8, kPerThread = 5000;
+    static constexpr int kThreads = 8, kPerThread = 5000;  // static: no lambda capture needed (MSVC C3493)
     std::vector<std::thread> ts;
     for (int t = 0; t < kThreads; ++t)
         ts.emplace_back([t] {
@@ -256,8 +256,7 @@ TINY_CHILD(segv_after_logging) {
     if (tblog_init(config(tos::child_arg(), "flush.interval_ms = 60000\n").c_str()) != 0)
         std::_Exit(2);
     for (int i = 0; i < 3000; ++i) TBLOG_INFO("line %d", i);
-    volatile int *volatile p = nullptr;  // both volatiles: GCC drops/traps otherwise
-    *p = 1;
+    tos::fault_null_store();
 }
 // Buffered lines survive SIGSEGV / an access violation through the crash handler.
 TEST(segv_keeps_logs) {

@@ -67,36 +67,45 @@ Số hiệu năng của CI lấy từ lần chạy bench đầu (commit `47e4c97
 
 ## So với spdlog và Quill
 
-spdlog 1.17.0 (bản async) và Quill 13.1.0, mỗi thư viện dùng cấu hình mặc định, chỉ ghi file, cùng một dòng log. Mỗi lần đo chạy trong một process riêng (backend của Quill chỉ khởi động được một lần mỗi process). Đo trên laptop (MinGW); kết quả: [hiệu năng](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-22-libs.json), [mất log](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-22-libs-crash.json).
+spdlog 1.17.0 (bản async) và Quill 13.1.0, mỗi thư viện dùng cấu hình mặc định, chỉ ghi file, cùng một dòng log. Mỗi lần đo chạy trong một process riêng (backend của Quill chỉ khởi động được một lần mỗi process). Đo trên laptop (MinGW) và 3 máy CI (Linux g++ 15, macOS clang 21, Windows MSVC; commit `6735f65`); kết quả: `bench/results/*-libs.json` (hiệu năng), `*-libs-crash.json` (mất log).
 
-| | tblog | spdlog async | Quill |
-|---|---|---|---|
-| Lệnh log p50 / p99, 1 thread | 190 / 321 ns | 220 ns / 9.54 µs | **20 / 30 ns** |
-| Lệnh log p50 / p99, 8 thread | 190 / 351 ns | 25.7 / 186 µs | **20 / 40 ns** |
-| Lệnh log p50 / p99, 16 thread | 330 / 601 ns | 68.8 / 356 µs | **40 / 70 ns** |
-| Thông lượng tới khi đã fsync, 1 thread | **2.75 M/s** | 1.21 M/s | 1.74 M/s |
-| Thông lượng tới khi đã fsync, 8 thread | **5.41 M/s** | 200 k/s | 1.57 M/s |
-| Thông lượng tới khi đã fsync, 16 thread | **4.04 M/s** [1.36–6.35 M] | 186 k/s | 1.40 M/s |
-| 50 k dòng/s mỗi thread, 8 thread, p50 / p99 | 208 / 453 ns | 340 ns / 2.69 µs | **40 / 99 ns** |
+**Hiệu năng**, 4 thread trừ khi ghi khác (tblog / spdlog / Quill):
+
+| | Linux | macOS | Windows CI | Laptop |
+|---|---|---|---|---|
+| Lệnh log p50 | 431 ns / 14.9 µs / **30 ns** | 416 / 458 / **42 ns** | 381 ns / 25.3 µs / **20 ns** | 180 ns / 1.84 µs / **20 ns** |
+| Lệnh log p99 | 541 ns / 82.1 µs / **40 ns** | 958 ns / 103 µs / **125 ns** | 491 ns / 66.6 µs / **30 ns** | 311 ns / 74.8 µs / **30 ns** |
+| Thông lượng tới khi đã fsync, 1 thread | **3.31 M** / 1.89 M / 2.29 M | **3.33 M** / 1.89 M / 3.12 M | **1.22 M** / 726 k / 989 k | **2.75 M** / 1.21 M / 1.74 M |
+| Thông lượng tới khi đã fsync, 4 thread | **6.33 M** / 235 k / 2.02 M | **8.61 M** / 329 k / 2.93 M | **1.61 M** / 203 k / 872 k | **3.34 M** / 370 k / 1.59 M |
 
 **Mất log** (20 lần thử, TB / max dòng):
 
-| Kịch bản | spdlog | Quill | Quill + signal handler | tblog | tblog + `flush.on_level` |
+| Kịch bản | Nền tảng | spdlog | Quill + signal handler | tblog | tblog + `flush.on_level` |
 |---|---|---|---|---|---|
-| SIGSEGV trên thread đang log | 20.1 / 41 | 550 / 855 | **0** | **0** | **0** |
-| SIGSEGV, 4 thread khác đang log | 24.9 / 39 | 1 530 / 5 504 | 178 / 1 339 | **0** | **0** |
-| `abort`, `assert`, exception | 0–31 / 403 ¹ | 470–493 / 1 133 | **0** | **0** | **0** |
-| Tràn stack (thread init / thread phụ) | 17–22 / 40 | 425–487 / 850 | **0** | **0** | **0** |
-| `kill -9`, 4 thread | **22 / 41** | 1 558 / 3 102 | 1 434 / 1 854 | 4 366 / 7 354 | 188 / 396 ² |
-| `_Exit` | 0 ¹ | 571 / 1 118 | 605 / 1 118 | 952 / 1 830 | 56 / 96 ² |
+| SIGSEGV trên thread đang log | Mọi nền tảng | 20–29 / 41 | **0** ¹ | **0** | **0** |
+| SIGSEGV, 4 thread khác đang log | Linux | 38.5 / 79 | 170 / 278 | **0** | **0** |
+| | macOS | 21.9 / 40 | 54.8 / 205 | **0** | **0** |
+| | Windows CI | 169 / 1 202 | 934 / 2 745 | **0** | **0** |
+| `abort`, `assert`, exception | Linux | 18.8–21.1 / 40 | **0** | **0** | **0** |
+| | macOS, Windows | 0–1 ² | **0** ¹ | **0** | **0** |
+| Tràn stack (thread init / thread phụ) | Linux | 21 / 41 | 250–336 / 599 | **0** | **0** |
+| | macOS | 19–20 / 39 | 246–324 / 600 | **0** | **0** |
+| | Windows | 17–22 / 40 | **0** | **0** | **0** |
+| `kill -9`, 4 thread | Linux | **29 / 76** | 528 / 4 902 | 6 927 / 14 739 | 181 / 389 ³ |
+| | macOS | **21 / 45** | 325 / 646 | 7 726 / 15 208 | 180 / 391 ³ |
+| | Windows CI | **43 / 416** | 964 / 2 801 | 8 837 / 15 524 | 272 / 396 ³ |
+| `_Exit` | Linux, macOS | 25 / 41 | 300–316 / 638 | 2 206–2 219 / 3 771 | 56 / 96 ³ |
 
-¹ Nhờ CRT của MinGW tự xả stdio khi process thoát (như `fprintf`); `abort` vẫn mất ở 2/20 lần, tới 403 dòng. Trên glibc thì khác: chưa đo.
-² 0 dòng mất tính tới dòng ERROR cuối.
+Quill không bật signal handler mất trung bình 240–1 530 dòng ở mọi kịch bản crash (riêng `abort`, `assert`, exception trên macOS: 11–13).
+¹ Trên Windows, handler của Quill đổi mã thoát: SIGSEGV và exception không ai bắt kết thúc bằng `abort` (mã 3) thay vì mã lỗi gốc, nên WER / debugger không thấy lỗi thật. Nó còn ghi thêm 2 dòng thông báo vào log (cột "corrupt" trong JSON).
+² libc của macOS và CRT của Windows tự xả stdio khi `abort` / thoát; trên laptop, `abort` của spdlog vẫn mất ở 2/20 lần (tới 403 dòng).
+³ 0 dòng mất tính tới dòng ERROR cuối.
 
-- **Quill nhanh hơn tblog 5–10× ở phía thread gọi log**: thread gọi log chỉ chép đối số, backend mới format. Đổi lại một backend format mọi dòng, nên thông lượng thấp hơn tblog 1.6–3.4×, và queue không giới hạn tự nở thêm (đã thấy tới 2 MB mỗi thread).
-- **spdlog không mở rộng theo số thread**: mọi thread dùng chung một queue có khóa, thông lượng giảm 1.21 M → 186 k dòng/s từ 1 lên 16 thread. Ở tốc độ đều 50 k dòng/s, mỗi lệnh tốn ~1.5 µs vì phải đánh thức thread nền đang ngủ.
-- **Crash: tblog là thư viện duy nhất mất 0 dòng ở mọi kịch bản.** Signal handler của Quill bỏ sót crash trên thread khác (TB 178, max 1 339 dòng), đổi SIGSEGV thành `abort` (mã thoát 3 thay vì 0xC0000005: WER / debugger không thấy lỗi gốc), và ghi thêm 2 dòng thông báo vào log (cột "corrupt" trong JSON).
-- **`kill -9`: spdlog mất ít nhất**: ở 20 k dòng/s thread nền ghi gần như ngay, chỉ còn buffer stdio (~40 dòng). tblog cố ý gom 200 ms để ghi theo lô nên mất nhiều nhất; `flush.on_level = ERROR` giữ được dòng lỗi.
+- **Quill nhanh hơn tblog khoảng 10× ở phía thread gọi log** (9–19× ở 4 thread): thread gọi log chỉ chép đối số, backend mới format. Đổi lại một backend format mọi dòng, nên thông lượng thấp hơn tblog 1.1–1.6× ở 1 thread và 1.8–3.1× ở 4 thread; queue không giới hạn tự nở thêm (đã thấy tới 2 MB mỗi thread).
+- **spdlog không mở rộng theo số thread**: mọi thread dùng chung một queue có khóa, thông lượng còn 203–370 k dòng/s ở 4 thread trên mọi máy (tblog cao hơn 4.4–27×), p50 lên 15–25 µs trên Linux và Windows CI.
+- **Crash: tblog là thư viện duy nhất mất 0 dòng ở mọi kịch bản, trên mọi nền tảng.** Signal handler của Quill bỏ sót tràn stack trên Linux / macOS (có lẽ cùng nguyên nhân tblog từng gặp: thread không có alternate signal stack) và crash trên thread khác.
+- **`kill -9`: spdlog mất ít nhất**: ở 20 k dòng/s thread nền ghi gần như ngay, chỉ còn buffer stdio (~40 dòng). tblog cố ý gom tới 200 ms để ghi theo lô nên mất nhiều nhất; `flush.on_level = ERROR` giữ được dòng lỗi.
+- Kịch bản paced 8 thread trên máy CI 3–5 CPU bị quá tải CPU (như phần trên) nên không đưa vào bảng.
 
 | Cần gì | Nên chọn |
 |---|---|
@@ -104,8 +113,6 @@ spdlog 1.17.0 (bản async) và Quill 13.1.0, mỗi thư viện dùng cấu hìn
 | Nhiều thread, thông lượng cao | tblog |
 | Không mất log khi crash | tblog |
 | Process hay bị `kill -9`, cần cả dòng INFO cuối | spdlog, hoặc tblog + `flush.on_level` |
-
-Chỉ đo trên một máy Windows; Linux và macOS: chạy `bench.yml` với ô **compare** (xem [Chạy lại](#chạy-lại)).
 
 ## Cách đo
 

@@ -30,7 +30,7 @@ So với `fprintf` vào một file, cùng dòng log, đo trên Linux (glibc), ma
 
 - **Nên dùng** khi có nhiều thread cùng log, thread làm việc không được chậm vì log, hoặc cần log còn nguyên khi crash.
 - **Không cần** nếu chương trình một thread, log ít: trên Linux / macOS, `fprintf` chỉ chậm hơn 1.3× ở p50 và 1.5–1.6× về thông lượng.
-- **So với thư viện log khác** (spdlog async, Quill, đo trên một máy Windows): Quill có lệnh log nhanh hơn tblog 5–10× (20–40 ns); tblog có thông lượng cao hơn 1.6–3.4× so với Quill, cao hơn nhiều so với spdlog khi nhiều thread, và là thư viện duy nhất mất 0 dòng ở mọi kịch bản crash ([benchmarks.md](docs/benchmarks.md#so-với-spdlog-và-quill)).
+- **So với thư viện log khác** (spdlog async, Quill; Linux, macOS, Windows): Quill có lệnh log nhanh hơn tblog khoảng 10× (20–42 ns); tblog có thông lượng cao hơn Quill 1.1–3.1× và hơn spdlog tới 27× khi nhiều thread, và là thư viện duy nhất mất 0 dòng ở mọi kịch bản crash; spdlog mất ít nhất khi `kill -9` ([benchmarks.md](docs/benchmarks.md#so-với-spdlog-và-quill)).
 - **Cân nhắc** nếu process hay bị `kill -9` và cần **từng** dòng cuối: `fprintf` + `fflush` mỗi dòng mất 0 dòng nhưng chậm 6–16× (1.42–4.95 µs mỗi lệnh).
 
 ## Bắt đầu nhanh

@@ -23,9 +23,12 @@
 // Alternate stack: sigaltstack() is PER THREAD. crash_install() sets one up
 // for the calling thread only (from static storage). A stack overflow in any
 // other thread can only be reported if that thread also has an alternate
-// stack; such threads should call crash_thread_init() (through
-// tblog::crash_altstack_for_this_thread()) early in their life. Faults other
-// than stack overflow are handled on the faulting thread's normal stack anyway.
+// stack: the worker and sync threads call crash_thread_init() when they start,
+// and every other thread gets one on its first log call
+// (crash_logging_thread_init, from thread_ctx()). A thread that never logs has
+// none; an overflow there still kills the process without the report. Faults
+// other than stack overflow are handled on the faulting thread's normal stack
+// anyway.
 #include "platform/platform.h"
 
 #include <atomic>
@@ -230,6 +233,15 @@ bool crash_thread_init() noexcept {
     ss.ss_size = kAltStackSize;
     ss.ss_flags = 0;
     return sigaltstack(&ss, nullptr) == 0;
+}
+
+void crash_logging_thread_init() noexcept {
+    // A crash is being handled: this may be a signal handler logging (the
+    // chained application handler, on a thread that never logged before).
+    if (g_owner_tid.load(std::memory_order_acquire) != 0) return;
+    stack_t cur;
+    if (sigaltstack(nullptr, &cur) == 0 && (cur.ss_flags & SS_ONSTACK)) return;  // in a handler
+    (void)crash_thread_init();
 }
 
 void crash_install(CrashReporter reporter) noexcept {

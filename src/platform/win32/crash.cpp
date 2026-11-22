@@ -176,6 +176,11 @@ bool crash_thread_init() noexcept {
     return SetThreadStackGuarantee(&size) != FALSE;
 }
 
+// The filter runs on what is left of the overflowing stack, which has been
+// enough on every thread measured (bench_crash_loss stack_overflow_thread:
+// 0 lines lost), so threads that only log keep their default guarantee.
+void crash_logging_thread_init() noexcept {}
+
 void crash_install(CrashReporter reporter) noexcept {
     g_reporter.store(reporter, std::memory_order_release);
     g_owner_tid.store(0, std::memory_order_release);

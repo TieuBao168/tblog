@@ -8,7 +8,12 @@ namespace tblog {
 
 ThreadContext &thread_ctx() {
     static thread_local ThreadContext ctx;  // POD: zero-initialised, no TLS ctor
-    if (TBLOG_UNLIKELY(ctx.tid == 0)) ctx.tid = pf::current_thread_id();
+    if (TBLOG_UNLIKELY(ctx.tid == 0)) {
+        // First log call of this thread: give it an alternate signal stack
+        // (POSIX), so a stack overflow here still drains the buffer.
+        pf::crash_logging_thread_init();
+        ctx.tid = pf::current_thread_id();
+    }
     return ctx;
 }
 

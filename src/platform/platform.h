@@ -203,6 +203,14 @@ void crash_uninstall() noexcept;  // restore previous handlers (and alt stack)
 // exit) so a stack overflow on it is still reported. Idempotent. Windows:
 // SetThreadStackGuarantee (room for the exception filter on overflow).
 bool crash_thread_init() noexcept;
+// Called once per thread, on its first log call (thread_ctx()), so that a
+// stack overflow on ANY thread that logs is still reported and its buffered
+// lines drained. POSIX: crash_thread_init() (one 64 KB anonymous mapping per
+// thread, untouched until a signal arrives, unmapped at thread exit); skipped
+// while a crash is being handled (the first log call may then come from a
+// signal handler, where mmap / TLS registration is not safe). Windows: no-op,
+// the filter already runs on what is left of the overflowing stack.
+void crash_logging_thread_init() noexcept;
 
 // ============================================================================
 // System log (src/platform/<os>/system_log.cpp)

@@ -447,6 +447,44 @@ TEST(segv_keeps_logs) {
     EXPECT_TRUE(s.find(kSegvMarker) > s.find("[INFO] [-] line 2999"));
 }
 
+// A secondary thread that only logs (no tblog call besides TBLOG_INFO), then
+// overflows its stack. Its first log call gives it an alternate signal stack
+// (POSIX), so the handler runs and drains the buffer. Without it, Linux and
+// macOS lost every buffered line (bench_crash_loss stack_overflow_thread).
+namespace {
+constexpr int kOverflowLines = 1500;  // < 75% of the smallest shard: stays buffered
+volatile int g_stop_recursion = 0;
+TOS_NOINLINE int recurse(int depth) {
+    volatile char pad[512];
+    pad[0] = static_cast<char>(depth);
+    if (g_stop_recursion) return pad[0];
+    return recurse(depth + 1) + pad[0];
+}
+void log_then_overflow() {
+    for (int i = 0; i < kOverflowLines; ++i) TBLOG_INFO("ovf %d", i);
+    recurse(0);
+}
+}  // namespace
+
+TINY_CHILD(stack_overflow_in_logging_thread) {
+    if (tblog_init(config(tos::child_arg(), "flush.interval_ms = 60000\n").c_str()) != 0)
+        std::_Exit(2);
+    std::thread t(&log_then_overflow);  // default stack, as bench_crash_loss
+    t.join();
+}
+TEST(stack_overflow_in_logging_thread_keeps_logs) {
+    const std::string dir = fresh("ovf_thread");
+    tos::ChildResult r = tos::run_child("stack_overflow_in_logging_thread", dir);
+    EXPECT_TRUE(tos::died_with(r, tos::Crash::StackOverflow));
+    if (!tos::died_with(r, tos::Crash::StackOverflow)) std::printf("  child: %s\n", tos::describe(r).c_str());
+    const std::string s = read_file(dir + "/app.log");
+    std::set<std::string> seen;
+    for (const auto &l : lines_of(s))
+        if (l.rfind("[INFO] [-] ovf ", 0) == 0) seen.insert(l);
+    EXPECT_EQ(seen.size(), size_t(kOverflowLines));
+    EXPECT_TRUE(s.find("*** tblog: caught") != std::string::npos);
+}
+
 TINY_CHILD(exit_without_shutdown) {
     if (tblog_init(config(tos::child_arg(), "flush.interval_ms = 60000\n").c_str()) != 0)
         std::_Exit(2);

@@ -24,9 +24,8 @@ So với `fprintf` vào một file, cùng dòng log, đo trên Linux (glibc), ma
 | Lệnh log p50, 1 thread | 321–381 ns (MinGW: 2.03 µs) | 230–311 ns | Nhanh hơn 1.3–1.7× (MinGW: 6.5×) |
 | Lệnh log p99, 4 thread | 34–139 µs | 0.48–1.8 µs | Thấp hơn 50–200×: không tranh khóa |
 | Thông lượng tới khi đã fsync, 4 thread | 213–734 k dòng/s | 1.5–6.4 M dòng/s | 2.5–13× |
-| Mất dòng khi SIGSEGV, `abort` (TB / max, 20 lần) | tới 28 / 41 | 0 | Crash handler xả buffer |
-| Mất dòng khi tràn stack trên thread phụ | tới 21 / 41 | Linux, macOS: tới 2 794 / 4 372; Windows: 0 | **tblog kém hơn** trên Linux, macOS |
-| Mất dòng khi `kill -9`, 4 thread | tới 22 / 41 | 4 612–12 614 / tới 27 654 | **tblog kém hơn**; `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối |
+| Mất dòng khi SIGSEGV, `abort`, tràn stack (TB / max, 20 lần) | tới 28 / 41 | 0 | Crash handler xả buffer |
+| Mất dòng khi `kill -9`, 4 thread | tới 25 / 41 | 4 612–15 072 / tới 23 457 | **tblog kém hơn**; `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối |
 | RAM | 4 KB | 8 MB (mặc định) | tblog tốn hơn |
 
 - **Nên dùng** khi có nhiều thread cùng log, thread làm việc không được chậm vì log, hoặc cần log còn nguyên khi crash.

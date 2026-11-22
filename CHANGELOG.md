@@ -19,9 +19,9 @@
 - **Benchmark so với `fprintf`**: `bench_vs_printf` (thông lượng, latency) và `bench_crash_loss` (mất log khi crash / `kill -9` / `exit`), workflow `bench.yml`.
 - CI trên Linux (glibc, musl), macOS, Windows. Kết quả benchmark của Linux, macOS, Windows MSVC (GitHub Actions) nằm trong `bench/results/`.
 
-### Sửa (chờ đo lại trên Linux / macOS)
+### Sửa
 
-- **Tràn stack trên thread phụ, Linux / macOS**: trước đây crash handler không chạy (thread không có alternate signal stack) và mất cả buffer (đo được TB 2 065–2 794 dòng). Giờ mỗi thread được cấp alternate stack 64 KB ở lệnh log đầu tiên của nó (một `mmap`, chưa tốn RAM thật tới khi có signal, gỡ khi thread kết thúc); các lệnh log sau không tốn thêm. Thread chưa từng log thì vẫn chưa được bảo vệ. Windows không đổi.
+- **Tràn stack trên thread phụ, Linux / macOS**: trước đây crash handler không chạy (thread không có alternate signal stack) và mất cả buffer (đo được TB 2 065–2 794 dòng). Giờ mỗi thread được cấp alternate stack 64 KB ở lệnh log đầu tiên của nó (một `mmap`, chưa tốn RAM thật tới khi có signal, gỡ khi thread kết thúc); các lệnh log sau không tốn thêm. Đo lại: 0 dòng mất ở 20/20 lần trên Linux và macOS. Thread chưa từng log thì vẫn chưa được bảo vệ. Windows không đổi.
 
 ### Sửa
 

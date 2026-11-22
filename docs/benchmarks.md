@@ -9,8 +9,8 @@ So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không 
 | Lệnh log, 1 thread | p50 nhanh hơn 1.3–1.7× (MinGW: 6.5×), p99 nhanh hơn 8–12× | Trên Linux / macOS, `fprintf` một thread đã đủ nhanh (321–375 ns p50) |
 | Lệnh log, nhiều thread | p99 0.48–1.8 µs so với 34–139 µs (4 thread) | |
 | Thông lượng | 2.5–13× ở 4 thread | Trần của một thread nền: 1.5 M (Windows CI) tới ~6 M dòng/s (Linux) |
-| Crash | 0 dòng mất ở mọi nền tảng, so với TB 17–28 | Process chết chậm hơn 0.5–9 ms. **Tràn stack trên thread phụ, Linux / macOS: mất cả buffer** |
-| `kill -9` | `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối | Mặc định mất 1 900–4 500 dòng mỗi thread (macOS VM: 6 920), so với 41 |
+| Crash, kể cả tràn stack | 0 dòng mất ở mọi nền tảng, so với TB 16–28 | Process chết chậm hơn 0.5–9 ms |
+| `kill -9` | `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối | Mặc định mất 1 900–4 500 dòng mỗi thread (macOS VM: 6 725), so với 41 |
 | Quá tải | `block`: không mất dòng | `block`: lệnh log có lúc chờ (max 2.9–36 ms); `drop`: mất tới 47% |
 | Mất điện | fsync mỗi giây và sau ERROR; `fprintf` không fsync | Không biến thể nào an toàn tuyệt đối |
 
@@ -23,7 +23,7 @@ So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không 
 | macOS | GitHub Actions, Apple M1 (VM), 3 CPU, macOS 26, clang 21 | VM dùng chung; đồng hồ bước 41 ns |
 | Windows CI | GitHub Actions, EPYC 9V45, 4 CPU, Windows Server 2025, MSVC 19.52 | VM dùng chung; đĩa chậm (fsync) |
 
-Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một máy, không so giữa các máy. Laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy.
+Số hiệu năng của CI lấy từ lần chạy bench đầu (commit `47e4c97`, máy như bảng trên). Số mất log lấy từ lần chạy sau bản sửa tràn stack (commit `12fb37d`); lần đó Linux chạy trên Xeon Platinum 8370C và Windows trên EPYC 7763 (vẫn 4 CPU). Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một máy, không so giữa các máy. Laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy.
 
 ## So sánh giữa các nền tảng
 
@@ -48,21 +48,19 @@ Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một m�
 
 | Kịch bản | Nền tảng | `fprintf` | tblog | + `flush.on_level` |
 |---|---|---|---|---|
-| SIGSEGV, 4 thread khác đang log | Mọi nền tảng | 16.6–19.2 / 41 | 0 | 0 |
+| SIGSEGV, 4 thread khác đang log | Mọi nền tảng | 15.8–19.4 / 40 | 0 | 0 |
 | `abort`, `assert`, exception | Linux | 18.8–21.1 / 40 | 0 | 0 |
 | | macOS, Windows | 0 (libc xả stdio) | 0 | 0 |
-| Tràn stack, thread phụ | Linux | 20.6 / 41 | **2 065 / 3 823** | 56 / 96 ¹ |
-| | macOS | 20.2 / 39 | **2 794 / 4 372** | 56 / 96 ¹ |
-| | Windows | 20.6 / 41 | 0 | 0 |
-| `kill -9`, 4 thread | Linux | 20.4 / 38 | 7 034 / 14 854 | 235 / 382 ¹ |
-| | macOS | 17.4 / 40 | 12 614 / 27 654 | 150 / 345 ¹ |
-| | Windows CI | 16.1 / 39 | 8 063 / 15 676 | 344 / 396 ¹ |
+| Tràn stack, thread phụ | Mọi nền tảng | 20.2–20.6 / 41 | 0 | 0 |
+| `kill -9`, 4 thread | Linux | 25.1 / 41 | 7 000 / 14 886 | 203 / 396 ¹ |
+| | macOS | 20.4 / 37 | 15 072 / 23 457 | 198 / 382 ¹ |
+| | Windows CI | 16.5 / 39 | 9 344 / 17 825 | 320 / 396 ¹ |
 | `_Exit` | Linux | 17.6 / 35 | 2 206 / 3 771 | 56 / 96 ¹ |
 
 ¹ 0 dòng mất tới dòng ERROR cuối, ở mọi nền tảng.
 
-- **Tràn stack trên thread phụ là lỗ hổng thật trên Linux / macOS**: thread đó không có alternate signal stack nên handler của tblog không chạy, tệ hơn cả `fprintf`. Trên macOS process còn chết bằng SIGILL thay vì SIGBUS.
-- **`kill -9` trên máy 4 CPU mất nhiều hơn laptop**: shard 1 MB nên giới hạn là 200 ms log (~4 000 dòng ở 20 k dòng/s), không phải 75% shard. Tối đa mỗi thread: 3 714 (Linux), 4 510 (Windows CI), 6 920 (macOS VM, vượt giới hạn: chưa rõ nguyên nhân).
+- **Tràn stack trên thread phụ, Linux / macOS**: trước commit `12fb37d` mất cả buffer (TB 2 065 dòng trên Linux, 2 794 trên macOS; macOS còn chết bằng SIGILL), vì chỉ thread gọi `tblog_init`, worker và thread sync có alternate signal stack. Giờ mỗi thread được cấp một stack ở lệnh log đầu tiên: 0 dòng mất, có dòng báo crash ở 20/20 lần, macOS chết bằng SIGBUS như dự kiến.
+- **`kill -9` trên máy 4 CPU mất nhiều hơn laptop**: shard 1 MB nên giới hạn là 200 ms log (~4 000 dòng ở 20 k dòng/s), không phải 75% shard. Tối đa mỗi thread: 3 722 (Linux), 4 460 (Windows CI), 6 725 (macOS VM, vượt giới hạn: chưa rõ nguyên nhân).
 - **`flush.on_level = ERROR` + `sync.on_level = ERROR`**, 1% dòng ERROR, 1 thread: lệnh ERROR 39 µs p50 (Linux), 37 µs (macOS), 2.92 ms (Windows CI), 2.69 ms (laptop). Việc phải chờ fsync chỉ xảy ra trên Windows.
 - `drop` ở 8 thread trên Windows CI bỏ 47% số dòng (466 k / 1 M): đĩa chậm làm thread nền ghi chậm.
 - Kịch bản paced với 8 thread không có ý nghĩa trên máy CI 3–4 CPU: 8 thread chờ bận chiếm hết CPU của cả thread nền.
@@ -159,7 +157,7 @@ Flood 200 k dòng, p50 / p99 của lệnh ERROR:
 - `fprintf_buffered` để lại dòng cụt ở cuối file ở 19–20/20 lần với SIGSEGV, stack overflow và `kill -9`.
 - `kill -9` của tblog: tối đa 1 939 dòng một thread, khớp với dự đoán: 16 CPU → shard 256 KB, thread nền được đánh thức khi đầy 75% ≈ 1 900 dòng.
 - `fprintf_buffered` không mất gì với `abort` và `_Exit`: CRT `msvcrt.dll` của MinGW xả stream khi process thoát. glibc thì không: trên Linux `fprintf` mất TB 21 dòng với `abort` ([xem trên](#so-sánh-giữa-các-nền-tảng)).
-- Tràn stack trên thread phụ không mất gì trên Windows; trên Linux / macOS thì có, xem phần so sánh ở trên.
+- Tràn stack trên thread phụ không mất gì trên Windows; Linux / macOS: xem phần so sánh ở trên.
 - Thời gian từ lúc gây crash tới khi process kết thúc: tblog 2.4 ms so với 1.6 ms của `fprintf` (1 thread), 10.3 ms so với 1.5 ms (4 thread khác đang log).
 
 ## Chạy lại

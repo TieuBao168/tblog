@@ -113,7 +113,7 @@ RAM dùng = 2 × max(`buffer.size`, N × 64 KB), N = số shard (lũy thừa c�
 - **Nhỏ (`256KB`)**: tiết kiệm RAM (4 CPU: 512 KB).
 - Ảnh hưởng tới số dòng mất khi `kill -9`. Mỗi thread mất tối đa phần nhỏ hơn trong hai giới hạn: 75% một shard, hoặc lượng log trong một `flush.interval_ms`. Đo ở 20 k dòng/s mỗi thread:
   - 16 CPU: shard 256 KB, 75% ≈ 1 900 dòng; đo được tối đa 1 939.
-  - 4 CPU: shard 1 MB, 75% ≈ 7 500 dòng, nên giới hạn 200 ms ≈ 4 000 dòng thắng; đo được tối đa 3 714 (Linux), 4 510 (Windows).
+  - 4 CPU: shard 1 MB, 75% ≈ 7 500 dòng, nên giới hạn 200 ms ≈ 4 000 dòng thắng; đo được tối đa 3 722 (Linux), 4 460 (Windows), 6 725 (macOS VM, vượt giới hạn, chưa rõ nguyên nhân).
 
 ### File: xoay, giữ, nén
 
@@ -154,8 +154,7 @@ Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. D�
 
 | Sự cố | Mặc định mất | Bảo vệ |
 |---|---|---|
-| Crash (SIGSEGV, `abort`, exception; Windows: SEH) | 0 (đo được) | Không cần |
-| Tràn stack | Thread gọi `tblog_init`, và mọi thread trên Windows: 0. Thread khác trên Linux / macOS: handler không chạy được, mất cả buffer (TB 2 065–2 794 dòng) | `flush.on_level` giới hạn phần mất |
+| Crash (SIGSEGV, `abort`, exception, tràn stack; Windows: SEH) | 0 (đo được) | Không cần. Ngoại lệ: tràn stack trên thread **chưa từng log** (Linux / macOS) thì handler không chạy được, mất như `kill -9` |
 | `exit()`, `return` từ `main` | 0 | Không cần |
 | `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Tới 75% một shard hoặc một `flush.interval_ms` log mỗi thread (đo được 1 900–4 500 dòng, xem [`buffer.size`](#buffersize-ram)) | `flush.on_level`, `tblog_flush()` ở điểm quan trọng |
 | Flood quá trần | 0 (`block` chờ) | `buffer.size`; `drop` thì mất dòng nhưng không chờ |

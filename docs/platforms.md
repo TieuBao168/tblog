@@ -12,7 +12,7 @@ Mọi nền tảng: file mở ở chế độ append, handle không kế thừa 
 
 ## Linux
 
-- **Tràn stack trên thread phụ** (thread không gọi `tblog_init`): thread đó không có alternate signal stack nên crash handler không chạy, phần trong buffer bị mất (đo được TB 2 065, max 3 823 dòng). macOS cũng vậy. Các crash khác không bị ảnh hưởng.
+- **Tràn stack**: chỉ báo được trên thread có alternate signal stack. tblog cấp cho mỗi thread 64 KB bộ nhớ ảo ở lệnh log đầu tiên của nó, nên mọi thread đã log đều được bảo vệ (đo được 0 dòng mất; trước đây TB 2 065 dòng). Thread chưa từng log thì không. macOS cũng vậy.
 - `abort()` của glibc không xả stdio: ở đây `fprintf` mất TB 21 dòng còn tblog mất 0.
 - glibc và musl đều được CI chạy toàn bộ test. musl không in call stack khi crash (vẫn xả log). `-DTBLOG_NO_BACKTRACE` tắt call stack ở mọi nơi.
 - TSan trên kernel mới cần tắt ASLR (`setarch $(uname -m) -R`); CTest và `make SAN=thread test` tự làm.
@@ -27,7 +27,7 @@ Mọi nền tảng: file mở ở chế độ append, handle không kế thừa 
 ## macOS
 
 - `fsync` của macOS chỉ đẩy dữ liệu tới ổ đĩa, ổ vẫn có thể giữ trong cache. tblog dùng `F_FULLFSYNC` để "đã sync" có cùng nghĩa như trên Linux. **Nhược**: mỗi lần sync tốn cỡ ms, nên `tblog_flush()` chờ lâu hơn; lệnh log không bị ảnh hưởng (sync chạy trên thread riêng).
-- Tràn stack trên thread phụ: handler không chạy, mất phần trong buffer (đo được TB 2 794, max 4 372 dòng), và process chết bằng SIGILL thay vì SIGBUS.
+- Tràn stack trên thread phụ đến dưới dạng SIGBUS; được báo và xả buffer như Linux (đo được 0 dòng mất). Trên thread không có alternate stack, macOS giết process bằng SIGILL thay vào đó.
 
 ## Windows
 

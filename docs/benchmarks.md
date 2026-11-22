@@ -65,6 +65,48 @@ Số hiệu năng của CI lấy từ lần chạy bench đầu (commit `47e4c97
 - `drop` ở 8 thread trên Windows CI bỏ 47% số dòng (466 k / 1 M): đĩa chậm làm thread nền ghi chậm.
 - Kịch bản paced với 8 thread không có ý nghĩa trên máy CI 3–4 CPU: 8 thread chờ bận chiếm hết CPU của cả thread nền.
 
+## So với spdlog và Quill
+
+spdlog 1.17.0 (bản async) và Quill 13.1.0, mỗi thư viện dùng cấu hình mặc định, chỉ ghi file, cùng một dòng log. Mỗi lần đo chạy trong một process riêng (backend của Quill chỉ khởi động được một lần mỗi process). Đo trên laptop (MinGW); kết quả: [hiệu năng](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-22-libs.json), [mất log](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-22-libs-crash.json).
+
+| | tblog | spdlog async | Quill |
+|---|---|---|---|
+| Lệnh log p50 / p99, 1 thread | 190 / 321 ns | 220 ns / 9.54 µs | **20 / 30 ns** |
+| Lệnh log p50 / p99, 8 thread | 190 / 351 ns | 25.7 / 186 µs | **20 / 40 ns** |
+| Lệnh log p50 / p99, 16 thread | 330 / 601 ns | 68.8 / 356 µs | **40 / 70 ns** |
+| Thông lượng tới khi đã fsync, 1 thread | **2.75 M/s** | 1.21 M/s | 1.74 M/s |
+| Thông lượng tới khi đã fsync, 8 thread | **5.41 M/s** | 200 k/s | 1.57 M/s |
+| Thông lượng tới khi đã fsync, 16 thread | **4.04 M/s** [1.36–6.35 M] | 186 k/s | 1.40 M/s |
+| 50 k dòng/s mỗi thread, 8 thread, p50 / p99 | 208 / 453 ns | 340 ns / 2.69 µs | **40 / 99 ns** |
+
+**Mất log** (20 lần thử, TB / max dòng):
+
+| Kịch bản | spdlog | Quill | Quill + signal handler | tblog | tblog + `flush.on_level` |
+|---|---|---|---|---|---|
+| SIGSEGV trên thread đang log | 20.1 / 41 | 550 / 855 | **0** | **0** | **0** |
+| SIGSEGV, 4 thread khác đang log | 24.9 / 39 | 1 530 / 5 504 | 178 / 1 339 | **0** | **0** |
+| `abort`, `assert`, exception | 0–31 / 403 ¹ | 470–493 / 1 133 | **0** | **0** | **0** |
+| Tràn stack (thread init / thread phụ) | 17–22 / 40 | 425–487 / 850 | **0** | **0** | **0** |
+| `kill -9`, 4 thread | **22 / 41** | 1 558 / 3 102 | 1 434 / 1 854 | 4 366 / 7 354 | 188 / 396 ² |
+| `_Exit` | 0 ¹ | 571 / 1 118 | 605 / 1 118 | 952 / 1 830 | 56 / 96 ² |
+
+¹ Nhờ CRT của MinGW tự xả stdio khi process thoát (như `fprintf`); `abort` vẫn mất ở 2/20 lần, tới 403 dòng. Trên glibc thì khác: chưa đo.
+² 0 dòng mất tính tới dòng ERROR cuối.
+
+- **Quill nhanh hơn tblog 5–10× ở phía thread gọi log**: thread gọi log chỉ chép đối số, backend mới format. Đổi lại một backend format mọi dòng, nên thông lượng thấp hơn tblog 1.6–3.4×, và queue không giới hạn tự nở thêm (đã thấy tới 2 MB mỗi thread).
+- **spdlog không mở rộng theo số thread**: mọi thread dùng chung một queue có khóa, thông lượng giảm 1.21 M → 186 k dòng/s từ 1 lên 16 thread. Ở tốc độ đều 50 k dòng/s, mỗi lệnh tốn ~1.5 µs vì phải đánh thức thread nền đang ngủ.
+- **Crash: tblog là thư viện duy nhất mất 0 dòng ở mọi kịch bản.** Signal handler của Quill bỏ sót crash trên thread khác (TB 178, max 1 339 dòng), đổi SIGSEGV thành `abort` (mã thoát 3 thay vì 0xC0000005: WER / debugger không thấy lỗi gốc), và ghi thêm 2 dòng thông báo vào log (cột "corrupt" trong JSON).
+- **`kill -9`: spdlog mất ít nhất**: ở 20 k dòng/s thread nền ghi gần như ngay, chỉ còn buffer stdio (~40 dòng). tblog cố ý gom 200 ms để ghi theo lô nên mất nhiều nhất; `flush.on_level = ERROR` giữ được dòng lỗi.
+
+| Cần gì | Nên chọn |
+|---|---|
+| Lệnh log nhanh nhất | Quill |
+| Nhiều thread, thông lượng cao | tblog |
+| Không mất log khi crash | tblog |
+| Process hay bị `kill -9`, cần cả dòng INFO cuối | spdlog, hoặc tblog + `flush.on_level` |
+
+Chỉ đo trên một máy Windows; Linux và macOS: chạy `bench.yml` với ô **compare** (xem [Chạy lại](#chạy-lại)).
+
 ## Cách đo
 
 | Biến thể | Mỗi dòng |
@@ -172,5 +214,15 @@ python3 -I bench/report.py bench/results/*.json                 # bảng đầy 
 
 - MSVC: file chạy ở `build-bench/bin/Release/`. Linux: `make bench`.
 - `--quick` để chạy nhanh; `--help` xem mọi option (số thread, biến thể, kịch bản, `--keep` giữ file log của từng lần thử).
-- GitHub: Actions → **bench** → *Run workflow*: chạy trên Linux, macOS, Windows (MSVC) và ghi bảng vào job summary. Máy CI nhiễu: chỉ so các biến thể với nhau trên cùng runner.
+- GitHub: Actions → **bench** → *Run workflow*: chạy trên Linux, macOS, Windows (MSVC) và ghi bảng vào job summary. Máy CI nhiễu: chỉ so các biến thể với nhau trên cùng runner. Ô chọn branch cho phép đo một branch bất kỳ (workflow và code lấy từ branch đó), không cần merge vào `main`; dòng lệnh: `gh workflow run bench.yml --ref <branch> -f compare=true`.
+- So với spdlog và Quill: thêm `-DTBLOG_BENCH_COMPARE=ON` khi configure (tải hai thư viện, cần CMake 3.18+), rồi:
+
+  ```bash
+  cmake --build build-bench --config Release --target bench_vs_libs bench_crash_loss
+  ./build-bench/bench/bench_vs_libs --out-dir bench/results     # ~5 phút
+  ./build-bench/bench/bench_crash_loss --out-dir bench/results \
+      --variants fprintf_buffered,tblog,tblog_flush_error,spdlog_async,quill,quill_sighandler
+  ```
+
+  Trên GitHub: tick ô **compare** khi *Run workflow*.
 - CTest `bench_vs_printf_smoke`, `bench_crash_loss_smoke` chỉ kiểm tra chương trình chạy hết, không phải phép đo.

@@ -47,6 +47,7 @@ option(TBLOG_BUILD_SHARED   "tblog::tblog refers to the shared library (OFF: sta
 option(TBLOG_BUILD_TESTS    "Build tests/unit/*.cpp and register them with CTest" OFF)
 option(TBLOG_BUILD_EXAMPLES "Build examples/*.c and examples/*.cpp" OFF)
 option(TBLOG_BUILD_BENCH    "Build bench/bench_vs_printf.cpp and bench/bench_crash_loss.cpp" OFF)
+option(TBLOG_BENCH_COMPARE  "With TBLOG_BUILD_BENCH: download spdlog and Quill, build bench/bench_vs_libs.cpp and their bench_crash_loss variants" OFF)
 option(TBLOG_WERROR         "Treat compiler warnings as errors" OFF)
 set(TBLOG_CXX_STANDARD 17 CACHE STRING "C++ standard used to build tblog (11, 14 or 17)")
 set_property(CACHE TBLOG_CXX_STANDARD PROPERTY STRINGS 11 14 17)
@@ -494,6 +495,46 @@ if(TBLOG_BUILD_BENCH)
       set_tests_properties(${_bench}_smoke PROPERTIES TIMEOUT 600)
     endif()
   endforeach()
+
+  # TBLOG_BENCH_COMPARE: the same benchmarks against spdlog (async) and Quill.
+  # Only their sources are downloaded (pinned release + SHA-256); their own
+  # CMake projects are not added, and their headers are SYSTEM includes so that
+  # their warnings do not trip -Werror. Both are header-only here. Quill needs
+  # C++17. No smoke test: CI does not download third-party code.
+  if(TBLOG_BENCH_COMPARE)
+    if(CMAKE_VERSION VERSION_LESS 3.18)
+      message(FATAL_ERROR "TBLOG_BENCH_COMPARE needs CMake 3.18 or newer")
+    endif()
+    if(TBLOG_CXX_STANDARD LESS 17)
+      message(FATAL_ERROR "TBLOG_BENCH_COMPARE needs TBLOG_CXX_STANDARD=17 (Quill)")
+    endif()
+    include(FetchContent)
+    FetchContent_Declare(tblog_bench_spdlog
+      URL https://github.com/gabime/spdlog/archive/refs/tags/v1.17.0.tar.gz
+      URL_HASH SHA256=d8862955c6d74e5846b3f580b1605d2428b11d97a410d86e2fb13e857cd3a744
+      SOURCE_SUBDIR tblog-no-cmake)   # download only: no add_subdirectory
+    FetchContent_Declare(tblog_bench_quill
+      URL https://github.com/odygrd/quill/archive/refs/tags/v13.1.0.tar.gz
+      URL_HASH SHA256=a08b93bafc7e712b28eb47e4a1ed9b60fc01ac7fad3ce269f1f100560a506a85
+      SOURCE_SUBDIR tblog-no-cmake)
+    FetchContent_MakeAvailable(tblog_bench_spdlog tblog_bench_quill)
+    set(_cmp_inc "${tblog_bench_spdlog_SOURCE_DIR}/include" "${tblog_bench_quill_SOURCE_DIR}/include")
+    message(STATUS "tblog: bench comparison with spdlog 1.17.0 and Quill 13.1.0: ON")
+
+    add_executable(bench_vs_libs "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_vs_libs.cpp")
+    target_link_libraries(bench_vs_libs PRIVATE tblog_static)
+    tblog_target_flags(bench_vs_libs)
+    tblog_enable_exports(bench_vs_libs)
+    tblog_runtime_dir(bench_vs_libs bench)
+    set_target_properties(bench_vs_libs PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    foreach(_t bench_vs_libs bench_crash_loss)
+      target_include_directories(${_t} SYSTEM PRIVATE ${_cmp_inc})
+      target_compile_definitions(${_t} PRIVATE TBLOG_BENCH_COMPARE=1)
+      if(MSVC)
+        target_compile_options(${_t} PRIVATE /bigobj)
+      endif()
+    endforeach()
+  endif()
 endif()
 
 # ---- install + package config -------------------------------------------------

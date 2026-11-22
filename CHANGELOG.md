@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Thêm
+
+- **So sánh với spdlog (async) và Quill**: option CMake `TBLOG_BENCH_COMPARE` (tải hai thư viện, ghim bản phát hành + SHA-256), chương trình `bench/bench_vs_libs` (mỗi lần đo một process) và các biến thể `spdlog_async`, `quill`, `quill_sighandler` của `bench_crash_loss`; ô `compare` trong workflow `bench.yml`. Kết quả và kết luận: [docs/benchmarks.md](docs/benchmarks.md#so-với-spdlog-và-quill).
+
 ## 0.1.0 (2026-11-22)
 
 Bản phát hành đầu tiên.

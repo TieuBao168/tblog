@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the JSON results of bench_vs_printf / bench_crash_loss as Markdown.
+"""Render the JSON results of bench_vs_printf / bench_vs_libs / bench_crash_loss as Markdown.
 
     python3 -I bench/report.py bench/results/*.json            # full tables
     python3 -I bench/report.py --compact bench/results/*.json  # README-sized tables
@@ -78,7 +78,7 @@ def grid(doc, scenario):
 
 def perf_full(doc):
     env, cfg = doc["env"], doc["config"]
-    out = ["### Performance: bench_vs_printf", "",
+    out = ["### Performance: " + cfg.get("program", "bench_vs_printf"), "",
            "Machine: " + machine_line(env), "",
            "Label: %s. Runs per cell: %s (after %s warm-up, discarded); median [min–max] across runs. "
            "Per-call timer: %s, overhead %s per call (included in every latency); steady_clock step %s ns." % (
@@ -288,14 +288,16 @@ def main():
         schema = doc.get("schema", "")
         if a.compact:
             parts.append("Machine: " + machine_line(doc["env"]) + "\n")
-            if schema.startswith("tblog-bench-vs-printf"):
+            if schema.startswith("tblog-bench-vs-libs"):
+                parts.append(perf_compact(doc, doc["config"]["variants"], [int(x) for x in a.threads.split(",")]))
+            elif schema.startswith("tblog-bench-vs-printf"):
                 parts.append(perf_compact(doc, a.variants.split(","), [int(x) for x in a.threads.split(",")]))
                 if flush_rows(doc):
                     parts += ["", flush_compact(doc, [int(x) for x in a.threads.split(",")])]
             elif schema.startswith("tblog-bench-crash-loss"):
                 parts.append(crash_compact(doc, a.crash_variants.split(",")))
             parts.append("")
-        elif schema.startswith("tblog-bench-vs-printf"):
+        elif schema.startswith("tblog-bench-vs-printf") or schema.startswith("tblog-bench-vs-libs"):
             parts.append(perf_full(doc))
         elif schema.startswith("tblog-bench-crash-loss"):
             parts.append(crash_full(doc))

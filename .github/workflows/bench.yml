@@ -1,9 +1,14 @@
 name: bench
 
-# Manual only (Actions tab -> bench -> Run workflow). Builds the two bench
-# programs (Release, static tblog) and runs them on GitHub's hosted runners:
+# Manual only (Actions tab -> bench -> Run workflow; pick the branch there).
+# Builds the bench programs (Release, static tblog) and runs them on GitHub's
+# hosted runners:
 #   bench/bench_vs_printf   tblog vs plain fprintf: throughput, per-call latency
 #   bench/bench_crash_loss  log lines lost on crash / kill / exit
+# With "compare" ticked, CMake also downloads spdlog and Quill
+# (-DTBLOG_BENCH_COMPARE=ON) and the run adds:
+#   bench/bench_vs_libs     tblog vs spdlog (async) vs Quill: throughput, latency
+#   bench_crash_loss variants spdlog_async, quill, quill_sighandler
 # The JSON results are uploaded as artifacts and rendered into the job
 # summary by bench/report.py. Shared CI VMs are noisy: compare the variants
 # within one runner, do not read the numbers as absolute figures
@@ -19,6 +24,10 @@ on:
         default: '20'
       quick:
         description: 'Smoke run only (--quick)'
+        type: boolean
+        default: false
+      compare:
+        description: 'Also compare with spdlog (async) and Quill (downloads both)'
         type: boolean
         default: false
 
@@ -45,28 +54,45 @@ jobs:
 
       # Windows: the default Visual Studio generator (MSVC, multi-config).
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTBLOG_BUILD_BENCH=ON -DTBLOG_WITH_ZLIB=OFF
+        env:
+          COMPARE: ${{ inputs.compare }}
+        run: |
+          cmp=OFF; if [ "$COMPARE" = true ]; then cmp=ON; fi
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTBLOG_BUILD_BENCH=ON -DTBLOG_WITH_ZLIB=OFF \
+            -DTBLOG_BENCH_COMPARE=$cmp
 
       - name: Build
-        run: cmake --build build --config Release --parallel --target bench_vs_printf bench_crash_loss
+        env:
+          COMPARE: ${{ inputs.compare }}
+        run: |
+          targets="bench_vs_printf bench_crash_loss"
+          if [ "$COMPARE" = true ]; then targets="$targets bench_vs_libs"; fi
+          cmake --build build --config Release --parallel --target $targets
 
-      - name: Run bench_vs_printf and bench_crash_loss
+      - name: Run the benchmarks
         env:
           RUNS: ${{ inputs.runs }}
           TRIALS: ${{ inputs.trials }}
           QUICK: ${{ inputs.quick }}
+          COMPARE: ${{ inputs.compare }}
         run: |
           set -eu
           bin=build/bench
           if [ -d build/bin/Release ]; then bin=build/bin/Release; fi   # Windows (MSVC)
           perf_opts="--runs $RUNS"; crash_opts="--trials $TRIALS"
           if [ "$QUICK" = true ]; then perf_opts=--quick; crash_opts=--quick; fi
+          variants=fprintf_buffered,fprintf_flush,tblog,tblog_flush_error
+          if [ "$COMPARE" = true ]; then variants="$variants,spdlog_async,quill,quill_sighandler"; fi
           info="CMake Release, $(cmake --version | head -n 1), GitHub-hosted $RUNNER_OS runner (${ImageOS:-?} ${ImageVersion:-?})"
           label="shared CI VM - noisy, for relative comparison"
           mkdir -p results
           "$bin/bench_vs_printf" $perf_opts --out-dir results \
             --commit "$GITHUB_SHA" --label "$label" --build-info "$info"
-          "$bin/bench_crash_loss" $crash_opts --out-dir results \
+          if [ "$COMPARE" = true ]; then
+            "$bin/bench_vs_libs" $perf_opts --out-dir results \
+              --commit "$GITHUB_SHA" --label "$label" --build-info "$info"
+          fi
+          "$bin/bench_crash_loss" $crash_opts --variants "$variants" --out-dir results \
             --commit "$GITHUB_SHA" --label "$label" --build-info "$info"
           ls -l results
 

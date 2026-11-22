@@ -25,6 +25,8 @@
 // config except file only; full_policy = block, the default),
 // tblog_flush_error (tblog + flush.on_level = ERROR; every 100th line of a
 // thread is an ERROR line), and on request tblog_drop, fprintf_unbuffered.
+// Built with TBLOG_BENCH_COMPARE (CMake option, downloads both libraries):
+// also spdlog_async, quill and quill_sighandler, on request (--variants).
 // For variants with ERROR lines the parent also counts the INFO and the
 // ERROR lines lost, and the lines lost up to each thread's last acknowledged
 // ERROR line (flush.on_level promises 0 there, even for kill -9 / _Exit).
@@ -32,6 +34,18 @@
 #include <cassert>
 
 #include "bench_common.h"
+
+#if TBLOG_BENCH_COMPARE
+#include "spdlog/async.h"
+#include "spdlog/sinks/basic_file_sink.h"
+#include "spdlog/spdlog.h"
+
+#include "quill/Backend.h"
+#include "quill/Frontend.h"
+#include "quill/LogMacros.h"
+#include "quill/Logger.h"
+#include "quill/sinks/FileSink.h"
+#endif
 
 #include <cerrno>
 #include <csignal>
@@ -106,7 +120,7 @@ const Scenario *find_scenario(const std::string &n) {
     return nullptr;
 }
 
-enum Kind { kStdio, kStdioFlush, kTblog };
+enum Kind { kStdio, kStdioFlush, kTblog, kSpdlog, kQuill, kQuillSig };
 
 struct Variant {
     const char *name;
@@ -131,6 +145,13 @@ const Variant kVariants[] = {
     {"tblog_flush_error", kTblog, "block", false, "flush.on_level = ERROR\n", kErrorEvery,
      "as tblog + flush.on_level=ERROR; every 100th line of each thread is TBLOG_ERROR (same text)"},
     {"tblog_drop", kTblog, "drop", false, "", 0, "as tblog, full_policy=drop"},
+#if TBLOG_BENCH_COMPARE
+    {"spdlog_async", kSpdlog, "", false, "", 0,
+     "spdlog 1.17.0 async_logger: thread pool queue 8192, 1 thread, overflow block (the defaults); basic_file_sink"},
+    {"quill", kQuill, "", false, "", 0, "Quill 13.1.0, default FrontendOptions / BackendOptions, FileSink; no signal handler"},
+    {"quill_sighandler", kQuillSig, "", false, "", 0,
+     "as quill, Backend::start with SignalHandlerOptions{} (Quill's crash handler; Windows: init_signal_handler per thread)"},
+#endif
 };
 
 const Variant *find_variant(const std::string &n) {
@@ -207,6 +228,10 @@ static_assert(sizeof(Shared) <= 4096, "Shared must fit the mapping");
 Shared *g_sh = nullptr;
 FILE *g_file = nullptr;
 Kind g_kind = kStdio;
+#if TBLOG_BENCH_COMPARE
+std::shared_ptr<spdlog::logger> g_spd;
+quill::Logger *g_quill = nullptr;
+#endif
 long g_error_every = 0;
 uint64_t g_rate = 0;
 std::atomic<int> g_zero{0};
@@ -269,6 +294,18 @@ inline void log_line(int t, long i) {
         if (err) g_sh->last_error[t].v.store(i, std::memory_order_release);
         return;
     }
+#if TBLOG_BENCH_COMPARE
+    if (g_kind == kSpdlog) {
+        SPDLOG_LOGGER_INFO(g_spd, "iteration {} value={} name={}", i, (int)(i * 7 % 1000), kNames[t]);
+        g_sh->acked[t].v.store(i, std::memory_order_release);
+        return;
+    }
+    if (g_kind == kQuill || g_kind == kQuillSig) {
+        LOG_INFO(g_quill, "iteration {} value={} name={}", i, (int)(i * 7 % 1000), kNames[t]);
+        g_sh->acked[t].v.store(i, std::memory_order_release);
+        return;
+    }
+#endif
     BENCH_FPRINTF_LINE(g_file, i, kNames[t], g_kind == kStdioFlush);
     g_sh->acked[t].v.store(i, std::memory_order_release);  // the call returned
 }
@@ -276,6 +313,10 @@ inline void log_line(int t, long i) {
 // Logs lines 1..n (n < 0: until the cap) at g_rate lines/s; returns false if
 // the cap was hit (the scenario's end never came).
 bool log_lines(int t, long n) {
+#if TBLOG_BENCH_COMPARE && defined(_WIN32)
+    // Quill on Windows: the CRT signal handler (abort, ...) is per thread.
+    if (g_kind == kQuillSig) quill::init_signal_handler<quill::FrontendOptions>();
+#endif
     const long cap = (long)std::max<uint64_t>(g_rate, 1000) * 30;
     const uint64_t period = g_rate ? 1000000000ull / g_rate : 0;
     const uint64_t start = now_ns();
@@ -302,6 +343,33 @@ int child_main(const Args &a) {
     g_error_every = var->error_every;
     if (g_kind == kTblog) {
         if (tblog_init((dir + "/log.conf").c_str()) != 0) return 92;
+#if TBLOG_BENCH_COMPARE
+    } else if (g_kind == kSpdlog) {
+        spdlog::init_thread_pool(8192, 1);
+        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(dir + "/app.log", true);
+        g_spd = std::make_shared<spdlog::async_logger>("bench", sink, spdlog::thread_pool(),
+                                                       spdlog::async_overflow_policy::block);
+        g_spd->set_pattern("%Y-%m-%d %H:%M:%S.%f [INFO] [%t] %s:%# - %v");  // only INFO is logged
+    } else if (g_kind == kQuill || g_kind == kQuillSig) {
+        if (g_kind == kQuillSig) {
+#if defined(_WIN32)
+            quill::init_signal_handler<quill::FrontendOptions>();
+#endif
+            quill::Backend::start<quill::FrontendOptions>(quill::BackendOptions{}, quill::SignalHandlerOptions{});
+        } else {
+            quill::Backend::start();
+        }
+        auto sink = quill::Frontend::create_or_get_sink<quill::FileSink>(dir + "/app.log", [] {
+            quill::FileSinkConfig cfg;
+            cfg.set_open_mode('w');
+            return cfg;
+        }());
+        quill::PatternFormatterOptions pfo;
+        pfo.format_pattern = "%(time) [%(log_level)] [%(thread_id)] %(file_name):%(line_number) - %(message)";
+        pfo.timestamp_pattern = "%Y-%m-%d %H:%M:%S.%Qus";
+        pfo.timestamp_timezone = quill::Timezone::LocalTime;
+        g_quill = quill::Frontend::create_or_get_logger("bench", std::move(sink), pfo);
+#endif
     } else {
         g_file = std::fopen((dir + "/app.log").c_str(), "wb");
         if (!g_file) return 93;
@@ -787,7 +855,8 @@ void usage() {
         "  --scenarios LIST      default: all (segv_main,segv_other_thread,abort,assert,uncaught_exception,\n"
         "                        stack_overflow,stack_overflow_thread,kill_hard,exit,_Exit)\n"
         "  --variants LIST       fprintf_buffered,fprintf_flush,tblog,tblog_flush_error (default);\n"
-        "                        also tblog_drop, fprintf_unbuffered\n"
+        "                        also tblog_drop, fprintf_unbuffered; with TBLOG_BENCH_COMPARE:\n"
+        "                        spdlog_async, quill, quill_sighandler\n"
         "  --rate N              lines/s per logging thread in the child (default 20000; 0 = flood)\n"
         "  --min-lines N --max-lines N   N lines before the trigger (default rate/20 .. rate/4)\n"
         "  --min-ms N --max-ms N         random delay of segv_other_thread / kill_hard (default 50 .. 250)\n"

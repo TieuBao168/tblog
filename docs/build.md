@@ -26,6 +26,7 @@ cmake --install build --prefix /usr/local
 | `TBLOG_CXX_STANDARD` | `17` | Chuẩn C++ để build thư viện: `11`, `14`, `17` (MSVC: từ `14`). Không ràng buộc ứng dụng |
 | `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
 | `TBLOG_BUILD_TESTS` / `_EXAMPLES` / `_BENCH` | `OFF` | Test, ví dụ, benchmark |
+| `TBLOG_BENCH_COMPARE` | `OFF` | Cùng `TBLOG_BUILD_BENCH`: tải spdlog 1.17.0 và Quill 13.1.0 (ghim SHA-256), build `bench_vs_libs` và các biến thể so sánh của `bench_crash_loss` ([benchmarks.md](benchmarks.md#so-với-spdlog-và-quill)). Cần CMake 3.18+, C++17 |
 | `TBLOG_WERROR` | `OFF` | Warning là lỗi |
 | `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` (kết hợp bằng dấu phẩy) |
 | `TBLOG_HEADERS_ONLY_CHECK` | `OFF` | Chỉ biên dịch thử header công khai |

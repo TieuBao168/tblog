@@ -47,7 +47,15 @@ target_link_libraries(app PRIVATE tblog::tblog)
 ```
 
 - Target: `tblog::tblog`, `tblog::tblog_static`, `tblog::tblog_shared`. Package tự kéo `Threads` và `ZLIB` khi cần.
-- Từ mã nguồn: `add_subdirectory(third_party/tblog)` hoặc FetchContent, cùng các target. Windows: `tblog.dll` được ghi vào `CMAKE_RUNTIME_OUTPUT_DIRECTORY` của project cha nếu có.
+- Từ mã nguồn: `add_subdirectory(third_party/tblog)`, hoặc FetchContent (CMake 3.14+) ghim theo tag:
+
+  ```cmake
+  include(FetchContent)
+  FetchContent_Declare(tblog GIT_REPOSITORY https://github.com/TieuBao168/tblog.git GIT_TAG v0.1.0)
+  FetchContent_MakeAvailable(tblog)
+  ```
+
+  Cùng các target như trên. Windows: `tblog.dll` được ghi vào `CMAKE_RUNTIME_OUTPUT_DIRECTORY` của project cha nếu có.
 - Link DLL bằng tay trên Windows: định nghĩa `TBLOG_DLL` trước khi include (`tblog::tblog_shared` làm sẵn).
 - pkg-config (Linux, macOS): `cc app.c $(pkg-config --cflags --libs tblog)`. Link tĩnh với GNU ld khi `.a` và `.so` cùng thư mục: thay `-ltblog` bằng `-l:libtblog.a`.
 

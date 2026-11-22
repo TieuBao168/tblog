@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-11-22)
+
+Bản phát hành đầu tiên.
 
 ### Không tương thích
 

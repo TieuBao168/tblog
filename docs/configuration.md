@@ -2,7 +2,7 @@
 
 `tblog_init(path)` đọc file `key = value`. `path` là `NULL`, rỗng hoặc không đọc được thì mọi key lấy mặc định. File mẫu đủ mọi key: [log.conf](../log.conf).
 
-Số đo trên trang này: Windows 11, Ryzen 7 8845HS, NVMe, MinGW g++ 15 ([benchmarks.md](benchmarks.md)).
+Số đo trên trang này lấy từ laptop Windows 11 (Ryzen 7 8845HS, NVMe, MinGW g++ 15), trừ khi ghi rõ Linux / macOS / MSVC (GitHub Actions) ([benchmarks.md](benchmarks.md)).
 
 ## Cú pháp
 
@@ -69,7 +69,7 @@ Mặc định lệnh log trả về khi dòng còn trong RAM, nên `kill -9`, OO
 | Dòng dưới level | 311 ns | 311–391 ns: không đổi |
 
 - **Ưu**: dòng lỗi cuối luôn còn khi process bị giết; dòng dưới level không tốn thêm.
-- **Nhược**: mỗi dòng ERROR chậm 70–260× (21–148 µs thay vì 311–561 ns). Trên Windows, kết hợp với `sync.on_level = ERROR` mà dòng ERROR dày thì mỗi dòng chờ cả một fsync, vì `WriteFile` phải đợi `FlushFileBuffers` đang chạy. Linux / macOS: chưa đo.
+- **Nhược**: mỗi dòng ERROR chậm 70–260× (21–148 µs thay vì 311–561 ns). Chỉ trên Windows: kết hợp với `sync.on_level = ERROR` mà dòng ERROR dày thì mỗi dòng chờ cả một fsync (2.69–2.92 ms p50), vì `WriteFile` phải đợi `FlushFileBuffers` đang chạy. Linux và macOS không bị: 39 và 37 µs p50 với cùng cấu hình.
 - **Không đặt dưới `INFO`**: khi mọi dòng phải chờ, 1 thread chỉ còn 43.5 k dòng/s (`sync.on_level = OFF`) hoặc 376 dòng/s (`ERROR`). tblog cảnh báo.
 - Không fsync (mất điện vẫn cần `sync.*`). Không bao giờ treo: chờ tối đa 2 s; không chờ khi đang shutdown, đang crash, dòng bị `drop`, hoặc khi gọi từ thread nền.
 
@@ -111,7 +111,9 @@ RAM dùng = 2 × max(`buffer.size`, N × 64 KB), N = số shard (lũy thừa c�
 
 - **Lớn (`16MB`, `64MB`)**: hấp thụ đợt log dồn dập mà không chờ (`block`) hay bỏ dòng (`drop`).
 - **Nhỏ (`256KB`)**: tiết kiệm RAM (4 CPU: 512 KB).
-- Không đổi số dòng mất khi `kill -9` trong điều kiện thường: thread nền đã ghi khi shard đầy 75%. Ví dụ: shard 256 KB → 75% ≈ 1 900 dòng 102 byte, khớp với 1 939 dòng mất tối đa mỗi thread đo được.
+- Ảnh hưởng tới số dòng mất khi `kill -9`. Mỗi thread mất tối đa phần nhỏ hơn trong hai giới hạn: 75% một shard, hoặc lượng log trong một `flush.interval_ms`. Đo ở 20 k dòng/s mỗi thread:
+  - 16 CPU: shard 256 KB, 75% ≈ 1 900 dòng; đo được tối đa 1 939.
+  - 4 CPU: shard 1 MB, 75% ≈ 7 500 dòng, nên giới hạn 200 ms ≈ 4 000 dòng thắng; đo được tối đa 3 714 (Linux), 4 510 (Windows).
 
 ### File: xoay, giữ, nén
 
@@ -152,9 +154,10 @@ Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. D�
 
 | Sự cố | Mặc định mất | Bảo vệ |
 |---|---|---|
-| Crash (SIGSEGV, `abort`, exception, stack overflow; Windows: SEH) | 0 (đo được) | Không cần |
+| Crash (SIGSEGV, `abort`, exception; Windows: SEH) | 0 (đo được) | Không cần |
+| Tràn stack | Thread gọi `tblog_init`, và mọi thread trên Windows: 0. Thread khác trên Linux / macOS: handler không chạy được, mất cả buffer (TB 2 065–2 794 dòng) | `flush.on_level` giới hạn phần mất |
 | `exit()`, `return` từ `main` | 0 | Không cần |
-| `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Tới ~1 900 dòng mỗi thread | `flush.on_level`, `tblog_flush()` ở điểm quan trọng |
+| `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Tới 75% một shard hoặc một `flush.interval_ms` log mỗi thread (đo được 1 900–4 500 dòng, xem [`buffer.size`](#buffersize-ram)) | `flush.on_level`, `tblog_flush()` ở điểm quan trọng |
 | Flood quá trần | 0 (`block` chờ) | `buffer.size`; `drop` thì mất dòng nhưng không chờ |
 | Mất điện, kernel panic | Tới ≈ `sync.interval_ms` + `flush.interval_ms` | `sync.on_level`, `sync.interval_ms`, `tblog_flush()` |
 | Đĩa đầy | Phần không ghi được (cảnh báo ra stderr) | Không có key |

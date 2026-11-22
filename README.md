@@ -17,20 +17,21 @@ Chi tiết từng bước, double buffer, độ bền và trình tự crash: [ar
 
 ## Nên dùng / không nên dùng
 
-So với `fprintf` vào một file, cùng dòng log ([benchmarks.md](docs/benchmarks.md); Windows 11, Ryzen 7 8845HS, NVMe, MinGW g++ 15 `-O2`):
+So với `fprintf` vào một file, cùng dòng log, đo trên Linux (glibc), macOS, Windows MSVC (GitHub Actions, 3–4 CPU) và Windows MinGW (laptop 16 CPU). Khoảng giá trị là từ nền tảng tốt nhất tới kém nhất ([benchmarks.md](docs/benchmarks.md)):
 
 | | `fprintf` | tblog | Kết luận |
 |---|---|---|---|
-| Lệnh log, p50 / p99, 1 thread | 2.03 µs / 6.9 µs | 311 ns / 591 ns | tblog nhanh hơn 6.5× |
-| Lệnh log, p50 / p99, 8 thread | 8.56 µs / 330 µs | 561 ns / 671 ns | p99 thấp hơn 490×: không tranh khóa |
-| Thông lượng tới khi đã fsync, 8 thread | 213 k dòng/s | 4.34 M dòng/s | 20× |
-| Mất dòng khi SIGSEGV (TB / max, 20 lần) | 24 / 41 | 0 / 0 | crash handler xả buffer |
-| Mất dòng khi `kill -9`, 4 thread | 22 / 41 | 4 612 / 7 751 | **tblog kém hơn**; bật `flush.on_level = ERROR` thì 0 dòng mất tới dòng ERROR cuối |
+| Lệnh log p50, 1 thread | 321–381 ns (MinGW: 2.03 µs) | 230–311 ns | Nhanh hơn 1.3–1.7× (MinGW: 6.5×) |
+| Lệnh log p99, 4 thread | 34–139 µs | 0.48–1.8 µs | Thấp hơn 50–200×: không tranh khóa |
+| Thông lượng tới khi đã fsync, 4 thread | 213–734 k dòng/s | 1.5–6.4 M dòng/s | 2.5–13× |
+| Mất dòng khi SIGSEGV, `abort` (TB / max, 20 lần) | tới 28 / 41 | 0 | Crash handler xả buffer |
+| Mất dòng khi tràn stack trên thread phụ | tới 21 / 41 | Linux, macOS: tới 2 794 / 4 372; Windows: 0 | **tblog kém hơn** trên Linux, macOS |
+| Mất dòng khi `kill -9`, 4 thread | tới 22 / 41 | 4 612–12 614 / tới 27 654 | **tblog kém hơn**; `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối |
 | RAM | 4 KB | 8 MB (mặc định) | tblog tốn hơn |
 
-- **Nên dùng** khi thread làm việc không được chậm vì log, có nhiều thread cùng log, hoặc cần log còn nguyên khi crash.
-- **Không cần** nếu chương trình một thread, log ít: `snprintf` + `fwrite` chỉ chậm hơn tblog 20% (381 so với 311 ns). Trên glibc / MSVC, `fprintf` có thể còn nhanh hơn: chưa đo.
-- **Cân nhắc** nếu process hay bị `kill -9` và cần **từng** dòng cuối: `fprintf` + `fflush` mỗi dòng mất 0 dòng nhưng chậm 16× (4.95 µs mỗi lệnh).
+- **Nên dùng** khi có nhiều thread cùng log, thread làm việc không được chậm vì log, hoặc cần log còn nguyên khi crash.
+- **Không cần** nếu chương trình một thread, log ít: trên Linux / macOS, `fprintf` chỉ chậm hơn 1.3× ở p50 và 1.5–1.6× về thông lượng.
+- **Cân nhắc** nếu process hay bị `kill -9` và cần **từng** dòng cuối: `fprintf` + `fflush` mỗi dòng mất 0 dòng nhưng chậm 6–16× (1.42–4.95 µs mỗi lệnh).
 
 ## Bắt đầu nhanh
 

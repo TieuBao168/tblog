@@ -17,7 +17,11 @@
 - **Windows** (MSVC, MinGW-w64; tĩnh và DLL) và **macOS** 12+ (arm64, x86_64).
 - **CMake package**: `find_package(tblog)`, `add_subdirectory`, FetchContent; target `tblog::tblog`, `_static`, `_shared`.
 - **Benchmark so với `fprintf`**: `bench_vs_printf` (thông lượng, latency) và `bench_crash_loss` (mất log khi crash / `kill -9` / `exit`), workflow `bench.yml`.
-- CI trên Linux (glibc, musl), macOS, Windows.
+- CI trên Linux (glibc, musl), macOS, Windows. Kết quả benchmark của Linux, macOS, Windows MSVC (GitHub Actions) nằm trong `bench/results/`.
+
+### Vấn đề đã biết
+
+- **Tràn stack trên thread phụ, Linux / macOS**: crash handler không chạy (thread không có alternate signal stack), phần trong buffer bị mất (đo được TB 2 065–2 794 dòng). Windows không bị.
 
 ### Sửa
 

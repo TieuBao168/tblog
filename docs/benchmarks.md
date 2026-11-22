@@ -1,23 +1,71 @@
 # Benchmark: tblog so với `fprintf`
 
-So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không so với thư viện log khác. Mọi số lấy từ [perf JSON](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-21-perf.json) và [crash JSON](../bench/results/windows-mingw-gcc15-ryzen-7-8845hs-2026-11-21-crash.json), bảng dựng bằng `bench/report.py`.
+So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không so với thư viện log khác. Mọi số lấy từ các file JSON trong [bench/results/](../bench/results/), bảng dựng bằng `bench/report.py`.
 
 ## Kết luận
 
 | | tblog tốt hơn | tblog kém hơn |
 |---|---|---|
-| Lệnh log | 311 ns p50 so với 2.03 µs (1 thread); p99 671 ns so với 330 µs (8 thread) | So với `snprintf` + `fwrite`: chỉ hơn 20% ở 1 thread (311 so với 381 ns) |
-| Thông lượng | 4.34 M dòng/s so với 213 k (8 thread) | Trần ~4–5 M dòng/s (một thread nền) |
-| Crash | 0 dòng mất so với TB 24 | Process chết chậm hơn 0.8–9 ms |
-| `kill -9` | Với `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối | Mặc định mất tới 1 939 dòng mỗi thread, so với 41 |
-| Quá tải | `block`: không mất dòng | `block`: lệnh log có lúc chờ (max 2.88 ms, 16 thread); `drop`: mất tới 33% |
+| Lệnh log, 1 thread | p50 nhanh hơn 1.3–1.7× (MinGW: 6.5×), p99 nhanh hơn 8–12× | Trên Linux / macOS, `fprintf` một thread đã đủ nhanh (321–375 ns p50) |
+| Lệnh log, nhiều thread | p99 0.48–1.8 µs so với 34–139 µs (4 thread) | |
+| Thông lượng | 2.5–13× ở 4 thread | Trần của một thread nền: 1.5 M (Windows CI) tới ~6 M dòng/s (Linux) |
+| Crash | 0 dòng mất ở mọi nền tảng, so với TB 17–28 | Process chết chậm hơn 0.5–9 ms. **Tràn stack trên thread phụ, Linux / macOS: mất cả buffer** |
+| `kill -9` | `flush.on_level = ERROR`: 0 dòng mất tới dòng ERROR cuối | Mặc định mất 1 900–4 500 dòng mỗi thread (macOS VM: 6 920), so với 41 |
+| Quá tải | `block`: không mất dòng | `block`: lệnh log có lúc chờ (max 2.9–36 ms); `drop`: mất tới 47% |
 | Mất điện | fsync mỗi giây và sau ERROR; `fprintf` không fsync | Không biến thể nào an toàn tuyệt đối |
 
 ## Máy đo
 
-Ryzen 7 8845HS (16 CPU logic), 31 GiB RAM, Windows 11 26H2, NVMe NTFS, MinGW-w64 g++ 15.1 `-O2`, tblog tĩnh. Một máy, laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy.
+| Tên | Máy | Ghi chú |
+|---|---|---|
+| Laptop | Ryzen 7 8845HS, 16 CPU, Windows 11, NVMe, MinGW-w64 g++ 15.1 `-O2` | Phần chi tiết bên dưới. `fprintf` của MinGW chậm bất thường: `snprintf` + `fwrite` nhanh hơn 5× |
+| Linux | GitHub Actions, EPYC 7763, 4 CPU, Ubuntu 26.04, g++ 15.2 | VM dùng chung |
+| macOS | GitHub Actions, Apple M1 (VM), 3 CPU, macOS 26, clang 21 | VM dùng chung; đồng hồ bước 41 ns |
+| Windows CI | GitHub Actions, EPYC 9V45, 4 CPU, Windows Server 2025, MSVC 19.52 | VM dùng chung; đĩa chậm (fsync) |
 
-**Lưu ý**: `fprintf` của MinGW (`__USE_MINGW_ANSI_STDIO=1`) chậm bất thường: cùng dòng đó, `snprintf` + `fwrite` nhanh hơn 5×. Số `fprintf` ở đây **không đại diện** cho glibc hay MSVC; chạy `bench.yml` để đo trên các nền tảng đó.
+Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một máy, không so giữa các máy. Laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy.
+
+## So sánh giữa các nền tảng
+
+**Lệnh log** p50 / p99 (flood):
+
+| | Linux | macOS | Windows CI | Laptop |
+|---|---|---|---|---|
+| `fprintf`, 1 thread | 321 ns / 3.73 µs | 375 ns / 5.33 µs | 381 ns / 2.84 µs | 2.03 µs / 6.9 µs |
+| tblog, 1 thread | 251 ns / 310 ns | 292 ns / 667 ns | 230 ns / 371 ns | 311 ns / 591 ns |
+| `fprintf`, 4 thread | 741 ns / 59 µs | 459 ns / 96.2 µs | 1.23 µs / 34.3 µs | 8.05 µs / 139 µs |
+| tblog, 4 thread | 441 ns / 501 ns | 417 ns / 1.79 µs | 361 ns / 481 ns | 551 ns / 641 ns |
+| Lệnh bị lọc (tblog / `if`) | 0.63 / 0.32 ns | 0.57 / 0.32 ns | 0.50 / 0.23 ns | 1.16 / 0.60 ns |
+
+**Thông lượng end-to-end** (tới khi đã fsync), `fprintf` → tblog:
+
+| Thread | Linux | macOS | Windows CI | Laptop |
+|---|---|---|---|---|
+| 1 | 2.19 M → 3.39 M | 1.74 M → 2.77 M | 600 k → 1.18 M | 365 k → 1.89 M |
+| 4 | 734 k → 6.44 M | 562 k → 3.62 M | 600 k → 1.52 M | 213 k → 2.72 M |
+
+**Mất log** (TB / max dòng, 20 lần; cột tblog / tblog + `flush.on_level = ERROR`):
+
+| Kịch bản | Nền tảng | `fprintf` | tblog | + `flush.on_level` |
+|---|---|---|---|---|
+| SIGSEGV, 4 thread khác đang log | Mọi nền tảng | 16.6–19.2 / 41 | 0 | 0 |
+| `abort`, `assert`, exception | Linux | 18.8–21.1 / 40 | 0 | 0 |
+| | macOS, Windows | 0 (libc xả stdio) | 0 | 0 |
+| Tràn stack, thread phụ | Linux | 20.6 / 41 | **2 065 / 3 823** | 56 / 96 ¹ |
+| | macOS | 20.2 / 39 | **2 794 / 4 372** | 56 / 96 ¹ |
+| | Windows | 20.6 / 41 | 0 | 0 |
+| `kill -9`, 4 thread | Linux | 20.4 / 38 | 7 034 / 14 854 | 235 / 382 ¹ |
+| | macOS | 17.4 / 40 | 12 614 / 27 654 | 150 / 345 ¹ |
+| | Windows CI | 16.1 / 39 | 8 063 / 15 676 | 344 / 396 ¹ |
+| `_Exit` | Linux | 17.6 / 35 | 2 206 / 3 771 | 56 / 96 ¹ |
+
+¹ 0 dòng mất tới dòng ERROR cuối, ở mọi nền tảng.
+
+- **Tràn stack trên thread phụ là lỗ hổng thật trên Linux / macOS**: thread đó không có alternate signal stack nên handler của tblog không chạy, tệ hơn cả `fprintf`. Trên macOS process còn chết bằng SIGILL thay vì SIGBUS.
+- **`kill -9` trên máy 4 CPU mất nhiều hơn laptop**: shard 1 MB nên giới hạn là 200 ms log (~4 000 dòng ở 20 k dòng/s), không phải 75% shard. Tối đa mỗi thread: 3 714 (Linux), 4 510 (Windows CI), 6 920 (macOS VM, vượt giới hạn: chưa rõ nguyên nhân).
+- **`flush.on_level = ERROR` + `sync.on_level = ERROR`**, 1% dòng ERROR, 1 thread: lệnh ERROR 39 µs p50 (Linux), 37 µs (macOS), 2.92 ms (Windows CI), 2.69 ms (laptop). Việc phải chờ fsync chỉ xảy ra trên Windows.
+- `drop` ở 8 thread trên Windows CI bỏ 47% số dòng (466 k / 1 M): đĩa chậm làm thread nền ghi chậm.
+- Kịch bản paced với 8 thread không có ý nghĩa trên máy CI 3–4 CPU: 8 thread chờ bận chiếm hết CPU của cả thread nền.
 
 ## Cách đo
 
@@ -38,7 +86,9 @@ Cùng một dòng ~102 byte theo pattern mặc định; timestamp của `fprintf
 - **Mất log**: process con log các dòng đánh số, ghi số dòng đã trả về vào bộ nhớ chia sẻ, rồi chết theo kịch bản. Process cha so với file: **mất** = số dòng đã trả về mà không có trong file.
 - 5 lần chạy (perf) hoặc 20 lần thử (crash) mỗi ô, sau 1 lần khởi động. Bảng ghi median [min–max].
 
-## Kết quả hiệu năng
+## Hiệu năng chi tiết (laptop)
+
+Bảng đầy đủ của các máy CI: `python3 -I bench/report.py bench/results/<máy>-*.json`.
 
 **Thông lượng end-to-end** (dòng/s, tới khi đã fsync):
 
@@ -86,10 +136,10 @@ Flood 200 k dòng, p50 / p99 của lệnh ERROR:
 | 8 | 100% | 103 µs / 233 µs; 69.8 k dòng/s | 5.21 ms / 9.04 ms; 1.54 k dòng/s |
 
 - Dòng INFO xen giữa vẫn 311–591 ns p50: dòng dưới level không tốn thêm.
-- Với `sync.on_level = ERROR` mỗi dòng ERROR tốn khoảng một fsync, vì trên NTFS `WriteFile` phải chờ `FlushFileBuffers` đang chạy. Dòng ERROR thưa (cách nhau hơn một fsync) và Linux / macOS: chưa đo.
+- Với `sync.on_level = ERROR` mỗi dòng ERROR tốn khoảng một fsync, vì trên NTFS `WriteFile` phải chờ `FlushFileBuffers` đang chạy. Linux và macOS không bị ([xem trên](#so-sánh-giữa-các-nền-tảng)). Dòng ERROR thưa (cách nhau hơn một fsync): chưa đo.
 - Kết luận: `flush.on_level` hợp với dòng hiếm (lỗi), không hợp với level của phần lớn các dòng.
 
-## Kết quả mất log
+## Mất log chi tiết (laptop)
 
 20 lần thử mỗi ô, 20 k dòng/s mỗi thread. Ô: dòng mất trung bình / lớn nhất.
 
@@ -107,8 +157,9 @@ Flood 200 k dòng, p50 / p99 của lệnh ERROR:
 
 - 800/800 process con chết đúng kịch bản; tblog ghi dòng `*** tblog: caught ... ***` ở 280/280 lần crash; 0 dòng hỏng, 0 dòng lặp.
 - `fprintf_buffered` để lại dòng cụt ở cuối file ở 19–20/20 lần với SIGSEGV, stack overflow và `kill -9`.
-- `kill -9` của tblog: tối đa 1 939 dòng một thread, khớp với dự đoán: shard 256 KB, thread nền được đánh thức khi đầy 75% ≈ 1 900 dòng.
-- `fprintf_buffered` không mất gì với `abort` và `_Exit`: CRT `msvcrt.dll` của MinGW xả stream khi process thoát. glibc thì không (từ 2.27): trên Linux kết quả sẽ khác, chưa đo.
+- `kill -9` của tblog: tối đa 1 939 dòng một thread, khớp với dự đoán: 16 CPU → shard 256 KB, thread nền được đánh thức khi đầy 75% ≈ 1 900 dòng.
+- `fprintf_buffered` không mất gì với `abort` và `_Exit`: CRT `msvcrt.dll` của MinGW xả stream khi process thoát. glibc thì không: trên Linux `fprintf` mất TB 21 dòng với `abort` ([xem trên](#so-sánh-giữa-các-nền-tảng)).
+- Tràn stack trên thread phụ không mất gì trên Windows; trên Linux / macOS thì có, xem phần so sánh ở trên.
 - Thời gian từ lúc gây crash tới khi process kết thúc: tblog 2.4 ms so với 1.6 ms của `fprintf` (1 thread), 10.3 ms so với 1.5 ms (4 thread khác đang log).
 
 ## Chạy lại

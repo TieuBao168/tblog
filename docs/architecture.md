@@ -1,6 +1,6 @@
 # Kiến trúc
 
-Số đo dưới đây: Windows 11, Ryzen 7 8845HS, NVMe ([benchmarks.md](benchmarks.md)).
+Số đo dưới đây lấy từ laptop Windows 11 (Ryzen 7 8845HS, NVMe), trừ khi ghi rõ Linux / macOS (GitHub Actions) ([benchmarks.md](benchmarks.md)).
 
 ## Tổng quan
 
@@ -79,7 +79,7 @@ Thread gọi log chỉ giữ spinlock trong lúc chép một dòng; việc ghi r
 Thread gọi log không gọi system call; một thread nền ghi file.
 
 - **Ưu**: lệnh log 311 ns p50 so với 2.03 µs của `fprintf` (1 thread). Đĩa chậm không làm chậm ứng dụng.
-- **Nhược**: `kill -9` mất phần còn trong RAM: tới 1 939 dòng mỗi thread, so với 41 của `fprintf`. Thêm 2–3 thread và 8 MB RAM. Có `flush.on_level` để bù cho dòng quan trọng ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
+- **Nhược**: `kill -9` mất phần còn trong RAM: tới 1 900–4 500 dòng mỗi thread tùy số CPU (6 920 trên macOS VM), so với 41 của `fprintf`. Thêm 2–3 thread và 8 MB RAM. Có `flush.on_level` để bù cho dòng quan trọng ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
 
 ### 2. Buffer chia shard theo thread
 
@@ -101,14 +101,17 @@ N shard (lũy thừa của 2 ≥ số CPU, tối đa 16), mỗi thread gắn c�
 ### 5. fsync trên thread riêng
 
 - **Ưu**: một fsync tốn khoảng 2.5 ms; nếu chạy trên worker, mỗi lần fsync worker ngừng đổi buffer. Tách ra thì lệnh log không bao giờ chờ fsync.
-- **Nhược**: thêm một thread. Trên Windows, `WriteFile` vẫn phải chờ `FlushFileBuffers` đang chạy trên cùng file, nên `flush.on_level` + `sync.on_level` cùng level làm mỗi dòng ERROR chờ cả fsync (2.69–5.4 ms thay vì 21–148 µs).
+- **Nhược**: thêm một thread. Trên Windows, `WriteFile` vẫn phải chờ `FlushFileBuffers` đang chạy trên cùng file, nên `flush.on_level` + `sync.on_level` cùng level làm mỗi dòng ERROR chờ cả fsync (2.69–5.4 ms thay vì 21–148 µs). Linux và macOS tách được hẳn: cùng cấu hình chỉ 39 / 37 µs p50.
 
 ### 6. Crash handler xả buffer
 
 Handler bắt SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL (Windows: SEH, `abort`), chờ lần ghi đang dở của worker xong, rồi xả phần còn lại vào file và console. Dòng log của thread khác sau lúc đó được ghi thẳng vào file trước khi lệnh trả về.
 
 - **Ưu**: 0 dòng mất, 0 dòng lặp ở mọi kịch bản crash, kể cả khi 4 thread khác vẫn đang log (20 lần mỗi kịch bản). `fprintf` mất trung bình 24 dòng và để lại dòng cụt.
-- **Nhược**: process chết chậm hơn: 2.4 ms so với 1.6 ms (crash trên thread đang log), 10.3 ms so với 1.5 ms (crash khi 4 thread khác đang log). Chỉ xả vào file và console: syslog và sink riêng không an toàn trong signal handler.
+- **Nhược**:
+  - Process chết chậm hơn: 1.2 so với 0.7 ms (Linux), 2.4 so với 1.6 ms (laptop Windows), tới 10.3 so với 1.5 ms khi 4 thread khác đang log.
+  - Chỉ xả vào file và console, vì syslog và sink riêng không an toàn trong signal handler.
+  - **Tràn stack trên thread phụ, Linux / macOS**: thread đó không có alternate signal stack nên handler không chạy, mất cả buffer: TB 2 065 / max 3 823 dòng (Linux), 2 794 / 4 372 (macOS). Windows không bị (0 dòng).
 
 ## Độ bền theo tình huống
 
@@ -118,8 +121,8 @@ Một dòng log đi qua ba chặng. Sự cố nào cũng chỉ làm mất phần
 flowchart LR
     R["1. Buffer RAM<br/>của tblog"] -->|"worker write()<br/>≤ 200 ms, hoặc ngay<br/>nếu ≥ flush.on_level"| P["2. Cache của OS<br/>(page cache)"]
     P -->|"fsync<br/>≤ 1 s, hoặc ngay<br/>sau dòng ≥ sync.on_level"| D["3. Đĩa"]
-    K["kill -9, OOM killer,<br/>TerminateProcess, _exit"] -.->|"mất phần ở chặng 1<br/>đo được: tới 1 939 dòng / thread"| R
-    C["Crash: SIGSEGV, abort,<br/>exception, stack overflow"] -.->|"handler đẩy 1 → 2<br/>đo được: 0 dòng mất"| R
+    K["kill -9, OOM killer,<br/>TerminateProcess, _exit,<br/>tràn stack thread phụ (POSIX)"] -.->|"mất phần ở chặng 1<br/>đo được: 1 900–4 500 dòng / thread"| R
+    C["Crash: SIGSEGV, abort,<br/>exception"] -.->|"handler đẩy 1 → 2<br/>đo được: 0 dòng mất"| R
     E["Mất điện,<br/>kernel panic"] -.->|"mất phần ở chặng 1 và 2"| P
 ```
 
@@ -132,7 +135,7 @@ flowchart LR
 | `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Mất phần còn trong buffer; dòng ≥ `flush.on_level` đã trả về thì không |
 | Mất điện | Mất phần chưa fsync: tối đa ≈ `sync.interval_ms` + `flush.interval_ms` |
 
-Giới hạn của crash handler (đều có chặn thời gian, không bao giờ treo): worker kẹt quá ~2 s giữa lúc ghi thì phần đầu chunk đó có thể bị lặp; stack overflow trên thread không có alternate stack (POSIX, thread không phải thread gọi `tblog_init`) thì handler không chạy được. Cơ chế chi tiết nằm trong chú thích "Crash safety" và "Waiting for the write" của `src/queue/queue.cpp`.
+Giới hạn của crash handler (đều có chặn thời gian, không bao giờ treo): worker kẹt quá ~2 s giữa lúc ghi thì phần đầu chunk đó có thể bị lặp; tràn stack trên thread không có alternate stack (Linux / macOS, thread không phải thread gọi `tblog_init`, worker, thread sync) thì handler không chạy được, mất cả buffer như `kill -9`. Cơ chế chi tiết nằm trong chú thích "Crash safety" và "Waiting for the write" của `src/queue/queue.cpp`.
 
 ## Trình tự khi crash
 
@@ -164,7 +167,7 @@ Nhờ bước chờ worker và đọc đúng vị trí đã ghi, không dòng n�
 | Dòng báo | `*** tblog: caught signal 11 (SIGSEGV) ***` | `*** tblog: caught exception 0xC0000005 (...) ***` |
 | Call stack ra stderr | `backtrace_symbols_fd` (musl: không có) | Chỉ địa chỉ + base address của module |
 | Sau đó | Handler cũ / core dump | Filter cũ / WER, debugger vẫn thấy |
-| Stack overflow | Báo được trên thread gọi `tblog_init`, worker, thread sync | Như vậy; thread khác: đo được 0 dòng mất (20/20 lần) |
+| Tràn stack | Thread gọi `tblog_init`, worker, thread sync: 0 dòng mất. Thread khác: handler không chạy, mất cả buffer (macOS: process chết bằng SIGILL) | Mọi thread: 0 dòng mất (20/20 lần) |
 
 ## Thoát process trên Windows
 

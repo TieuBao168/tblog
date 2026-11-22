@@ -12,6 +12,8 @@ Mọi nền tảng: file mở ở chế độ append, handle không kế thừa 
 
 ## Linux
 
+- **Tràn stack trên thread phụ** (thread không gọi `tblog_init`): thread đó không có alternate signal stack nên crash handler không chạy, phần trong buffer bị mất (đo được TB 2 065, max 3 823 dòng). macOS cũng vậy. Các crash khác không bị ảnh hưởng.
+- `abort()` của glibc không xả stdio: ở đây `fprintf` mất TB 21 dòng còn tblog mất 0.
 - glibc và musl đều được CI chạy toàn bộ test. musl không in call stack khi crash (vẫn xả log). `-DTBLOG_NO_BACKTRACE` tắt call stack ở mọi nơi.
 - TSan trên kernel mới cần tắt ASLR (`setarch $(uname -m) -R`); CTest và `make SAN=thread test` tự làm.
 
@@ -25,14 +27,14 @@ Mọi nền tảng: file mở ở chế độ append, handle không kế thừa 
 ## macOS
 
 - `fsync` của macOS chỉ đẩy dữ liệu tới ổ đĩa, ổ vẫn có thể giữ trong cache. tblog dùng `F_FULLFSYNC` để "đã sync" có cùng nghĩa như trên Linux. **Nhược**: mỗi lần sync tốn cỡ ms, nên `tblog_flush()` chờ lâu hơn; lệnh log không bị ảnh hưởng (sync chạy trên thread riêng).
-- Stack overflow trên thread phụ đến dưới dạng SIGBUS.
+- Tràn stack trên thread phụ: handler không chạy, mất phần trong buffer (đo được TB 2 794, max 4 372 dòng), và process chết bằng SIGILL thay vì SIGBUS.
 
 ## Windows
 
 - MSVC không có chế độ C++11: build thư viện với `TBLOG_CXX_STANDARD=14` hoặc `17`.
 - Đường dẫn là UTF-8; `/` và `\` đều được; hỗ trợ UNC và `\\?\`.
 - File log mở với `FILE_SHARE_READ | WRITE | DELETE`: đọc, đổi tên, xóa được khi đang ghi (cần cho xoay file).
-- `WriteFile` phải chờ khi `FlushFileBuffers` đang chạy trên cùng file: `flush.on_level` + `sync.on_level` cùng level làm dòng ERROR chậm tới 2.69–5.4 ms ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
+- `WriteFile` phải chờ khi `FlushFileBuffers` đang chạy trên cùng file: `flush.on_level` + `sync.on_level` cùng level làm dòng ERROR chậm tới 2.69–5.4 ms (Linux / macOS: 37–39 µs) ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
 - Console có màu khi bật được ANSI (Windows 10 1511+).
 - DLL: gọi `tblog_shutdown()` trước khi thoát; không `FreeLibrary` khi logger đang chạy ([architecture.md](architecture.md#thoát-process-trên-windows)).
 - ARM64: chỉ header được CI biên dịch thử; thư viện chưa build hay chạy trên ARM64.

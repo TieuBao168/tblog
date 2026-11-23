@@ -26,6 +26,9 @@ struct FileOptions {
     int max_files = 5;                         // app.log + up to N-1 newest rotated files
     RotateMode rotate = RotateMode::Size;
     CompressMode compress = CompressMode::None;
+    // file.mode: POSIX permission bits of the files tblog creates (log file,
+    // rotated .gz); existing files keep theirs. Ignored on Windows.
+    unsigned mode = 0640;
     // Test hook: wall clock in seconds since the epoch used for period
     // decisions (nullptr = the real wall clock). Called on the worker only.
     int64_t (*now_fn)() = nullptr;

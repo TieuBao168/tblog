@@ -226,10 +226,12 @@ bool posix_rename(const std::wstring &from, const std::wstring &to) noexcept {
 }  // namespace
 
 // ------------------------------------------------------------------ files
-FileHandle file_open(const std::string &path, OpenMode mode) noexcept {
+FileHandle file_open(const std::string &path, OpenMode mode, unsigned /*perms*/) noexcept {
     std::wstring w;
     if (!win::to_wide(path, &w)) return no_file();
     DWORD access = 0, disposition = 0;
+    bool no_follow = true;  // refuse a reparse point as the file (platform.h, OpenMode)
+    bool truncate = false;
     switch (mode) {
         case OpenMode::Append:
             // FILE_APPEND_DATA without FILE_WRITE_DATA: every WriteFile goes
@@ -240,18 +242,54 @@ FileHandle file_open(const std::string &path, OpenMode mode) noexcept {
         case OpenMode::Read:
             access = GENERIC_READ;
             disposition = OPEN_EXISTING;
+            no_follow = false;
+            break;
+        case OpenMode::ReadNoFollow:
+            access = GENERIC_READ;
+            disposition = OPEN_EXISTING;
             break;
         case OpenMode::Truncate:
+            // Not CREATE_ALWAYS: the reparse-point check must come before the
+            // data is cut, so open first and truncate once it passed.
             access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
-            disposition = CREATE_ALWAYS;
+            disposition = OPEN_ALWAYS;
+            truncate = true;
+            break;
+        case OpenMode::CreateNew:
+            access = GENERIC_WRITE | FILE_READ_ATTRIBUTES;
+            disposition = CREATE_NEW;  // fails if the name exists, a link included
             break;
     }
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link / junction itself
+    // instead of its target, so the attribute check below sees it.
+    const DWORD flags = FILE_ATTRIBUTE_NORMAL | (no_follow ? FILE_FLAG_OPEN_REPARSE_POINT : 0);
     // Default security attributes: the handle is not inherited.
-    HANDLE h = CreateFileW(w.c_str(), access, kShareAll, nullptr, disposition, FILE_ATTRIBUTE_NORMAL,
-                           nullptr);
+    HANDLE h = CreateFileW(w.c_str(), access, kShareAll, nullptr, disposition, flags, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         win::set_errno_from_last_error();
         return no_file();
+    }
+    if (no_follow) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(h, &info)) {
+            win::set_errno_from_last_error();
+            CloseHandle(h);
+            return no_file();
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            CloseHandle(h);
+            errno = ELOOP;
+            return no_file();
+        }
+    }
+    if (truncate) {
+        LARGE_INTEGER zero;
+        zero.QuadPart = 0;
+        if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN) || !SetEndOfFile(h)) {
+            win::set_errno_from_last_error();
+            CloseHandle(h);
+            return no_file();
+        }
     }
     return file_of(h);
 }

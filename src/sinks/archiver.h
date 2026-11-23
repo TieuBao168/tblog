@@ -114,6 +114,7 @@ private:
     int max_files_ = 5;
     RotateMode rotate_ = RotateMode::Size;
     CompressMode compress_ = CompressMode::None;
+    unsigned mode_ = 0640;  // file.mode of the .gz files
     int64_t (*now_fn_)() = nullptr;
 
     std::mutex mu_;

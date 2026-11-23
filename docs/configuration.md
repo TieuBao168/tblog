@@ -22,10 +22,12 @@ Figures on this page come from a Windows 11 laptop (Ryzen 7 8845HS, NVMe, MinGW 
 | `level` | `INFO` | Root level, applies to every module without its own | Yes |
 | `module.<name>` | follows `level` | A module's own level (name ≤ 45 characters, ≤ 256 modules) | Yes ¹ |
 | `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Line layout, see [tokens](#pattern) | Yes |
+| `message.escape` | `true` | Escape control characters in the message, see [security](#security-links-permissions-escaping) | Yes |
 | `file` | `true` | Write a file | No ² |
-| `file.path` | `./logs/app.log` | Log file; relative to the working directory at init | No ² |
+| `file.path` | `./logs/app.log` | Log file; relative to the working directory at init. Must not be a symbolic link | No ² |
+| `file.mode` | `0640` | Permission bits (octal) of the files tblog creates; Linux, macOS | No ² |
 | `file.max_size` | `256MB` | Rotate when the file exceeds this | No |
-| `file.max_files` | `5` | Files to keep, the current one included | No |
+| `file.max_files` | `5` | Files to keep, the current one included (1–10000) | No |
 | `file.rotate` | `size` | `size`, `daily`, `hourly` | No |
 | `file.compress` | `none` | `none`, `gzip` (needs a zlib build) | No |
 | `buffer.size` | `4MB` | RAM buffer, split across shards | No ² |
@@ -152,6 +154,14 @@ Every sink runs on the background thread in the order file, console, syslog, cus
 
 Lines are at most 1024 bytes; longer ones are truncated and end with `...`. Shorter lines mean smaller files and more lines per second through the background thread.
 
+### Security: links, permissions, escaping
+
+Log files often sit in directories other users or services can write to, and log messages often carry data from outside (user names, request paths). Three protections are on by default:
+
+- **No symbolic links.** The log file and the files of rotation and compression are opened without following a symbolic link in the last path component (Windows: any reparse point). If someone plants `app.log → /etc/passwd`, `tblog_init` fails with `Too many levels of symbolic links` instead of writing into the target. Links in the directory part (`/var/log/app → /data/log`) still work. A log path that is itself a link must be replaced by its target.
+- **`file.mode = 0640`**: the log file and `.gz` files are readable by the owner and the group only (the umask can restrict further). Use `0644` if a log shipper running as another user needs to read them; files that already exist keep their permissions.
+- **`message.escape = true`**: in the message (`%m`), a newline becomes `\n`, a carriage return `\r` and other control characters `\xHH` (tab is kept), and trailing newlines are dropped. A logged value such as `bob\n2026-… [ERROR] …` therefore cannot forge a second line (in the file, or a second syslog record with its own severity), and escape sequences cannot reach a terminal. Backslashes are not escaped, so the text is not reversible: it guarantees one record per line, nothing more. Cost: one extra pass over the message bytes (not benchmarked separately). Turn it off only if every message is trusted and must keep raw newlines.
+
 ## Which failure, which key protects
 
 | Failure | Lost by default | Protection |
@@ -165,7 +175,7 @@ Lines are at most 1024 bytes; longer ones are truncated and end with `...`. Shor
 
 ## Warnings
 
-Format `tblog: config: config line <N>: <error>` at init and on every reload: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, quoting errors, `option removed, ignored` (removed keys: `backend`, `mmap.region_size`, `format.mode`).
+Format `tblog: config: config line <N>: <error>` at init and on every reload: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, `file.max_files above 10000, clamped`, `invalid file.mode`, quoting errors, `option removed, ignored` (removed keys: `backend`, `mmap.region_size`, `format.mode`).
 
 Unusable combinations are corrected: `gzip` without zlib → `none`; `file = false` with no sink left → `console` enabled; `flush.on_level` below `INFO` → warning only.
 

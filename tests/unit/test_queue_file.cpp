@@ -24,6 +24,11 @@
 #include <thread>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 using namespace tblog;
 
 // The few std::filesystem-like calls used here (std::filesystem is C++17;
@@ -181,6 +186,77 @@ TEST(rotating_names) {
     ASSERT_TRUE(r3.open(o));
     EXPECT_EQ(r3.rotated_name(1), d.file("a.b/.hidden.1"));
 }
+
+// A symbolic link planted at the log path (directory writable by others)
+// must not make tblog append to the link's target; files are created with
+// file.mode (0640 by default), not world-readable.
+TEST(rotating_refuses_symlink_and_applies_mode) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks and permission bits");
+#else
+    TempDir d("symlink");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.log").c_str()) == 0);
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        EXPECT_FALSE(rf.open(o));  // ELOOP, reported on stderr
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+
+    const mode_t old_mask = ::umask(022);
+    ::unlink(d.file("app.log").c_str());
+    for (unsigned mode : {0640u, 0600u}) {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.mode = mode;
+        ASSERT_TRUE(rf.open(o));
+        struct stat st;
+        ASSERT_TRUE(::stat(o.path.c_str(), &st) == 0);
+        EXPECT_EQ(static_cast<unsigned>(st.st_mode & 0777), mode);
+        rf.close();
+        ::unlink(o.path.c_str());
+    }
+    ::umask(old_mask);
+#endif
+}
+
+#ifdef TBLOG_HAVE_ZLIB
+// The compressor's temporary file is created fresh: a link planted at
+// app.1.log.gz.tmp is replaced, never followed (its target is not truncated).
+TEST(rotating_gzip_tmp_symlink_not_followed) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks");
+#else
+    TempDir d("gztmp");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.max_size = 1000;
+        o.max_files = 3;
+        o.compress = CompressMode::Gzip;
+        ASSERT_TRUE(rf.open(o));
+        ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.1.log.gz.tmp").c_str()) == 0);
+        for (int i = 1; i <= 15; ++i) {  // one rotation (10 lines per file)
+            std::string l = fixed_line(i);
+            rf.write_all(l.data(), l.size());
+        }
+        rf.close();  // waits for the compression
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+    EXPECT_TRUE(fs::exists(d.file("app.1.log.gz")));
+    EXPECT_FALSE(fs::exists(d.file("app.1.log.gz.tmp")));
+#endif
+}
+#endif
 
 TEST(rotating_rotation_count) {
     TempDir d("rot");

@@ -31,6 +31,7 @@ TBLOG_LOG(level, module, fmt, ...)
 - **A filtered call does not format and does not evaluate its arguments**: 1.16 ns, versus 0.60 ns for `if (flag) fprintf(...)`.
 - `module` must be constant (usually a literal): it is read only the first time the call site runs, then cached.
 - Lines are at most 1024 bytes; longer ones are truncated with `...`.
+- Control characters in the message are escaped (`\n`, `\x1b`...) and trailing newlines dropped, so one call is always one line (`message.escape`, [configuration.md](configuration.md#security-links-permissions-escaping)). Applies to the C++ API too.
 - A log call **waits** in two cases: the buffer is full with `full_policy = block` (the default), and the line is ≥ `flush.on_level` ([configuration.md](configuration.md#choices-and-their-cost)).
 - `TBLOG_FATAL`: writes, `tblog_flush()`, then `abort()`. If filtered out, it does not `abort()`.
 

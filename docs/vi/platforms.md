@@ -10,7 +10,7 @@
 | Syslog | Có | Có (unified logging) | Không, `syslog = true` bị bỏ qua kèm cảnh báo |
 | Makefile | Có | Không, dùng CMake | Không, dùng CMake |
 
-Mọi nền tảng: file mở ở chế độ append, handle không kế thừa sang process con, thư mục cha được tự tạo.
+Mọi nền tảng: file mở ở chế độ append, handle không kế thừa sang process con, thư mục cha được tự tạo, và file log là symlink (Windows: mọi reparse point) bị từ chối ([bảo mật](configuration.md#bảo-mật-symlink-quyền-file-escape)). `file.mode` (mặc định `0640`) chỉ áp dụng trên Linux và macOS; trên Windows file mới nhận ACL mặc định của thư mục.
 
 ## Linux
 

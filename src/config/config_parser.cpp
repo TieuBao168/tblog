@@ -228,11 +228,25 @@ private:
             } else if (e == NumErr::Negative || n < 1) {
                 warn("file.max_files must be >= 1, set to 1", text);
                 cfg_.file.max_files = 1;
-            } else if (n > uint64_t(std::numeric_limits<int>::max())) {
-                warn(num_err_text(NumErr::Overflow), text);
+            } else if (e == NumErr::Ok && n > uint64_t(kMaxFilesLimit)) {
+                // Size rotation renames every kept file once per rotation.
+                warn("file.max_files above " + std::to_string(kMaxFilesLimit) + ", clamped to " +
+                         std::to_string(kMaxFilesLimit),
+                     text);
+                cfg_.file.max_files = kMaxFilesLimit;
             } else {
                 cfg_.file.max_files = int(n);
             }
+        } else if (key == "file.mode") {
+            // Octal permission bits, e.g. 0640 / 640 / 0600.
+            unsigned m = 0;
+            bool ok = !v.empty() && v.size() <= 4;
+            for (char ch : v) {
+                if (ch < '0' || ch > '7') { ok = false; break; }
+                m = m * 8 + unsigned(ch - '0');
+            }
+            if (!ok || m > 0777) warn("invalid file.mode (octal permission bits, e.g. 0640)", text);
+            else cfg_.file.mode = m;
         } else if (key == "file.rotate") {
             std::string l = to_lower(v);
             if (l == "size") cfg_.file.rotate = RotateMode::Size;
@@ -264,6 +278,8 @@ private:
             tblog_level lv;
             if (parse_level_local(v, &lv)) cfg_.urgent_level = lv;
             else warn("invalid level", text);
+        } else if (key == "message.escape") {
+            set_bool(v, text, &cfg_.message_escape);
         } else if (key == "console") {
             set_bool(v, text, &cfg_.console);
         } else if (key == "console.color") {

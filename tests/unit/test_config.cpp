@@ -329,6 +329,44 @@ TEST(sanity_rules) {
     EXPECT_EQ(b.file.max_size, uint64_t(1) << 20);
 }
 
+// Security hardening keys: message.escape, file.mode, the file.max_files cap.
+TEST(security_keys) {
+    Config c;
+    EXPECT_TRUE(c.message_escape);          // on by default
+    EXPECT_EQ(c.file.mode, 0640u);          // not world-readable by default
+    std::vector<std::string> w;
+    EXPECT_TRUE(parse_config_string("message.escape = false\nfile.mode = 0600\n", c, &w));
+    EXPECT_FALSE(c.message_escape);
+    EXPECT_EQ(c.file.mode, 0600u);
+    EXPECT_TRUE(parse_config_string("file.mode = 644\n", c, &w));
+    EXPECT_EQ(c.file.mode, 0644u);
+    // Not octal / too many digits / out of range: warning, previous value kept.
+    const char *bad[] = {"file.mode = 0648", "file.mode = rw-r-----", "file.mode = 01777",
+                         "file.mode = ", "file.mode = 00640"};
+    for (const char *b : bad) {
+        w.clear();
+        EXPECT_FALSE(parse_config_string(b, c, &w));
+        EXPECT_EQ(c.file.mode, 0644u);
+        EXPECT_EQ(w.size(), size_t(1));
+    }
+    // file.max_files above the cap: clamped with a warning.
+    w.clear();
+    EXPECT_FALSE(parse_config_string("file.max_files = 20000", c, &w));
+    EXPECT_EQ(c.file.max_files, kMaxFilesLimit);
+    EXPECT_EQ(w.size(), size_t(1));
+    EXPECT_TRUE(parse_config_string("file.max_files = 10000", c, nullptr));
+    EXPECT_EQ(c.file.max_files, 10000);
+    // Programmatic configs are normalised by validate_config().
+    Config p;
+    p.file.max_files = 1000000;
+    p.file.mode = 01777;
+    w.clear();
+    EXPECT_FALSE(validate_config(p, &w));
+    EXPECT_EQ(p.file.max_files, kMaxFilesLimit);
+    EXPECT_EQ(p.file.mode, 0640u);
+    EXPECT_EQ(w.size(), size_t(2));
+}
+
 TEST(load_config_file) {
     std::string dir = test_dir();
     std::string p = dir + "/test_config_load.conf";

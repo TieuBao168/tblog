@@ -26,9 +26,16 @@ struct Record {
     const char *func;
 };
 
+// message.escape (escape_message = true): in the %m text, trailing '\n' are
+// removed and the other control characters are written as escapes ("\n",
+// "\r", "\xHH" for the rest of 0x00-0x1F and 0x7F; tab is kept), so data
+// logged with %s / {} cannot start a forged log line or send terminal escape
+// sequences. Backslashes are not escaped (Windows paths stay readable), so
+// the escaping is not reversible; it only guarantees one record per line.
+// Only %m is affected: the pattern's own text and tokens are written as is.
 class Formatter {
 public:
-    explicit Formatter(const std::string &pattern);
+    explicit Formatter(const std::string &pattern, bool escape_message = true);
     ~Formatter();
     Formatter(const Formatter &) = delete;
     Formatter &operator=(const Formatter &) = delete;

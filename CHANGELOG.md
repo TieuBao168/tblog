@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+### Security
+
+- **The log file is no longer opened through a symbolic link.** Previously a link planted at the log path (`app.log → <any file>`) made the process append its log lines to the link's target, and links planted among the rotated files made the gzip compressor truncate a target (`app.N.log.gz.tmp`) or copy a target into a readable `.gz` (`app.N.log`). The log file, rotated files and compression's temporary files are now opened with `O_NOFOLLOW` (Windows: reparse points refused), the temporary file is created with `O_EXCL`. A log path that is itself a symbolic link now makes `tblog_init` fail (`Too many levels of symbolic links`); links in the directory part still work.
+- **Control characters in messages are escaped** (`message.escape = true`, new): a newline becomes `\n`, other control characters `\xHH`, trailing newlines are dropped. Previously a logged value containing a newline could forge further log lines (and syslog records with their own severity), and escape sequences reached the terminal. Backslashes are not escaped.
+- **Log files are created with mode `0640`** instead of `0644` (`file.mode`, new): no longer readable by every local user. Existing files keep their permissions.
+- **`file.max_files` is capped at 10000** (clamped with a warning): size rotation renames every kept file, so a huge value stalled the background thread on every rotation.
+
 ### Fixed
 
 - **Shard lock no longer waits without bound.** Previously a log call spun and yielded forever while another thread held its shard's lock; a real-time thread (`SCHED_FIFO` / `SCHED_RR`) could hang behind a lower-priority holder preempted on the same CPU, because a yield only lets threads of the same priority run. Now `full_policy = drop` gives up after a short spin and drops the line (counted in `tblog_dropped_count()`); `block` sleeps in 50 µs steps after spinning and yielding, which lets the holder run. The uncontended path only gains one branch on the policy.

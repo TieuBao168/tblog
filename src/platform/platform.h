@@ -49,19 +49,34 @@ struct FileHandle {
 };
 FileHandle no_file() noexcept;  // inline, in <os>/inline.h
 
+// Every mode except Read refuses a symbolic link (or, on Windows, any reparse
+// point) as the last path component: the open fails with errno ELOOP. Log
+// files often live in directories that other users can write to, and a
+// planted link must not make the process append to, truncate or read a file
+// of the link's choosing. Links in the directory part are still followed.
 enum class OpenMode {
-    Append,    // write-only, create (0644), every write appends (O_APPEND /
-               // FILE_APPEND_DATA). Log files.
-    Read,      // read-only, must exist.
-    Truncate,  // write-only, create (0644) or truncate to 0.
+    Append,      // write-only, create (`perms`), every write appends (O_APPEND /
+                 // FILE_APPEND_DATA). Log files.
+    Read,        // read-only, must exist. Follows links (configuration files).
+    ReadNoFollow,  // read-only, must exist, not a link. Rotated log files.
+    Truncate,    // write-only, create (`perms`) or truncate to 0.
+    CreateNew,   // write-only, create (`perms`); fails (EEXIST) if anything,
+                 // a link included, already has that name. Temporary files.
 };
 
+// Default permissions of files tblog creates (file.mode): owner read/write,
+// group read. Ignored on Windows (default ACL of the directory).
+constexpr unsigned kDefaultFileMode = 0640;
+
 // Opens `path`. Handles are close-on-exec / not inherited by child processes.
+// `perms` applies only when the file is created (POSIX permission bits,
+// further restricted by the umask; ignored on Windows).
 // Windows: every handle is opened with FILE_SHARE_READ | FILE_SHARE_WRITE |
 // FILE_SHARE_DELETE, so the file can still be renamed or deleted while open
 // (rotation renames the live log file before closing it, and the archiver may
 // shift a rotated file while compressing it).
-FileHandle file_open(const std::string &path, OpenMode mode) noexcept;
+FileHandle file_open(const std::string &path, OpenMode mode,
+                     unsigned perms = kDefaultFileMode) noexcept;
 void file_close(FileHandle h) noexcept;                 // invalid handle: no-op
 FileHandle file_dup(FileHandle h) noexcept;             // independent handle to the same open file
 

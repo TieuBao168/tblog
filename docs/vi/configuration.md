@@ -22,10 +22,12 @@ Số đo trên trang này lấy từ laptop Windows 11 (Ryzen 7 8845HS, NVMe, Mi
 | `level` | `INFO` | Level gốc, áp cho mọi module chưa đặt riêng | Có |
 | `module.<tên>` | theo `level` | Level riêng của một module (tên ≤ 45 ký tự, ≤ 256 module) | Có ¹ |
 | `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Khuôn dòng, xem [token](#pattern) | Có |
+| `message.escape` | `true` | Escape ký tự điều khiển trong nội dung, xem [bảo mật](#bảo-mật-symlink-quyền-file-escape) | Có |
 | `file` | `true` | Ghi file | Không ² |
-| `file.path` | `./logs/app.log` | File log; tương đối theo thư mục làm việc lúc init | Không ² |
+| `file.path` | `./logs/app.log` | File log; tương đối theo thư mục làm việc lúc init. Không được là symlink | Không ² |
+| `file.mode` | `0640` | Quyền (bát phân) của các file tblog tạo; Linux, macOS | Không ² |
 | `file.max_size` | `256MB` | Xoay khi file vượt | Không |
-| `file.max_files` | `5` | Số file giữ, kể cả file đang ghi | Không |
+| `file.max_files` | `5` | Số file giữ, kể cả file đang ghi (1–10000) | Không |
 | `file.rotate` | `size` | `size`, `daily`, `hourly` | Không |
 | `file.compress` | `none` | `none`, `gzip` (cần build có zlib) | Không |
 | `buffer.size` | `4MB` | Buffer RAM, chia cho các shard | Không ² |
@@ -152,6 +154,14 @@ Mọi sink chạy trên thread nền theo thứ tự file, console, syslog, sink
 
 Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. Dòng ngắn hơn thì file nhỏ hơn và thread nền ghi được nhiều dòng hơn mỗi giây.
 
+### Bảo mật: symlink, quyền file, escape
+
+File log thường nằm trong thư mục mà người dùng hay dịch vụ khác ghi được, còn nội dung log thường chứa dữ liệu từ bên ngoài (tên người dùng, đường dẫn request). Ba lớp bảo vệ bật mặc định:
+
+- **Không đi theo symlink.** File log và các file khi xoay, nén được mở mà không đi theo symlink ở thành phần cuối của đường dẫn (Windows: mọi reparse point). Nếu ai đó cài sẵn `app.log → /etc/passwd`, `tblog_init` thất bại với `Too many levels of symbolic links` thay vì ghi vào file đích. Symlink ở phần thư mục (`/var/log/app → /data/log`) vẫn dùng được. Nếu chính đường dẫn file log là symlink, hãy thay bằng đường dẫn thật.
+- **`file.mode = 0640`**: file log và file `.gz` chỉ chủ sở hữu và nhóm đọc được (umask có thể hạn chế thêm). Dùng `0644` nếu công cụ gom log chạy bằng user khác cần đọc; file đã có sẵn giữ nguyên quyền cũ.
+- **`message.escape = true`**: trong nội dung (`%m`), ký tự xuống dòng thành `\n`, carriage return thành `\r`, các ký tự điều khiển khác thành `\xHH` (tab giữ nguyên), và các dấu xuống dòng ở cuối bị bỏ. Một giá trị như `bob\n2026-… [ERROR] …` vì vậy không tạo được dòng giả (trong file, hay một bản ghi syslog thứ hai với severity riêng), và mã điều khiển không tới được terminal. Dấu `\` không bị escape nên không khôi phục được văn bản gốc: chỉ bảo đảm mỗi bản ghi một dòng. Chi phí: thêm một lượt quét qua nội dung (chưa benchmark riêng). Chỉ tắt khi mọi nội dung log đều đáng tin và cần giữ xuống dòng thật.
+
 ## Sự cố nào, key nào bảo vệ
 
 | Sự cố | Mặc định mất | Bảo vệ |
@@ -165,7 +175,7 @@ Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. D�
 
 ## Cảnh báo
 
-Dạng `tblog: config: config line <N>: <lỗi>` lúc init và mỗi lần đọc lại: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, lỗi ngoặc kép, `option removed, ignored` (các key đã bỏ: `backend`, `mmap.region_size`, `format.mode`).
+Dạng `tblog: config: config line <N>: <lỗi>` lúc init và mỗi lần đọc lại: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, `file.max_files above 10000, clamped`, `invalid file.mode`, lỗi ngoặc kép, `option removed, ignored` (các key đã bỏ: `backend`, `mmap.region_size`, `format.mode`).
 
 Sửa tổ hợp không dùng được: `gzip` khi không có zlib → `none`; `file = false` không còn sink → bật `console`; `flush.on_level` dưới `INFO` → chỉ cảnh báo.
 

@@ -77,7 +77,8 @@ void RotatingFile::check_time() noexcept {
 }
 
 bool RotatingFile::open_fd() noexcept {
-    pf::FileHandle h = pf::file_open(opt_.path, pf::OpenMode::Append);
+    // Refuses a symbolic link planted at the path (ELOOP; see pf::OpenMode).
+    pf::FileHandle h = pf::file_open(opt_.path, pf::OpenMode::Append, opt_.mode);
     if (!h.valid()) return false;
     pf::FileInfo fi;
     size_ = pf::file_info(h, &fi) ? fi.size : 0;

@@ -2,6 +2,12 @@
 
 [English](CHANGELOG.md) | **Tiếng Việt**
 
+## Chưa phát hành
+
+### Sửa
+
+- **Khóa của shard không còn chờ vô hạn.** Trước đây lệnh log quay và `yield` mãi khi thread khác giữ khóa shard của nó; thread real-time (`SCHED_FIFO` / `SCHED_RR`) có thể treo sau một thread ưu tiên thấp hơn bị chen ngang trên cùng CPU, vì `yield` chỉ nhường cho thread cùng độ ưu tiên. Giờ `full_policy = drop` bỏ cuộc sau một vòng quay ngắn và bỏ dòng (tính vào `tblog_dropped_count()`); `block` sau khi quay và `yield` thì ngủ từng 50 µs, để thread giữ khóa được chạy. Đường không tranh khóa chỉ thêm một lệnh rẽ nhánh theo policy.
+
 ## 0.1.0 (2026-11-22)
 
 Bản phát hành đầu tiên.

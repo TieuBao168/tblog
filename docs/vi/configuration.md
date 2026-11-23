@@ -55,7 +55,7 @@ Chỉ có tác dụng khi log nhanh hơn trần của thread nền (khoảng 4�
 | Thông lượng end-to-end, 16 thread | 4.27 M/s | 5.04 M/s |
 
 - **`block`**: không mất dòng; đổi lại khi quá tải, thread gọi log có lúc chờ vài ms, và đĩa chậm sẽ làm chậm ứng dụng.
-- **`drop`**: lệnh log không bao giờ chờ; đổi lại mất log đúng lúc quá tải (thường là lúc có chuyện). Một thread ồn có thể làm đầy shard của nó trong khi shard khác còn trống. Theo dõi bằng `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file.
+- **`drop`**: lệnh log không bao giờ chờ thread nền, chờ đĩa hay chờ thread đang giữ khóa của shard (khóa không trống sau một vòng quay ngắn, có giới hạn, thì dòng cũng bị bỏ; nhờ vậy thread real-time không bị kẹt sau một thread ưu tiên thấp bị chen ngang lúc đang log); đổi lại mất log đúng lúc quá tải (thường là lúc có chuyện). Một thread ồn có thể làm đầy shard của nó trong khi shard khác còn trống. Theo dõi bằng `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file.
 - Chọn `drop` chỉ khi thread gọi log có deadline cứng (vòng lặp thời gian thực, xử lý mạng).
 
 ### `flush.on_level`: sống sót qua `kill -9`

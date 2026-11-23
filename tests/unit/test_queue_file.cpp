@@ -4,6 +4,7 @@
 #include "logger/pipeline.h"
 #include "pipeline_util.h"
 #include "queue/queue.h"
+#include "queue/spinlock.h"
 #include "sinks/file_sink.h"
 #include "sinks/rotating_file.h"
 #include "sinks/sink.h"
@@ -368,6 +369,58 @@ TEST(queue_drop_policy_stalled_worker) {
     EXPECT_TRUE(b->queue().append(line.data(), 64, TBLOG_LV_INFO));
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == expect + line);
+}
+
+// full_policy = drop: a held shard lock (holder descheduled) makes the caller
+// give up after a bounded spin instead of waiting for the holder.
+TEST(spinlock_bounded_try_gives_up_on_held_lock) {
+    SpinLock l;
+    l.lock();
+    bool got = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread t([&] { got = l.try_lock_bounded(); });
+    t.join();
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    EXPECT_FALSE(got);
+    EXPECT_TRUE(waited < std::chrono::seconds(1));  // ~256 pauses + 64 yields
+    l.unlock();
+    EXPECT_TRUE(l.try_lock_bounded());
+    l.unlock();
+}
+
+// full_policy = block: lock() waits through its spin, yield and sleep phases
+// for a holder that sleeps inside the critical section, and still excludes.
+TEST(spinlock_lock_waits_for_sleeping_holder) {
+    SpinLock l;
+    std::atomic<bool> held{false};
+    std::atomic<bool> released{false};
+    std::thread holder([&] {
+        SpinGuard g(l);
+        held = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        released = true;
+    });
+    while (!held) std::this_thread::yield();
+    {
+        SpinGuard g(l);  // reaches the sleep phase while the holder sleeps
+        EXPECT_TRUE(released.load());
+    }
+    holder.join();
+
+    // Mutual exclusion with holders that sometimes sleep inside the lock.
+    const int kThreads = 4, kIters = 20000 / kScale;
+    long counter = 0;  // plain: only ever touched under the lock
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < kIters; ++i) {
+                SpinGuard g(l);
+                ++counter;
+                if (i % 2000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        });
+    for (auto &t : ts) t.join();
+    EXPECT_EQ(counter, static_cast<long>(kThreads) * kIters);
 }
 
 TEST(queue_block_policy_loses_nothing) {

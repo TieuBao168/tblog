@@ -2,6 +2,12 @@
 
 **English** | [Tiếng Việt](CHANGELOG.vi.md)
 
+## Unreleased
+
+### Fixed
+
+- **Shard lock no longer waits without bound.** Previously a log call spun and yielded forever while another thread held its shard's lock; a real-time thread (`SCHED_FIFO` / `SCHED_RR`) could hang behind a lower-priority holder preempted on the same CPU, because a yield only lets threads of the same priority run. Now `full_policy = drop` gives up after a short spin and drops the line (counted in `tblog_dropped_count()`); `block` sleeps in 50 µs steps after spinning and yielding, which lets the holder run. The uncontended path only gains one branch on the policy.
+
 ## 0.1.0 (2026-11-22)
 
 First release.

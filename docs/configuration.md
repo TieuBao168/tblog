@@ -55,7 +55,7 @@ Only matters when logging is faster than the background thread's ceiling (about 
 | End-to-end throughput, 16 threads | 4.27 M/s | 5.04 M/s |
 
 - **`block`**: no lines lost; in exchange, under overload the logging thread sometimes waits a few ms, and a slow disk slows the application.
-- **`drop`**: a log call never waits; in exchange, logs are lost exactly under overload (usually when something is going on). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
+- **`drop`**: a log call never waits for the background thread, the disk or a thread that holds its shard's lock (if the lock is not free after a short, bounded spin, the line is dropped too, so a real-time thread cannot get stuck behind a lower-priority thread that was preempted while logging); in exchange, logs are lost exactly under overload (usually when something is going on). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
 - Choose `drop` only when the logging thread has a hard deadline (real-time loops, network processing).
 
 ### `flush.on_level`: surviving `kill -9`

@@ -342,7 +342,8 @@ TEST(security_keys) {
     EXPECT_EQ(c.file.mode, 0644u);
     // Not octal / too many digits / out of range: warning, previous value kept.
     const char *bad[] = {"file.mode = 0648", "file.mode = rw-r-----", "file.mode = 01777",
-                         "file.mode = ", "file.mode = 00640"};
+                         "file.mode = ", "file.mode = 00640",
+                         "file.mode = 0440", "file.mode = 0"};  // no owner write: reopen would fail
     for (const char *b : bad) {
         w.clear();
         EXPECT_FALSE(parse_config_string(b, c, &w));
@@ -359,7 +360,7 @@ TEST(security_keys) {
     // Programmatic configs are normalised by validate_config().
     Config p;
     p.file.max_files = 1000000;
-    p.file.mode = 01777;
+    p.file.mode = 0444;  // no owner write
     w.clear();
     EXPECT_FALSE(validate_config(p, &w));
     EXPECT_EQ(p.file.max_files, kMaxFilesLimit);

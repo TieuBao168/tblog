@@ -100,7 +100,7 @@ File được đọc lại khi đổi (level, module, pattern...). Mọi key kè
 | Windows 8+ x64 | MSVC (C++14+), MinGW-w64 | Đầy đủ |
 | Windows ARM64 | MSVC | Chỉ biên dịch header |
 
-Ứng dụng: C99 (MSVC: C11) hoặc C++11 trở lên. CMake 3.10+; zlib tùy chọn (nén gzip). Vi điều khiển: [tblog-lite](docs/vi/lite.md) (C99, không malloc, ~3 KB code).
+Ứng dụng: C99 (MSVC: C11) hoặc C++11 trở lên. CMake 3.10+; zlib tùy chọn (nén gzip). Vi điều khiển: [tblog-lite](docs/vi/lite.md) (C99, không malloc, ~3.7 KB code).
 
 ## Tài liệu
 

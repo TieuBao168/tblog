@@ -21,7 +21,7 @@ tblog_lite_process();
 
 | | tblog-lite | tblog |
 |---|---|---|
-| Memory | ~3 KB code, ~2.1 KB RAM (2 KB ring) | 8 MB buffer by default |
+| Memory | ~3.7 KB code (3.4 KB with `TBLOG_LITE_ESCAPE=0`), ~2.1 KB RAM (2 KB ring) | 8 MB buffer by default |
 | Output | Your `write` function, called from `process()` | File, console, syslog, custom sinks |
 | Buffer full | Always drops the line (counted) | Wait or drop |
 | Levels | One global level | Per module |
@@ -61,6 +61,7 @@ Set with `-D`, or `tblog_lite_user_config.h` + `-DTBLOG_LITE_USER_CONFIG`. The l
 | `TBLOG_LITE_LONG_LONG` | `1` | `0`: avoid 64-bit division helpers on 32-bit MCUs |
 | `TBLOG_LITE_FILELINE` | `1` | `0`: drop `file:line`, no `__FILE__` strings in flash |
 | `TBLOG_LITE_MODULE` | `1` | `0`: drop the module name from the line |
+| `TBLOG_LITE_ESCAPE` | `1` | `0`: write control characters in the message as is (saves ~270 bytes of code); `1` escapes them like full tblog's `message.escape` |
 | `TBLOG_LITE_DEFAULT_LEVEL` | `TBLOG_LV_INFO` | Level after reset |
 | `TBLOG_COMPILE_LEVEL` | `TBLOG_LV_TRACE` | Remove calls below the level from flash entirely |
 

@@ -246,6 +246,7 @@ private:
                 m = m * 8 + unsigned(ch - '0');
             }
             if (!ok || m > 0777) warn("invalid file.mode (octal permission bits, e.g. 0640)", text);
+            else if (!(m & 0200)) warn("file.mode must let the owner write (e.g. 0640)", text);
             else cfg_.file.mode = m;
         } else if (key == "file.rotate") {
             std::string l = to_lower(v);

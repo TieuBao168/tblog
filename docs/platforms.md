@@ -10,7 +10,7 @@
 | Syslog | Yes | Yes (unified logging) | No, `syslog = true` is ignored with a warning |
 | Makefile | Yes | No, use CMake | No, use CMake |
 
-All platforms: files are opened in append mode, handles are not inherited by child processes, parent directories are created automatically, and a symbolic link as the log file (Windows: any reparse point) is refused ([security](configuration.md#security-links-permissions-escaping)). `file.mode` (default `0640`) applies on Linux and macOS only; on Windows new files get the directory's default ACL.
+All platforms: files are opened in append mode, handles are not inherited by child processes, parent directories are created automatically, and a symbolic link or a second hard link as the log file (Windows: symbolic link or junction) is refused ([security](configuration.md#security-links-permissions-escaping)). `file.mode` (default `0640`) applies on Linux and macOS only; on Windows new files get the directory's default ACL.
 
 ## Linux
 

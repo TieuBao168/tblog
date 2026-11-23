@@ -119,10 +119,25 @@ inline size_t escaped_len(unsigned char c) {
 // No allocation: the common case (no control byte) is one scan; otherwise
 // the escapes are written back to front, which never overwrites a byte that
 // is still to be read because the text only grows.
+// True if some byte of w is below 0x20 (tab included) or equal to 0x7F
+// (bit tricks "has less than" / "has value"; exact as to existence, bytes
+// >= 0x80 never match). Lets the common case skip 8 bytes per step.
+inline bool word_has_control(uint64_t w) {
+    const uint64_t ones = 0x0101010101010101ull, high = 0x8080808080808080ull;
+    const uint64_t below = (w - ones * 0x20) & ~w & high;
+    const uint64_t x = w ^ (ones * 0x7f);
+    const uint64_t del = (x - ones) & ~x & high;
+    return (below | del) != 0;
+}
+
 bool escape_message(char *buf, size_t start, size_t *end, size_t lim) {
     size_t e = *end;
     while (e > start && buf[e - 1] == '\n') --e;
     size_t i = start;
+    for (uint64_t w; i + 8 <= e; i += 8) {
+        std::memcpy(&w, buf + i, 8);
+        if (word_has_control(w)) break;
+    }
     while (i < e && !needs_escape(static_cast<unsigned char>(buf[i]))) ++i;
     if (i == e) {
         *end = e;

@@ -4,6 +4,8 @@
 
 So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không so với thư viện log khác. Mọi số lấy từ các file JSON trong [bench/results/](../../bench/results/), bảng dựng bằng `bench/report.py`.
 
+> **Lưu ý:** các số dưới đây được đo trước hai thay đổi sau này: `full_policy = drop` giờ cũng bỏ dòng khi khóa shard vẫn bận sau một vòng quay ngắn (dd7791a), và `message.escape` (bật mặc định) thêm 6–10 ns mỗi dòng (microbenchmark của formatter). Hãy chạy lại benchmark trước khi dựa vào số chính xác.
+
 ## Kết luận
 
 | | tblog tốt hơn | tblog kém hơn |

@@ -271,17 +271,21 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
         uint64_t gen = 0;
         bool ok = false;
         {
-            // Drop never waits for a holder that was descheduled (spinlock.h):
-            // the line is dropped like one that does not fit.
-            if (policy_ == FullPolicy::Drop) {
-                if (TBLOG_UNLIKELY(!sh.spin.try_lock_bounded())) {
-                    dropped_.fetch_add(1, std::memory_order_relaxed);
-                    return false;
-                }
-            } else {
-                sh.spin.lock();
+            // Drop never waits for a holder that was descheduled (spinlock.h);
+            // Block waits, but gives up once the queue is closed, so a holder
+            // that died inside append (a crash) cannot hang it.
+            const bool locked = policy_ == FullPolicy::Drop ? sh.spin.try_lock_bounded()
+                                                            : sh.spin.lock_unless(closed_);
+            if (TBLOG_UNLIKELY(!locked)) {
+                // Closed or crashed meanwhile (a crash drain probing the lock,
+                // a holder that died in here): the post-crash path writes the
+                // line. Otherwise (Drop only) the line is dropped like one
+                // that does not fit.
+                if (closed_.load(std::memory_order_relaxed)) return append_closed(data, len);
+                dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false;
             }
-            SpinAdopt g(sh.spin);
+            std::lock_guard<SpinLock> g(sh.spin, std::adopt_lock);
             // Re-checked under the lock: close() / crash_drain() barriers.
             if (TBLOG_UNLIKELY(closed_.load(std::memory_order_relaxed))) goto closed;
             Buffer &b = sh.bufs[sh.active.load(std::memory_order_relaxed)];
@@ -352,7 +356,7 @@ size_t Queue::take(Batch &out) noexcept {
     // Swap every non-empty shard (short critical sections).
     for (size_t i = 0; i < nshards_; ++i) {
         Shard &sh = shards_[i];
-        SpinGuard g(sh.spin);
+        std::lock_guard<SpinLock> g(sh.spin);
         // A crash handler passed (or is about to pass) its barrier: leave
         // every shard as it found it. The lock orders this load after the
         // handler's store when the handler took this lock first.
@@ -441,7 +445,7 @@ void Queue::close() noexcept {
     closed_.store(true, std::memory_order_relaxed);
     // Barrier: appends that saw closed_ == false finish before we return;
     // later ones see closed_ (the lock orders them after this store).
-    for (size_t i = 0; i < nshards_; ++i) SpinGuard g(shards_[i].spin);
+    for (size_t i = 0; i < nshards_; ++i) std::lock_guard<SpinLock> g(shards_[i].spin);
     wake_blocked();
     wake_flush_waiters();
     wake();

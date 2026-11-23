@@ -49,11 +49,14 @@ struct FileHandle {
 };
 FileHandle no_file() noexcept;  // inline, in <os>/inline.h
 
-// Every mode except Read refuses a symbolic link (or, on Windows, any reparse
-// point) as the last path component: the open fails with errno ELOOP. Log
-// files often live in directories that other users can write to, and a
-// planted link must not make the process append to, truncate or read a file
-// of the link's choosing. Links in the directory part are still followed.
+// Every mode except Read refuses a symbolic link (Windows: a symbolic link
+// or junction, i.e. a name-surrogate reparse point) as the last path
+// component, errno ELOOP, and a regular file with more than one hard link,
+// errno EMLINK. Log files often live in directories that other users can
+// write to, and a planted link must not make the process append to,
+// truncate or read a file of the link's choosing. Links in the directory
+// part are still followed; other reparse points (cloud-files placeholders,
+// deduplication) are opened normally.
 enum class OpenMode {
     Append,      // write-only, create (`perms`), every write appends (O_APPEND /
                  // FILE_APPEND_DATA). Log files.

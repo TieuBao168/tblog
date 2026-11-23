@@ -4,6 +4,8 @@
 
 Compares tblog with the simplest way to log: `fprintf` into a file. No comparison with other logging libraries. Every figure comes from the JSON files in [bench/results/](../bench/results/); tables are built with `bench/report.py`.
 
+> **Note:** these figures were measured before two later changes: `full_policy = drop` now also drops a line when its shard lock stays busy after a short spin (dd7791a), and `message.escape` (on by default) adds 6–10 ns per line (formatter microbenchmark). Rerun the benchmarks before relying on the exact numbers.
+
 ## Conclusions
 
 | | tblog is better | tblog is worse |

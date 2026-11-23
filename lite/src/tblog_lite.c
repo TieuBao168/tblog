@@ -69,12 +69,53 @@ uint32_t tblog_lite_dropped_count(void) {
     return dropped_total_;
 }
 
+#if TBLOG_LITE_ESCAPE
+/* Bytes written for c once escaped (see TBLOG_LITE_ESCAPE). */
+static size_t esc_len(unsigned char c) {
+    if ((c >= 0x20 || c == '\t') && c != 0x7f) return 1;
+    return (c == '\n' || c == '\r') ? 2 : 4;
+}
+
+/* Escapes b[start, end) in place, growing it up to lim (whole escapes only);
+ * trailing newlines are dropped first. Returns the new end. Written back to
+ * front, so no byte is overwritten before it is read (the text only grows). */
+static size_t escape_inplace(char *b, size_t start, size_t end, size_t lim) {
+    static const char hex[] = "0123456789abcdef";
+    size_t i = start, out, src, w;
+    while (end > start && b[end - 1] == '\n') end--;
+    while (i < end && esc_len((unsigned char)b[i]) == 1) i++;
+    if (i == end) return end;
+    out = i;
+    for (src = i; src < end; src++) {
+        size_t l = esc_len((unsigned char)b[src]);
+        if (out + l > lim) break;
+        out += l;
+    }
+    w = out;
+    while (src > i) {
+        unsigned char c = (unsigned char)b[--src];
+        if (esc_len(c) == 1) {
+            b[--w] = (char)c;
+        } else if (c == '\n' || c == '\r') {
+            b[--w] = c == '\n' ? 'n' : 'r';
+            b[--w] = '\\';
+        } else {
+            b[--w] = hex[c & 0xF];
+            b[--w] = hex[c >> 4];
+            b[--w] = 'x';
+            b[--w] = '\\';
+        }
+    }
+    return out;
+}
+#endif
+
 void tblog_lite_write(tblog_level lv, const char *module, const char *file, int line,
                       const char *fmt, ...) {
     static const char letters[] = "TDIWEF";
     const tblog_lite_port *p = port_;
     char buf[TBLOG_LITE_LINE_MAX];
-    size_t len, h, used, first;
+    size_t len, h, used, first, msg;
     uint32_t st;
     va_list ap;
     int r;
@@ -93,13 +134,19 @@ void tblog_lite_write(tblog_level lv, const char *module, const char *file, int 
         if ((size_t)r >= sizeof buf) r = (int)sizeof buf - 1;
     }
 
+    msg = (size_t)r; /* the message starts here (r <= sizeof buf - 1) */
     va_start(ap, fmt);
     r += tblog_lite_vsnprintf(buf + r, sizeof buf - (size_t)r, fmt, ap);
     va_end(ap);
 
     /* Terminate with exactly one '\n' (replaces the NUL; may use the last byte). */
     len = (size_t)r < sizeof buf ? (size_t)r : sizeof buf - 1;
+#if TBLOG_LITE_ESCAPE
+    len = escape_inplace(buf, msg, len, sizeof buf - 1);
+#else
+    (void)msg;
     if (len && buf[len - 1] == '\n') len--;
+#endif
     buf[len++] = '\n';
 
     st = crit_enter(p);

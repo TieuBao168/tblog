@@ -4,8 +4,8 @@
 // The lock is held only for one memcpy of a line, so the uncontended and the
 // briefly contended cases are what matter for speed. What matters for
 // correctness is the holder being preempted while a waiter spins:
-//   * lock() (full_policy = block) spins, then yields, then SLEEPS in short
-//     steps. Sleeping matters for real-time threads (SCHED_FIFO / SCHED_RR):
+//   * lock() / lock_unless() (full_policy = block) spin, then yield, then
+//     SLEEP in short steps; lock_unless() also stops once the queue closed. Sleeping matters for real-time threads (SCHED_FIFO / SCHED_RR):
 //     sched_yield only yields to threads of the same priority, so a waiter
 //     that only yielded could spin forever while a lower-priority holder on
 //     the same CPU never runs again. A sleeping waiter lets it run.
@@ -16,6 +16,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>  // std::lock_guard, std::adopt_lock (users)
 #include <chrono>
 #include <thread>
 
@@ -84,23 +85,12 @@ public:
 
     // Test-and-test-and-set: spin on a plain load (no cache-line ping-pong),
     // pause between probes, then yield, then sleep (see the top of the file).
-    void lock() noexcept {
-        unsigned spins = 0;
-        while (flag_.test_and_set(std::memory_order_acquire)) {
-            while (locked_.load(std::memory_order_relaxed)) {
-                if (spins < kPauses) {
-                    TBLOG_CPU_RELAX();
-                } else if (spins < kPauses + kYields) {
-                    std::this_thread::yield();
-                } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long>(kSleepUs)));
-                    continue;  // no counter overflow while sleeping
-                }
-                ++spins;
-            }
-        }
-        locked_.store(true, std::memory_order_relaxed);
-    }
+    void lock() noexcept { (void)lock_unless_impl(nullptr); }
+
+    // As lock(), but returns false (lock not taken) once `stop` is seen set
+    // in the sleep phase: the queue's closed flag, so a holder that died
+    // inside its critical section (a crash) cannot hang the waiter forever.
+    bool lock_unless(const std::atomic<bool> &stop) noexcept { return lock_unless_impl(&stop); }
 
     // full_policy = drop: never waits for a descheduled holder. False after
     // kPauses pauses and kBoundedYields yields without getting the lock.
@@ -136,27 +126,31 @@ public:
     }
 
 private:
+    bool lock_unless_impl(const std::atomic<bool> *stop) noexcept {
+        unsigned spins = 0;
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+            while (locked_.load(std::memory_order_relaxed)) {
+                if (spins < kPauses) {
+                    TBLOG_CPU_RELAX();
+                } else if (spins < kPauses + kYields) {
+                    std::this_thread::yield();
+                } else {
+                    if (stop && stop->load(std::memory_order_relaxed)) return false;
+                    std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long>(kSleepUs)));
+                    continue;  // no counter overflow while sleeping
+                }
+                ++spins;
+            }
+        }
+        locked_.store(true, std::memory_order_relaxed);
+        return true;
+    }
+
     // std::atomic_flag has no load() before C++20, so mirror its state.
     std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
     std::atomic<bool> locked_{false};
 };
-
-// Locks in the constructor, unlocks in the destructor.
-struct SpinGuard {
-    explicit SpinGuard(SpinLock &l) : l_(l) { l_.lock(); }
-    ~SpinGuard() { l_.unlock(); }
-    SpinGuard(const SpinGuard &) = delete;
-    SpinGuard &operator=(const SpinGuard &) = delete;
-    SpinLock &l_;
-};
-
-// Unlocks in the destructor a lock the caller already holds.
-struct SpinAdopt {
-    explicit SpinAdopt(SpinLock &l) : l_(l) {}
-    ~SpinAdopt() { l_.unlock(); }
-    SpinAdopt(const SpinAdopt &) = delete;
-    SpinAdopt &operator=(const SpinAdopt &) = delete;
-    SpinLock &l_;
-};
+// SpinLock is BasicLockable: guard it with std::lock_guard<SpinLock> (with
+// std::adopt_lock after try_lock_bounded() / lock_unless()).
 
 }  // namespace tblog

@@ -261,7 +261,7 @@ FileHandle file_open(const std::string &path, OpenMode mode, unsigned /*perms*/)
             break;
     }
     // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link / junction itself
-    // instead of its target, so the attribute check below sees it.
+    // instead of its target, so the check below sees it.
     const DWORD flags = FILE_ATTRIBUTE_NORMAL | (no_follow ? FILE_FLAG_OPEN_REPARSE_POINT : 0);
     // Default security attributes: the handle is not inherited.
     HANDLE h = CreateFileW(w.c_str(), access, kShareAll, nullptr, disposition, flags, nullptr);
@@ -270,16 +270,37 @@ FileHandle file_open(const std::string &path, OpenMode mode, unsigned /*perms*/)
         return no_file();
     }
     if (no_follow) {
+        auto fail = [&](int err) -> FileHandle {
+            CloseHandle(h);
+            errno = err;
+            return no_file();
+        };
         BY_HANDLE_FILE_INFORMATION info;
-        if (!GetFileInformationByHandle(h, &info)) {
-            win::set_errno_from_last_error();
+        FILE_ATTRIBUTE_TAG_INFO tag;
+        if (!GetFileInformationByHandle(h, &info) ||
+            !GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag))
+            return fail(win::errno_from(GetLastError()));
+        // A hard link (second name) may be any file of the creator's choosing.
+        if (info.nNumberOfLinks > 1) return fail(EMLINK);
+        if (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            // Links (symbolic links, junctions: name surrogates) are refused.
+            if (IsReparseTagNameSurrogate(tag.ReparseTag)) return fail(ELOOP);
+            // Other reparse points are ordinary files with a filter on top
+            // (OneDrive / cloud-files placeholders, deduplication): open
+            // them normally, so the filter serves the data, and make sure
+            // the name still refers to the same file.
             CloseHandle(h);
-            return no_file();
-        }
-        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-            CloseHandle(h);
-            errno = ELOOP;
-            return no_file();
+            h = CreateFileW(w.c_str(), access, kShareAll, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                win::set_errno_from_last_error();
+                return no_file();
+            }
+            BY_HANDLE_FILE_INFORMATION again;
+            if (!GetFileInformationByHandle(h, &again)) return fail(win::errno_from(GetLastError()));
+            if (again.dwVolumeSerialNumber != info.dwVolumeSerialNumber ||
+                again.nFileIndexHigh != info.nFileIndexHigh || again.nFileIndexLow != info.nFileIndexLow)
+                return fail(ELOOP);  // replaced in between (e.g. by a link)
         }
     }
     if (truncate) {

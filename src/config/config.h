@@ -65,7 +65,7 @@ bool load_config(const char *path, Config &out, std::vector<std::string> *warnin
 // Rules:
 //   * file.compress = gzip in a build without zlib -> none (warning)
 //   * file.max_files < 1 -> 1, > kMaxFilesLimit -> kMaxFilesLimit,
-//     file.max_size == 0 -> 1, file.mode > 0777 -> 0640 (programmatic configs;
+//     file.max_size == 0 -> 1, file.mode > 0777 or without owner write -> 0640 (programmatic configs;
 //     the parser already rejects these)
 //   * flush.interval_ms clamped to [kFlushIntervalMinMs, kFlushIntervalMaxMs],
 //     sync.interval_ms to [0, kSyncIntervalMaxMs] (programmatic configs; the

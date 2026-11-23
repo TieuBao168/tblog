@@ -100,7 +100,7 @@ The file is re-read when it changes (level, modules, pattern...). Every key with
 | Windows 8+ x64 | MSVC (C++14+), MinGW-w64 | Full |
 | Windows ARM64 | MSVC | Headers compiled only |
 
-Applications: C99 (MSVC: C11) or C++11 and later. CMake 3.10+; zlib optional (gzip compression). Microcontrollers: [tblog-lite](docs/lite.md) (C99, no malloc, ~3 KB code).
+Applications: C99 (MSVC: C11) or C++11 and later. CMake 3.10+; zlib optional (gzip compression). Microcontrollers: [tblog-lite](docs/lite.md) (C99, no malloc, ~3.7 KB code).
 
 ## Documentation
 

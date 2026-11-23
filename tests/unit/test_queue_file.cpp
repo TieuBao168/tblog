@@ -5,6 +5,7 @@
 #include "pipeline_util.h"
 #include "queue/queue.h"
 #include "queue/spinlock.h"
+#include "sinks/archiver.h"
 #include "sinks/file_sink.h"
 #include "sinks/rotating_file.h"
 #include "sinks/sink.h"
@@ -222,6 +223,16 @@ TEST(rotating_refuses_symlink_and_applies_mode) {
         ::unlink(o.path.c_str());
     }
     ::umask(old_mask);
+
+    // A hard link (second name of another file) is refused too (EMLINK).
+    ASSERT_TRUE(::link(victim.c_str(), d.file("app.log").c_str()) == 0);
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        EXPECT_FALSE(rf.open(o));
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
 #endif
 }
 
@@ -254,6 +265,33 @@ TEST(rotating_gzip_tmp_symlink_not_followed) {
     EXPECT_TRUE(read_file(victim) == "SECRET\n");
     EXPECT_TRUE(fs::exists(d.file("app.1.log.gz")));
     EXPECT_FALSE(fs::exists(d.file("app.1.log.gz.tmp")));
+#endif
+}
+
+// Read side: a rotated file replaced by a link to another file is not
+// compressed (its target would be copied into a readable .gz).
+TEST(archiver_does_not_compress_through_symlink) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks");
+#else
+    TempDir d("gzread");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.1.log").c_str()) == 0);
+    {
+        Archiver a;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.max_files = 3;
+        o.compress = CompressMode::Gzip;
+        a.configure(o);
+        a.recover();
+        a.start();  // queues app.1.log for compression
+        a.finish();
+    }
+    EXPECT_FALSE(fs::exists(d.file("app.1.log.gz")));
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
 #endif
 }
 #endif
@@ -471,14 +509,14 @@ TEST(spinlock_lock_waits_for_sleeping_holder) {
     std::atomic<bool> held{false};
     std::atomic<bool> released{false};
     std::thread holder([&] {
-        SpinGuard g(l);
+        std::lock_guard<SpinLock> g(l);
         held = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         released = true;
     });
     while (!held) std::this_thread::yield();
     {
-        SpinGuard g(l);  // reaches the sleep phase while the holder sleeps
+        std::lock_guard<SpinLock> g(l);  // reaches the sleep phase while the holder sleeps
         EXPECT_TRUE(released.load());
     }
     holder.join();
@@ -490,13 +528,32 @@ TEST(spinlock_lock_waits_for_sleeping_holder) {
     for (int t = 0; t < kThreads; ++t)
         ts.emplace_back([&] {
             for (int i = 0; i < kIters; ++i) {
-                SpinGuard g(l);
+                std::lock_guard<SpinLock> g(l);
                 ++counter;
                 if (i % 2000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
         });
     for (auto &t : ts) t.join();
     EXPECT_EQ(counter, static_cast<long>(kThreads) * kIters);
+}
+
+// full_policy = block after a crash: a holder that died inside append never
+// unlocks; lock_unless() gives up once the queue's closed flag is set, and
+// append() then takes the post-crash path instead of hanging.
+TEST(spinlock_lock_unless_stops_when_closed) {
+    SpinLock l;
+    l.lock();  // never unlocked by this "dead" holder until the end
+    std::atomic<bool> closed{false};
+    std::atomic<int> result{-1};
+    std::thread waiter([&] { result = l.lock_unless(closed) ? 1 : 0; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(result.load(), -1);  // still waiting (sleep phase)
+    closed = true;
+    waiter.join();
+    EXPECT_EQ(result.load(), 0);
+    l.unlock();
+    EXPECT_TRUE(l.lock_unless(closed));  // free: taken even when closed is set
+    l.unlock();
 }
 
 TEST(queue_block_policy_loses_nothing) {

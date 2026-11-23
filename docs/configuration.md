@@ -25,7 +25,7 @@ Figures on this page come from a Windows 11 laptop (Ryzen 7 8845HS, NVMe, MinGW 
 | `message.escape` | `true` | Escape control characters in the message, see [security](#security-links-permissions-escaping) | Yes |
 | `file` | `true` | Write a file | No ² |
 | `file.path` | `./logs/app.log` | Log file; relative to the working directory at init. Must not be a symbolic link | No ² |
-| `file.mode` | `0640` | Permission bits (octal) of the files tblog creates; Linux, macOS | No ² |
+| `file.mode` | `0640` | Permission bits (octal) of the files tblog creates; must include owner write; Linux, macOS | No ² |
 | `file.max_size` | `256MB` | Rotate when the file exceeds this | No |
 | `file.max_files` | `5` | Files to keep, the current one included (1–10000) | No |
 | `file.rotate` | `size` | `size`, `daily`, `hourly` | No |
@@ -57,7 +57,7 @@ Only matters when logging is faster than the background thread's ceiling (about 
 | End-to-end throughput, 16 threads | 4.27 M/s | 5.04 M/s |
 
 - **`block`**: no lines lost; in exchange, under overload the logging thread sometimes waits a few ms, and a slow disk slows the application.
-- **`drop`**: a log call never waits for the background thread, the disk or a thread that holds its shard's lock (if the lock is not free after a short, bounded spin, the line is dropped too, so a real-time thread cannot get stuck behind a lower-priority thread that was preempted while logging); in exchange, logs are lost exactly under overload (usually when something is going on). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
+- **`drop`**: a log call never waits for the background thread, the disk or a thread that holds its shard's lock (if the lock is not free after a short, bounded spin, the line is dropped too, so a real-time thread cannot get stuck behind a lower-priority thread that was preempted while logging); in exchange, logs are lost under overload (usually when something is going on), and also when many threads share a shard on few CPUs and a holder is preempted mid-copy, even with room in the buffer. The drop figures in this section and in [benchmarks.md](benchmarks.md) were measured before that bounded spin existed (dd7791a). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
 - Choose `drop` only when the logging thread has a hard deadline (real-time loops, network processing).
 
 ### `flush.on_level`: surviving `kill -9`
@@ -158,9 +158,9 @@ Lines are at most 1024 bytes; longer ones are truncated and end with `...`. Shor
 
 Log files often sit in directories other users or services can write to, and log messages often carry data from outside (user names, request paths). Three protections are on by default:
 
-- **No symbolic links.** The log file and the files of rotation and compression are opened without following a symbolic link in the last path component (Windows: any reparse point). If someone plants `app.log → /etc/passwd`, `tblog_init` fails with `Too many levels of symbolic links` instead of writing into the target. Links in the directory part (`/var/log/app → /data/log`) still work. A log path that is itself a link must be replaced by its target.
-- **`file.mode = 0640`**: the log file and `.gz` files are readable by the owner and the group only (the umask can restrict further). Use `0644` if a log shipper running as another user needs to read them; files that already exist keep their permissions.
-- **`message.escape = true`**: in the message (`%m`), a newline becomes `\n`, a carriage return `\r` and other control characters `\xHH` (tab is kept), and trailing newlines are dropped. A logged value such as `bob\n2026-… [ERROR] …` therefore cannot forge a second line (in the file, or a second syslog record with its own severity), and escape sequences cannot reach a terminal. Backslashes are not escaped, so the text is not reversible: it guarantees one record per line, nothing more. Cost: one extra pass over the message bytes (not benchmarked separately). Turn it off only if every message is trusted and must keep raw newlines.
+- **No symbolic links.** The log file and the files of rotation and compression are opened without following a symbolic link in the last path component (Windows: symbolic links and junctions; other reparse points such as OneDrive placeholders and deduplicated files open normally), and a file with a second hard link is refused too (`Too many links`). If someone plants `app.log → /etc/passwd`, `tblog_init` fails with `Too many levels of symbolic links` instead of writing into the target. Links in the directory part (`/var/log/app → /data/log`) still work. A log path that is itself a link must be replaced by its target.
+- **`file.mode = 0640`**: the log file and `.gz` files are readable by the owner and the group only (the umask can restrict further). Use `0644` if a log shipper running as another user needs to read them; files that already exist keep their permissions. The owner must keep write permission (`0440` is rejected), otherwise the file could not be reopened after a restart or an external rename.
+- **`message.escape = true`**: in the message (`%m`), a newline becomes `\n`, a carriage return `\r` and other control characters `\xHH` (tab is kept), and trailing newlines are dropped. A logged value such as `bob\n2026-… [ERROR] …` therefore cannot forge a second line (in the file, or a second syslog record with its own severity), and escape sequences cannot reach a terminal. Backslashes are not escaped, so the text is not reversible: it guarantees one record per line, nothing more. Cost: 6–10 ns per line in a formatter microbenchmark (Intel i5-14600K, Linux, 30–60-byte messages, formatting itself 97–133 ns), checked 8 bytes at a time; the log-call figures in [benchmarks.md](benchmarks.md) were measured without it. tblog-lite does the same (`TBLOG_LITE_ESCAPE`). Turn it off only if every message is trusted and must keep raw newlines.
 
 ## Which failure, which key protects
 

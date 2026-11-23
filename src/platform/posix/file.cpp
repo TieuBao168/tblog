@@ -48,6 +48,20 @@ FileHandle file_open(const std::string &path, OpenMode mode, unsigned perms) noe
     do {
         fd = ::open(path.c_str(), flags, static_cast<mode_t>(perms & 07777));
     } while (fd < 0 && errno == EINTR);
+    // O_NOFOLLOW does not catch a hard link: a regular file with a second
+    // name could be another file of the attacker's choosing (systems without
+    // fs.protected_hardlinks, e.g. macOS). Log and rotated files have one.
+    if (fd >= 0 && mode != OpenMode::Read) {
+        struct stat st;
+        int err = 0;
+        if (::fstat(fd, &st) != 0) err = errno;
+        else if (S_ISREG(st.st_mode) && st.st_nlink > 1) err = EMLINK;
+        if (err) {
+            ::close(fd);
+            errno = err;
+            return FileHandle{-1};
+        }
+    }
     return FileHandle{fd};
 }
 

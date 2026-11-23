@@ -55,6 +55,14 @@
 #define TBLOG_LITE_MODULE 1
 #endif
 
+/* 1 = escape control characters in the message, as full tblog's
+ * message.escape: '\n' -> "\\n", '\r' -> "\\r", other 0x00-0x1F and 0x7F ->
+ * "\\xHH" (tab kept), trailing newlines dropped. Data logged with %s can then
+ * not start a forged line on the UART / RTT stream. 0 = written as is. */
+#ifndef TBLOG_LITE_ESCAPE
+#define TBLOG_LITE_ESCAPE 1
+#endif
+
 /* Runtime root level after reset (same default as full tblog). */
 #ifndef TBLOG_LITE_DEFAULT_LEVEL
 #define TBLOG_LITE_DEFAULT_LEVEL TBLOG_LV_INFO

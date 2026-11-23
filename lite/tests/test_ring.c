@@ -208,6 +208,31 @@ static void test_compat(void) {
     CHECK(tblog_dropped_count() == (uint64_t)tblog_lite_dropped_count());
 }
 
+/* TBLOG_LITE_ESCAPE (default 1): one call is one line, no raw control bytes. */
+static void test_escape(void) {
+    char big[300];
+    size_t i, nl = 0;
+    reset_cap();
+    TBLOG_INFO("user %s", "bob\n1234 E forged\x1b[31m\x7f");
+    tblog_lite_process();
+    CHECK(strstr(cap, "user bob\\n1234 E forged\\x1b[31m\\x7f\n") != NULL);
+    for (i = 0; i < cap_len; i++) nl += cap[i] == '\n';
+    CHECK(nl == 1);
+    reset_cap();
+    TBLOG_INFO("done\n\n");
+    tblog_lite_process();
+    CHECK(cap_len > 6 && memcmp(cap + cap_len - 6, " done\n", 6) == 0);
+    /* Long message of control bytes: cut at the line size, whole escapes only. */
+    reset_cap();
+    memset(big, '\x01', sizeof big - 1);
+    big[sizeof big - 1] = 0;
+    TBLOG_INFO("%s", big);
+    tblog_lite_process();
+    CHECK(cap_len <= TBLOG_LITE_LINE_MAX && cap[cap_len - 1] == '\n');
+    for (i = 0; i + 1 < cap_len; i++) CHECK((unsigned char)cap[i] >= 0x20);
+    CHECK(cap_len >= 5 && memcmp(cap + cap_len - 5, "\\x01\n", 5) == 0);
+}
+
 int main(void) {
     test_preinit();
     test_format_and_levels();
@@ -216,6 +241,7 @@ int main(void) {
     test_overflow();
     test_fatal_and_reentrancy();
     test_compat();
+    test_escape();
     printf("test_ring: %s (%d failure(s))\n", fails ? "FAILED" : "ok", fails);
     return fails ? 1 : 0;
 }

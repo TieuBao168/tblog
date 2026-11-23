@@ -4,8 +4,6 @@
 
 So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không so với thư viện log khác. Mọi số lấy từ các file JSON trong [bench/results/](../../bench/results/), bảng dựng bằng `bench/report.py`.
 
-> **Lưu ý:** các số dưới đây được đo trước hai thay đổi sau này: `full_policy = drop` giờ cũng bỏ dòng khi khóa shard vẫn bận sau một vòng quay ngắn (dd7791a), và `message.escape` (bật mặc định) thêm 6–10 ns mỗi dòng (microbenchmark của formatter). Hãy chạy lại benchmark trước khi dựa vào số chính xác.
-
 ## Kết luận
 
 | | tblog tốt hơn | tblog kém hơn |
@@ -27,7 +25,7 @@ So tblog với cách log đơn giản nhất: `fprintf` vào một file. Không 
 | macOS | GitHub Actions, Apple M1 (VM), 3 CPU, macOS 26, clang 21 | VM dùng chung; đồng hồ bước 41 ns |
 | Windows CI | GitHub Actions, EPYC 9V45, 4 CPU, Windows Server 2025, MSVC 19.52 | VM dùng chung; đĩa chậm (fsync) |
 
-Số hiệu năng của CI lấy từ lần chạy bench đầu (commit `47e4c97`, máy như bảng trên). Số mất log lấy từ lần chạy sau bản sửa tràn stack (commit `12fb37d`); lần đó Linux chạy trên Xeon Platinum 8370C và Windows trên EPYC 7763 (vẫn 4 CPU). Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một máy, không so giữa các máy. Laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy.
+Số hiệu năng của CI lấy từ lần chạy bench đầu (commit `47e4c97`, máy như bảng trên). Số mất log lấy từ lần chạy sau bản sửa tràn stack (commit `12fb37d`); lần đó Linux chạy trên Xeon Platinum 8370C và Windows trên EPYC 7763 (vẫn 4 CPU). Máy CI nhiễu: chỉ nên so các biến thể với nhau trên cùng một máy, không so giữa các máy. Laptop không cố định tần số CPU: end-to-end của tblog dao động ±20–40% giữa các lần chạy. Hai thay đổi sau này chưa có trong các số này: `drop` cũng bỏ dòng khi khóa shard vẫn bận sau một vòng quay ngắn (commit `dd7791a`), và `message.escape` (bật mặc định) thêm 6–10 ns mỗi dòng ([configuration.md](configuration.md#messageescape-mỗi-lệnh-một-dòng)).
 
 ## So sánh giữa các nền tảng
 

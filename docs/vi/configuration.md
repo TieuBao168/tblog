@@ -22,10 +22,10 @@ Số đo trên trang này lấy từ laptop Windows 11 (Ryzen 7 8845HS, NVMe, Mi
 | `level` | `INFO` | Level gốc, áp cho mọi module chưa đặt riêng | Có |
 | `module.<tên>` | theo `level` | Level riêng của một module (tên ≤ 45 ký tự, ≤ 256 module) | Có ¹ |
 | `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Khuôn dòng, xem [token](#pattern) | Có |
-| `message.escape` | `true` | Escape ký tự điều khiển trong nội dung, xem [bảo mật](#bảo-mật-symlink-quyền-file-escape) | Có |
+| `message.escape` | `true` | Escape ký tự điều khiển trong nội dung, xem [dưới](#messageescape-mỗi-lệnh-một-dòng) | Có |
 | `file` | `true` | Ghi file | Không ² |
-| `file.path` | `./logs/app.log` | File log; tương đối theo thư mục làm việc lúc init. Không được là symlink | Không ² |
-| `file.mode` | `0640` | Quyền (bát phân) của các file tblog tạo; phải có quyền ghi cho chủ; Linux, macOS | Không ² |
+| `file.path` | `./logs/app.log` | File log; tương đối theo thư mục làm việc lúc init; không phải link, xem [dưới](#filemode-link-ai-đọc-và-thay-được-file-log) | Không ² |
+| `file.mode` | `0640` | Quyền của các file tblog tạo (bát phân, chủ phải có quyền ghi); Linux, macOS | Không ² |
 | `file.max_size` | `256MB` | Xoay khi file vượt | Không |
 | `file.max_files` | `5` | Số file giữ, kể cả file đang ghi (1–10000) | Không |
 | `file.rotate` | `size` | `size`, `daily`, `hourly` | Không |
@@ -57,7 +57,8 @@ Chỉ có tác dụng khi log nhanh hơn trần của thread nền (khoảng 4�
 | Thông lượng end-to-end, 16 thread | 4.27 M/s | 5.04 M/s |
 
 - **`block`**: không mất dòng; đổi lại khi quá tải, thread gọi log có lúc chờ vài ms, và đĩa chậm sẽ làm chậm ứng dụng.
-- **`drop`**: lệnh log không bao giờ chờ thread nền, chờ đĩa hay chờ thread đang giữ khóa của shard (khóa không trống sau một vòng quay ngắn, có giới hạn, thì dòng cũng bị bỏ; nhờ vậy thread real-time không bị kẹt sau một thread ưu tiên thấp bị chen ngang lúc đang log); đổi lại mất log khi quá tải (thường là lúc có chuyện), và cả khi nhiều thread dùng chung một shard trên ít CPU mà thread giữ khóa bị chen ngang giữa lúc chép, dù buffer còn chỗ. Số liệu `drop` ở mục này và trong [benchmarks.md](benchmarks.md) được đo trước khi có vòng quay có giới hạn này (dd7791a). Một thread ồn có thể làm đầy shard của nó trong khi shard khác còn trống. Theo dõi bằng `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file.
+- **`drop`**: lệnh log không bao giờ chờ; đổi lại mất log đúng lúc quá tải (thường là lúc có chuyện). Một thread ồn có thể làm đầy shard của nó trong khi shard khác còn trống. Theo dõi bằng `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file.
+- `drop` cũng bỏ cuộc khi khóa shard vẫn bị giữ sau một vòng quay ngắn (thread giữ khóa bị chen ngang giữa lúc chép) và bỏ dòng, dù buffer còn chỗ: thread real-time không bao giờ chờ sau thread ưu tiên thấp hơn. Nhiều thread trên mỗi CPU thì bỏ nhiều dòng hơn; chưa đo (bảng trên đo trước thay đổi này).
 - Chọn `drop` chỉ khi thread gọi log có deadline cứng (vòng lặp thời gian thực, xử lý mạng).
 
 ### `flush.on_level`: sống sót qua `kill -9`
@@ -132,6 +133,14 @@ RAM dùng = 2 × max(`buffer.size`, N × 64 KB), N = số shard (lũy thừa c�
 | `daily` | `app.2026-11-13.log`, `app.2026-11-13.1.log`... |
 | `hourly` | `app.2026-11-13T14.log`... |
 
+### `file.mode`, link: ai đọc và thay được file log
+
+Thư mục log thường cho người dùng hay dịch vụ khác ghi vào.
+
+- `file.mode` (mặc định `0640`): quyền của các file tblog tạo (file log, `.gz`), umask hạn chế thêm; file đã có giữ quyền cũ. `0644` nếu công cụ gom log chạy bằng user khác cần đọc. Chủ phải giữ quyền ghi (`0440` bị từ chối): nếu không, file không mở lại được sau khi khởi động lại. Chỉ Linux, macOS.
+- File log và các file đã xoay không bao giờ được mở qua symlink hay qua hard link thứ hai: cài sẵn `app.log → /etc/passwd` thì `tblog_init` thất bại (`Too many levels of symbolic links`, `Too many links`) thay vì ghi vào file đích. Link ở phần thư mục (`/var/log/app → /data/log`) vẫn dùng được; nếu chính đường dẫn log là link, hãy thay bằng đường dẫn thật.
+- Windows: từ chối symlink và junction; các reparse point khác (file giữ chỗ OneDrive, file đã dedup) mở bình thường.
+
 ### Console, syslog
 
 Mọi sink chạy trên thread nền theo thứ tự file, console, syslog, sink riêng: một sink chậm làm chậm tất cả.
@@ -154,13 +163,21 @@ Mọi sink chạy trên thread nền theo thứ tự file, console, syslog, sink
 
 Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. Dòng ngắn hơn thì file nhỏ hơn và thread nền ghi được nhiều dòng hơn mỗi giây.
 
-### Bảo mật: symlink, quyền file, escape
+### `message.escape`: mỗi lệnh một dòng
 
-File log thường nằm trong thư mục mà người dùng hay dịch vụ khác ghi được, còn nội dung log thường chứa dữ liệu từ bên ngoài (tên người dùng, đường dẫn request). Ba lớp bảo vệ bật mặc định:
+Dữ liệu log bằng `%s` / `{}` (tên người dùng, đường dẫn request) có thể chứa ký tự xuống dòng hay mã điều khiển terminal. Chỉ nội dung (`%m`) được escape:
 
-- **Không đi theo symlink.** File log và các file khi xoay, nén được mở mà không đi theo symlink ở thành phần cuối của đường dẫn (Windows: symlink và junction; các reparse point khác như file giữ chỗ của OneDrive hay file đã dedup vẫn mở bình thường), và file có thêm hard link cũng bị từ chối (`Too many links`). Nếu ai đó cài sẵn `app.log → /etc/passwd`, `tblog_init` thất bại với `Too many levels of symbolic links` thay vì ghi vào file đích. Symlink ở phần thư mục (`/var/log/app → /data/log`) vẫn dùng được. Nếu chính đường dẫn file log là symlink, hãy thay bằng đường dẫn thật.
-- **`file.mode = 0640`**: file log và file `.gz` chỉ chủ sở hữu và nhóm đọc được (umask có thể hạn chế thêm). Dùng `0644` nếu công cụ gom log chạy bằng user khác cần đọc; file đã có sẵn giữ nguyên quyền cũ. Chủ sở hữu phải giữ quyền ghi (`0440` bị từ chối), nếu không file không mở lại được sau khi khởi động lại hay bị đổi tên từ bên ngoài.
-- **`message.escape = true`**: trong nội dung (`%m`), ký tự xuống dòng thành `\n`, carriage return thành `\r`, các ký tự điều khiển khác thành `\xHH` (tab giữ nguyên), và các dấu xuống dòng ở cuối bị bỏ. Một giá trị như `bob\n2026-… [ERROR] …` vì vậy không tạo được dòng giả (trong file, hay một bản ghi syslog thứ hai với severity riêng), và mã điều khiển không tới được terminal. Dấu `\` không bị escape nên không khôi phục được văn bản gốc: chỉ bảo đảm mỗi bản ghi một dòng. Chi phí: 6–10 ns mỗi dòng trong microbenchmark của formatter (Intel i5-14600K, Linux, nội dung 30–60 byte, riêng format tốn 97–133 ns), kiểm tra 8 byte một lần; số đo lệnh log trong [benchmarks.md](benchmarks.md) là trước khi có bước này. tblog-lite làm giống vậy (`TBLOG_LITE_ESCAPE`). Chỉ tắt khi mọi nội dung log đều đáng tin và cần giữ xuống dòng thật.
+| | `true` (mặc định) | `false` |
+|---|---|---|
+| Log giá trị `"bob\n2026-… [ERROR] …"` | Một dòng: `bob\n2026-… [ERROR] …` | Hai dòng, dòng thứ hai là giả (syslog: thêm một bản ghi với severity riêng) |
+| ESC, ký tự điều khiển khác | `\x1b`, `\xHH` | Ghi nguyên (tới được terminal) |
+| `\n` ở cuối chuỗi format | Bỏ | Một dòng trống |
+| Chi phí mỗi dòng | 6–10 ns ¹ | 0 |
+
+¹ Microbenchmark của formatter, Intel i5-14600K, Linux, nội dung 30–60 byte (riêng format: 97–133 ns). Số đo lệnh log trong [benchmarks.md](benchmarks.md) là trước khi có bước này.
+
+- Tab giữ nguyên. Dấu `\` không bị escape (đường dẫn Windows vẫn dễ đọc), nên không khôi phục được văn bản gốc: chỉ bảo đảm mỗi bản ghi một dòng.
+- Chỉ tắt khi mọi nội dung log đều đáng tin và cần giữ xuống dòng thật. tblog-lite: `TBLOG_LITE_ESCAPE`.
 
 ## Sự cố nào, key nào bảo vệ
 

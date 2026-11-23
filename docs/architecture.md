@@ -89,6 +89,7 @@ N shards (power of 2 ≥ CPU count, at most 16), each thread pinned to one shard
 
 - **Pro**: threads barely contend. Throughput scales with threads (1.89 M → 4.34 M lines/s from 1 to 8 threads), p99 stays under 1 µs. `fprintf` sharing one `FILE*` drops (365 k → 213 k) and p99 rises to 330 µs.
 - **Con**: lines from different threads can be out of time order by up to about one `flush.interval_ms`. Lines from the same thread are always in order.
+- The spinlock is held for one copy. `block` spins, yields, then sleeps (so a preempted lower-priority holder gets to run) and stops waiting once the queue is closed; `drop` gives up after a short spin and drops the line. A real-time thread therefore never spins forever behind a preempted or crashed holder.
 
 ### 3. Formatting on the logging thread
 

@@ -17,10 +17,10 @@ No external library needed (`tests/tiny_test.h`). Crash and process-exit tests r
 
 | Test | Checks |
 |---|---|
-| `test_config` | Parser, warnings, defaults, hot reload |
-| `test_core` | Levels, modules, formatter |
+| `test_config` | Parser, warnings, defaults, hot reload, `file.mode` / `file.max_files` limits |
+| `test_core` | Levels, modules, formatter, `message.escape` (one line, within the line size) |
 | `test_cpp_api` | `{}` API, `Logger`, user-defined types (built as C++11) |
-| `test_queue_file` | Buffer (ordering, drop/block, crash), file rotation, `flush.on_level` never hangs |
+| `test_queue_file` | Buffer (ordering, drop/block, crash), shard lock (bounded, stops once closed), file rotation, links refused, `file.mode`, `flush.on_level` never hangs |
 | `test_crash_sinks` | 4 threads logging, a 5th thread crashes: every line that returned is in the file and console exactly once |
 | `test_integration` | End to end through the C API; process hard-killed right after an ERROR line (10 times): 0 lines lost up to the last ERROR line |
 | `test_rotation_time` | Daily/hourly rotation (fake clock), gzip compression, recovery after a crash |
@@ -28,7 +28,7 @@ No external library needed (`tests/tiny_test.h`). Crash and process-exit tests r
 | `example_*`, `bench_*_smoke` | Examples and benchmarks run to completion (not measurements) |
 | `check_symbols`, `check_exports` | The library exports only public functions |
 
-Skipped tests: `rotating_write_error_counts_loss` on macOS / Windows (no `/dev/full`), `syslog_sink_handles_batches` on Windows. The TSan build skips the stack-overflow scenario of `bench_crash_loss_smoke`.
+Skipped tests: `rotating_write_error_counts_loss` on macOS / Windows (no `/dev/full`), `syslog_sink_handles_batches` on Windows, the link and permission tests of `test_queue_file` on Windows (POSIX links and permission bits). The gzip link tests only exist in builds with zlib. The TSan build skips the stack-overflow scenario of `bench_crash_loss_smoke`.
 
 ## CI
 

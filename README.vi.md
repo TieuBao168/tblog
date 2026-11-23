@@ -78,7 +78,7 @@ pkg-config: `cc app.c $(pkg-config --cflags --libs tblog)`. Tĩnh / động, opt
 
 ## Cấu hình
 
-Không có file cấu hình: log `INFO` trở lên vào `./logs/app.log`, xoay ở 256 MB, giữ 5 file. Ví dụ cho dịch vụ:
+Không có file cấu hình: log `INFO` trở lên vào `./logs/app.log` (quyền `0640`), xoay ở 256 MB, giữ 5 file. Ví dụ cho dịch vụ:
 
 ```ini
 level          = INFO

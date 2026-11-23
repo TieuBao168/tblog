@@ -22,10 +22,10 @@ Figures on this page come from a Windows 11 laptop (Ryzen 7 8845HS, NVMe, MinGW 
 | `level` | `INFO` | Root level, applies to every module without its own | Yes |
 | `module.<name>` | follows `level` | A module's own level (name ≤ 45 characters, ≤ 256 modules) | Yes ¹ |
 | `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Line layout, see [tokens](#pattern) | Yes |
-| `message.escape` | `true` | Escape control characters in the message, see [security](#security-links-permissions-escaping) | Yes |
+| `message.escape` | `true` | Escape control characters in the message, see [below](#messageescape-one-call-one-line) | Yes |
 | `file` | `true` | Write a file | No ² |
-| `file.path` | `./logs/app.log` | Log file; relative to the working directory at init. Must not be a symbolic link | No ² |
-| `file.mode` | `0640` | Permission bits (octal) of the files tblog creates; must include owner write; Linux, macOS | No ² |
+| `file.path` | `./logs/app.log` | Log file; relative to the working directory at init; not a link, see [below](#filemode-links-who-can-read-and-replace-the-log) | No ² |
+| `file.mode` | `0640` | Permissions of the files tblog creates (octal, owner write required); Linux, macOS | No ² |
 | `file.max_size` | `256MB` | Rotate when the file exceeds this | No |
 | `file.max_files` | `5` | Files to keep, the current one included (1–10000) | No |
 | `file.rotate` | `size` | `size`, `daily`, `hourly` | No |
@@ -57,7 +57,8 @@ Only matters when logging is faster than the background thread's ceiling (about 
 | End-to-end throughput, 16 threads | 4.27 M/s | 5.04 M/s |
 
 - **`block`**: no lines lost; in exchange, under overload the logging thread sometimes waits a few ms, and a slow disk slows the application.
-- **`drop`**: a log call never waits for the background thread, the disk or a thread that holds its shard's lock (if the lock is not free after a short, bounded spin, the line is dropped too, so a real-time thread cannot get stuck behind a lower-priority thread that was preempted while logging); in exchange, logs are lost under overload (usually when something is going on), and also when many threads share a shard on few CPUs and a holder is preempted mid-copy, even with room in the buffer. The drop figures in this section and in [benchmarks.md](benchmarks.md) were measured before that bounded spin existed (dd7791a). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
+- **`drop`**: a log call never waits; in exchange, logs are lost exactly under overload (usually when something is going on). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
+- `drop` also gives up on a shard lock still held after a short spin (its holder preempted mid-copy) and drops the line, even with room in the buffer: a real-time thread never waits behind a lower-priority one. With many threads per CPU this adds drops; not measured (the table above predates it).
 - Choose `drop` only when the logging thread has a hard deadline (real-time loops, network processing).
 
 ### `flush.on_level`: surviving `kill -9`
@@ -132,6 +133,14 @@ RAM used = 2 × max(`buffer.size`, N × 64 KB), N = number of shards (power of 2
 | `daily` | `app.2026-11-13.log`, `app.2026-11-13.1.log`... |
 | `hourly` | `app.2026-11-13T14.log`... |
 
+### `file.mode`, links: who can read and replace the log
+
+Log directories are often writable by other users or services.
+
+- `file.mode` (default `0640`): permissions of the files tblog creates (log file, `.gz`), further restricted by the umask; existing files keep theirs. `0644` if a log shipper running as another user must read them. The owner must keep write (`0440` is rejected): the file could not be reopened after a restart. Linux, macOS only.
+- The log file and the rotated files are never opened through a symbolic link or a second hard link: a planted `app.log → /etc/passwd` makes `tblog_init` fail (`Too many levels of symbolic links`, `Too many links`) instead of writing into the target. Links in the directory part (`/var/log/app → /data/log`) still work; a log path that is itself a link must be replaced by its target.
+- Windows: symbolic links and junctions are refused; other reparse points (OneDrive placeholders, deduplicated files) open normally.
+
 ### Console, syslog
 
 Every sink runs on the background thread in the order file, console, syslog, custom sinks: one slow sink slows them all.
@@ -154,13 +163,21 @@ Every sink runs on the background thread in the order file, console, syslog, cus
 
 Lines are at most 1024 bytes; longer ones are truncated and end with `...`. Shorter lines mean smaller files and more lines per second through the background thread.
 
-### Security: links, permissions, escaping
+### `message.escape`: one call, one line
 
-Log files often sit in directories other users or services can write to, and log messages often carry data from outside (user names, request paths). Three protections are on by default:
+Data logged with `%s` / `{}` (user names, request paths) may contain newlines or terminal escape codes. Escaping applies to the message (`%m`) only:
 
-- **No symbolic links.** The log file and the files of rotation and compression are opened without following a symbolic link in the last path component (Windows: symbolic links and junctions; other reparse points such as OneDrive placeholders and deduplicated files open normally), and a file with a second hard link is refused too (`Too many links`). If someone plants `app.log → /etc/passwd`, `tblog_init` fails with `Too many levels of symbolic links` instead of writing into the target. Links in the directory part (`/var/log/app → /data/log`) still work. A log path that is itself a link must be replaced by its target.
-- **`file.mode = 0640`**: the log file and `.gz` files are readable by the owner and the group only (the umask can restrict further). Use `0644` if a log shipper running as another user needs to read them; files that already exist keep their permissions. The owner must keep write permission (`0440` is rejected), otherwise the file could not be reopened after a restart or an external rename.
-- **`message.escape = true`**: in the message (`%m`), a newline becomes `\n`, a carriage return `\r` and other control characters `\xHH` (tab is kept), and trailing newlines are dropped. A logged value such as `bob\n2026-… [ERROR] …` therefore cannot forge a second line (in the file, or a second syslog record with its own severity), and escape sequences cannot reach a terminal. Backslashes are not escaped, so the text is not reversible: it guarantees one record per line, nothing more. Cost: 6–10 ns per line in a formatter microbenchmark (Intel i5-14600K, Linux, 30–60-byte messages, formatting itself 97–133 ns), checked 8 bytes at a time; the log-call figures in [benchmarks.md](benchmarks.md) were measured without it. tblog-lite does the same (`TBLOG_LITE_ESCAPE`). Turn it off only if every message is trusted and must keep raw newlines.
+| | `true` (default) | `false` |
+|---|---|---|
+| `"bob\n2026-… [ERROR] …"` logged | One line: `bob\n2026-… [ERROR] …` | Two lines, the second forged (syslog: a second record with its own severity) |
+| ESC, other control characters | `\x1b`, `\xHH` | Written as is (they reach the terminal) |
+| Trailing `\n` in the format | Dropped | An empty line |
+| Cost per line | 6–10 ns ¹ | 0 |
+
+¹ Formatter microbenchmark, Intel i5-14600K, Linux, 30–60-byte messages (formatting itself: 97–133 ns). The log-call figures in [benchmarks.md](benchmarks.md) were measured before it.
+
+- Tab is kept. Backslashes are not escaped (Windows paths stay readable), so the text is not reversible: it only guarantees one record per line.
+- Turn it off only if every message is trusted and must keep raw newlines. tblog-lite: `TBLOG_LITE_ESCAPE`.
 
 ## Which failure, which key protects
 

@@ -4,16 +4,24 @@
 
 ## Unreleased
 
-### Security
+### Breaking
 
-- **The log file is no longer opened through a symbolic link.** Previously a link planted at the log path (`app.log → <any file>`) made the process append its log lines to the link's target, and links planted among the rotated files made the gzip compressor truncate a target (`app.N.log.gz.tmp`) or copy a target into a readable `.gz` (`app.N.log`). The log file, rotated files and compression's temporary files are now opened with `O_NOFOLLOW` (Windows: symbolic links and junctions refused; other reparse points such as OneDrive placeholders open normally), a file with a second hard link is refused (`Too many links`), and the temporary file is created with `O_EXCL`. A log path that is itself a symbolic link now makes `tblog_init` fail (`Too many levels of symbolic links`); links in the directory part still work.
-- **Control characters in messages are escaped** (`message.escape = true`, new): a newline becomes `\n`, other control characters `\xHH`, trailing newlines are dropped. Previously a logged value containing a newline could forge further log lines (and syslog records with their own severity), and escape sequences reached the terminal. Backslashes are not escaped. Cost: 6–10 ns per line (formatter microbenchmark). tblog-lite escapes the same way (`TBLOG_LITE_ESCAPE`, default 1, ~270 bytes of code).
-- **Log files are created with mode `0640`** instead of `0644` (`file.mode`, new): no longer readable by every local user. Existing files keep their permissions. A mode without owner write (e.g. `0440`) is rejected: the file could not be reopened.
-- **`file.max_files` is capped at 10000** (clamped with a warning): size rotation renames every kept file, so a huge value stalled the background thread on every rotation.
+- **The log file is never opened through a symbolic link or a second hard link.** A log path that is itself a link now makes `tblog_init` fail (`Too many levels of symbolic links` / `Too many links`); links in the directory part still work. Migration: replace the link by its target.
+- **Control characters in the message are escaped by default** (`message.escape = true`): a newline becomes `\n`, other control characters `\xHH`, trailing newlines are dropped, so one call is one line. Old behaviour: `message.escape = false`.
+- **New log files are created with mode `0640`** (previously `0644`): no longer readable by every local user. Old behaviour: `file.mode = 0644`.
+- **`file.max_files` is capped at 10000** (clamped with a warning).
+
+### Added
+
+- **`message.escape`**: escape control characters in the message; costs 6–10 ns per line (formatter microbenchmark). tblog-lite: `TBLOG_LITE_ESCAPE` (default 1, ~270 bytes of code).
+- **`file.mode`**: permissions of the files tblog creates (octal, owner write required; Linux, macOS).
 
 ### Fixed
 
-- **Shard lock no longer waits without bound.** Previously a log call spun and yielded forever while another thread held its shard's lock; a real-time thread (`SCHED_FIFO` / `SCHED_RR`) could hang behind a lower-priority holder preempted on the same CPU, because a yield only lets threads of the same priority run. Now `full_policy = drop` gives up after a short spin and drops the line (counted in `tblog_dropped_count()`); `block` sleeps in 50 µs steps after spinning and yielding, which lets the holder run, and gives up once the queue is closed, so a holder that crashed inside a log call cannot hang it. When the lock cannot be taken because the queue was closed or crashed meanwhile, the line now takes the post-crash path (written directly) instead of being dropped. With `drop`, lines can now also be dropped when many threads share a shard on few CPUs and a holder is preempted. The uncontended path only gains one branch on the policy.
+- **A link planted in the log directory could redirect writes and reads.** `app.log → <any file>` made the process append to the target; links among the rotated files made the gzip compressor truncate a target (`app.N.log.gz.tmp`) or copy it into a `.gz` (`app.N.log`). Now opened with `O_NOFOLLOW` plus a hard-link check, the temporary file with `O_EXCL`. Windows: symbolic links and junctions refused; other reparse points (OneDrive placeholders, deduplicated files) open normally.
+- **Data logged with `%s` / `{}` could forge log lines** (and syslog records with their own severity) through embedded newlines, and send escape sequences to the terminal. Now escaped (`message.escape`).
+- **The shard lock could wait forever.** A real-time thread (`SCHED_FIFO` / `SCHED_RR`) could spin forever behind a lower-priority holder preempted on the same CPU, and a thread could hang behind a holder that crashed inside a log call. Now `block` spins, yields, then sleeps in 50 µs steps and stops waiting once the queue is closed; `drop` gives up after a short spin and drops the line (counted), so it can now also drop lines when many threads share a shard on few CPUs. A line whose lock cannot be taken because of a crash is written directly, as after a crash. The uncontended path only gains one branch.
+- **`file.max_files` had no upper bound**: size rotation renames every kept file, so a huge value stalled the background thread on every rotation.
 
 ## 0.1.0 (2026-11-22)
 

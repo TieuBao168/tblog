@@ -10,7 +10,7 @@
 | Syslog | Yes | Yes (unified logging) | No, `syslog = true` is ignored with a warning |
 | Makefile | Yes | No, use CMake | No, use CMake |
 
-All platforms: files are opened in append mode, handles are not inherited by child processes, parent directories are created automatically, and a symbolic link or a second hard link as the log file (Windows: symbolic link or junction) is refused ([security](configuration.md#security-links-permissions-escaping)). `file.mode` (default `0640`) applies on Linux and macOS only; on Windows new files get the directory's default ACL.
+All platforms: files are opened in append mode, handles are not inherited by child processes, parent directories are created automatically, and the log file is never opened through a symbolic link or a second hard link ([configuration.md](configuration.md#filemode-links-who-can-read-and-replace-the-log)).
 
 ## Linux
 
@@ -38,5 +38,6 @@ All platforms: files are opened in append mode, handles are not inherited by chi
 - The log file is opened with `FILE_SHARE_READ | WRITE | DELETE`: it can be read, renamed and deleted while being written (needed for rotation).
 - `WriteFile` has to wait while `FlushFileBuffers` runs on the same file: `flush.on_level` + `sync.on_level` at the same level slows ERROR lines to 2.69–5.4 ms (Linux / macOS: 37–39 µs) ([configuration.md](configuration.md#flushon_level-surviving-kill--9)).
 - The console is coloured when ANSI can be enabled (Windows 10 1511+).
+- Links: symbolic links and junctions are refused as the log file; other reparse points (OneDrive placeholders, deduplicated files) open normally. `file.mode` is ignored: new files get the directory's default ACL.
 - DLL: call `tblog_shutdown()` before exiting; do not `FreeLibrary` while the logger is running ([architecture.md](architecture.md#process-exit-on-windows)).
 - ARM64: CI only test-compiles the headers; the library has not been built or run on ARM64.

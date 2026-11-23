@@ -35,6 +35,7 @@ Sizes measured on an x86-64 host (`-Os`, `TBLOG_LITE_FLOAT=0`); enabling floatin
 - A log call formats onto the stack (`TBLOG_LITE_LINE_MAX` bytes), then copies into a static ring inside a short critical section. It **never blocks** and never calls `write`.
 - `tblog_lite_process()` / `tblog_lite_flush()` (called by you) hand the bytes to `write`. When the ring is full the line is dropped, and the next `process()` prints `tblog-lite: N line(s) dropped`.
 - Lines logged before `tblog_lite_init` still stay in the ring.
+- Control characters in the message are escaped as in full tblog, so one call is one line (`TBLOG_LITE_ESCAPE`).
 
 ## API
 

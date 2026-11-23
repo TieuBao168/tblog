@@ -17,10 +17,10 @@ Không cần thư viện ngoài (`tests/tiny_test.h`). Test crash và thoát pro
 
 | Test | Kiểm tra |
 |---|---|
-| `test_config` | Parser, cảnh báo, giá trị mặc định, hot-reload |
-| `test_core` | Level, module, formatter |
+| `test_config` | Parser, cảnh báo, giá trị mặc định, hot-reload, giới hạn `file.mode` / `file.max_files` |
+| `test_core` | Level, module, formatter, `message.escape` (một dòng, trong giới hạn dòng) |
 | `test_cpp_api` | API `{}`, `Logger`, kiểu tự định nghĩa (build ở C++11) |
-| `test_queue_file` | Buffer (thứ tự, drop/block, crash), xoay file, `flush.on_level` không treo |
+| `test_queue_file` | Buffer (thứ tự, drop/block, crash), khóa shard (có giới hạn, dừng khi đã đóng), xoay file, từ chối link, `file.mode`, `flush.on_level` không treo |
 | `test_crash_sinks` | 4 thread log, thread thứ 5 crash: mọi dòng đã trả về có trong file và console đúng một lần |
 | `test_integration` | Đầu cuối qua API C; process bị giết cứng ngay sau dòng ERROR (10 lần): 0 dòng mất tới dòng ERROR cuối |
 | `test_rotation_time` | Xoay theo ngày/giờ (đồng hồ giả), nén gzip, khôi phục sau crash |
@@ -28,7 +28,7 @@ Không cần thư viện ngoài (`tests/tiny_test.h`). Test crash và thoát pro
 | `example_*`, `bench_*_smoke` | Ví dụ và benchmark chạy hết (không phải phép đo) |
 | `check_symbols`, `check_exports` | Thư viện chỉ export các hàm công khai |
 
-Test bị bỏ qua: `rotating_write_error_counts_loss` trên macOS / Windows (không có `/dev/full`), `syslog_sink_handles_batches` trên Windows. Bản TSan bỏ kịch bản stack overflow của `bench_crash_loss_smoke`.
+Test bị bỏ qua: `rotating_write_error_counts_loss` trên macOS / Windows (không có `/dev/full`), `syslog_sink_handles_batches` trên Windows, các test link và quyền file của `test_queue_file` trên Windows (link và quyền kiểu POSIX). Test link với gzip chỉ có trong bản build có zlib. Bản TSan bỏ kịch bản stack overflow của `bench_crash_loss_smoke`.
 
 ## CI
 

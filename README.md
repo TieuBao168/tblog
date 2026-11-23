@@ -78,7 +78,7 @@ pkg-config: `cc app.c $(pkg-config --cflags --libs tblog)`. Static / shared, CMa
 
 ## Configuration
 
-With no configuration file: `INFO` and above go to `./logs/app.log`, rotated at 256 MB, 5 files kept. Example for a service:
+With no configuration file: `INFO` and above go to `./logs/app.log` (mode `0640`), rotated at 256 MB, 5 files kept. Example for a service:
 
 ```ini
 level          = INFO

@@ -10,7 +10,7 @@
 | Syslog | Có | Có (unified logging) | Không, `syslog = true` bị bỏ qua kèm cảnh báo |
 | Makefile | Có | Không, dùng CMake | Không, dùng CMake |
 
-Mọi nền tảng: file mở ở chế độ append, handle không kế thừa sang process con, thư mục cha được tự tạo, và file log là symlink hoặc có thêm hard link (Windows: symlink hoặc junction) bị từ chối ([bảo mật](configuration.md#bảo-mật-symlink-quyền-file-escape)). `file.mode` (mặc định `0640`) chỉ áp dụng trên Linux và macOS; trên Windows file mới nhận ACL mặc định của thư mục.
+Mọi nền tảng: file mở ở chế độ append, handle không kế thừa sang process con, thư mục cha được tự tạo, và file log không bao giờ được mở qua symlink hay hard link thứ hai ([configuration.md](configuration.md#filemode-link-ai-đọc-và-thay-được-file-log)).
 
 ## Linux
 
@@ -38,5 +38,6 @@ Mọi nền tảng: file mở ở chế độ append, handle không kế thừa 
 - File log mở với `FILE_SHARE_READ | WRITE | DELETE`: đọc, đổi tên, xóa được khi đang ghi (cần cho xoay file).
 - `WriteFile` phải chờ khi `FlushFileBuffers` đang chạy trên cùng file: `flush.on_level` + `sync.on_level` cùng level làm dòng ERROR chậm tới 2.69–5.4 ms (Linux / macOS: 37–39 µs) ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
 - Console có màu khi bật được ANSI (Windows 10 1511+).
+- Link: symlink và junction bị từ chối làm file log; các reparse point khác (file giữ chỗ OneDrive, file đã dedup) mở bình thường. `file.mode` bị bỏ qua: file mới nhận ACL mặc định của thư mục.
 - DLL: gọi `tblog_shutdown()` trước khi thoát; không `FreeLibrary` khi logger đang chạy ([architecture.md](architecture.md#thoát-process-trên-windows)).
 - ARM64: chỉ header được CI biên dịch thử; thư viện chưa build hay chạy trên ARM64.

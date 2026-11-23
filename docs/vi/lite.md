@@ -35,6 +35,7 @@ Số kích thước đo trên host x86-64 (`-Os`, `TBLOG_LITE_FLOAT=0`); bật s
 - Lệnh log format vào stack (`TBLOG_LITE_LINE_MAX` byte) rồi chép vào ring tĩnh trong một critical section ngắn. **Không bao giờ chặn**, không bao giờ gọi `write`.
 - `tblog_lite_process()` / `tblog_lite_flush()` (do bạn gọi) đưa byte tới `write`. Ring đầy thì dòng bị bỏ, lần `process()` sau in `tblog-lite: N line(s) dropped`.
 - Dòng log trước `tblog_lite_init` vẫn nằm trong ring.
+- Ký tự điều khiển trong nội dung được escape như tblog đầy đủ, nên mỗi lệnh một dòng (`TBLOG_LITE_ESCAPE`).
 
 ## API
 

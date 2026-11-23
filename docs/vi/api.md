@@ -31,7 +31,7 @@ TBLOG_LOG(level, module, fmt, ...)
 - **Lệnh bị lọc không format, không tính đối số**: 1.16 ns, so với 0.60 ns của `if (flag) fprintf(...)`.
 - `module` phải là hằng (thường là literal): nó chỉ được đọc ở lần chạy đầu của call site, rồi được cache.
 - Dòng tối đa 1024 byte, dài hơn bị cắt thành `...`.
-- Ký tự điều khiển trong nội dung được escape (`\n`, `\x1b`...) và dấu xuống dòng ở cuối bị bỏ, nên mỗi lệnh log luôn là một dòng (`message.escape`, [configuration.md](configuration.md#bảo-mật-symlink-quyền-file-escape)). Áp dụng cả cho API C++; tblog-lite cũng làm vậy (`TBLOG_LITE_ESCAPE`).
+- Ký tự điều khiển trong nội dung được escape (`\n`, `\x1b`), dấu xuống dòng ở cuối bị bỏ: mỗi lệnh một dòng, kể cả API C++ ([`message.escape`](configuration.md#messageescape-mỗi-lệnh-một-dòng)).
 - Lệnh log **chờ** trong hai trường hợp: buffer đầy với `full_policy = block` (mặc định), và dòng ≥ `flush.on_level` ([configuration.md](configuration.md#các-lựa-chọn-và-cái-giá)).
 - `TBLOG_FATAL`: ghi, `tblog_flush()`, rồi `abort()`. Bị lọc thì không `abort()`.
 

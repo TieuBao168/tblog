@@ -1,177 +1,179 @@
-# Cấu hình (`log.conf`)
+# Configuration (`log.conf`)
 
-`tblog_init(path)` đọc file `key = value`. `path` là `NULL`, rỗng hoặc không đọc được thì mọi key lấy mặc định. File mẫu đủ mọi key: [log.conf](../log.conf).
+**English** | [Tiếng Việt](vi/configuration.md)
 
-Số đo trên trang này lấy từ laptop Windows 11 (Ryzen 7 8845HS, NVMe, MinGW g++ 15), trừ khi ghi rõ Linux / macOS / MSVC (GitHub Actions) ([benchmarks.md](benchmarks.md)).
+`tblog_init(path)` reads a `key = value` file. If `path` is `NULL`, empty or unreadable, every key takes its default. Sample file with every key: [log.conf](../log.conf).
 
-## Cú pháp
+Figures on this page come from a Windows 11 laptop (Ryzen 7 8845HS, NVMe, MinGW g++ 15), unless Linux / macOS / MSVC (GitHub Actions) is stated ([benchmarks.md](benchmarks.md)).
 
-- Mỗi dòng một `key = value`; key lặp lại thì dòng sau thắng.
-- Tên key phân biệt hoa thường (`Level` là key lạ); giá trị thì không.
-- Comment: `#` đầu dòng, hoặc ` #` sau khoảng trắng. Riêng `pattern` lấy hết phần còn lại của dòng, kể cả `#`.
-- `"..."` giữ khoảng trắng đầu/cuối hoặc ` #` trong giá trị. Không có escape.
-- Kiểu giá trị: level `TRACE` `DEBUG` `INFO` `WARN` `ERROR` `FATAL` `OFF`; boolean `true/false`, `1/0`, `yes/no`, `on/off`; kích thước `64MB`, `512K`, `4 GB` (cơ số 1024, số nguyên); mili giây là số nguyên không hậu tố (`200ms` sai).
-- Giá trị sai: cảnh báo ra stderr, key giữ giá trị trước. `tblog_init` không bao giờ thất bại vì cấu hình.
+## Syntax
 
-## Mọi key
+- One `key = value` per line; if a key repeats, the later line wins.
+- Key names are case-sensitive (`Level` is an unknown key); values are not.
+- Comments: `#` at the start of a line, or ` #` after whitespace. Only `pattern` takes the rest of the line, `#` included.
+- `"..."` keeps leading/trailing whitespace or ` #` in a value. No escapes.
+- Value types: levels `TRACE` `DEBUG` `INFO` `WARN` `ERROR` `FATAL` `OFF`; booleans `true/false`, `1/0`, `yes/no`, `on/off`; sizes `64MB`, `512K`, `4 GB` (base 1024, integers); milliseconds are integers with no suffix (`200ms` is invalid).
+- Invalid value: a warning on stderr, the key keeps its previous value. `tblog_init` never fails because of the configuration.
 
-| Key | Mặc định | Ý nghĩa | Đổi lúc chạy |
+## Every key
+
+| Key | Default | Meaning | Changeable at run time |
 |---|---|---|---|
-| `level` | `INFO` | Level gốc, áp cho mọi module chưa đặt riêng | Có |
-| `module.<tên>` | theo `level` | Level riêng của một module (tên ≤ 45 ký tự, ≤ 256 module) | Có ¹ |
-| `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Khuôn dòng, xem [token](#pattern) | Có |
-| `file` | `true` | Ghi file | Không ² |
-| `file.path` | `./logs/app.log` | File log; tương đối theo thư mục làm việc lúc init | Không ² |
-| `file.max_size` | `256MB` | Xoay khi file vượt | Không |
-| `file.max_files` | `5` | Số file giữ, kể cả file đang ghi | Không |
-| `file.rotate` | `size` | `size`, `daily`, `hourly` | Không |
-| `file.compress` | `none` | `none`, `gzip` (cần build có zlib) | Không |
-| `buffer.size` | `4MB` | Buffer RAM, chia cho các shard | Không ² |
-| `full_policy` | `block` | Buffer đầy: chờ (`block`) hay bỏ dòng (`drop`) | Không |
-| `flush.interval_ms` | `200` | Chu kỳ ghi tối đa, 1–60000 | Có |
-| `flush.on_level` | `OFF` | Dòng ≥ level chỉ trả về khi đã ghi vào file | Có |
-| `sync.interval_ms` | `1000` | Chu kỳ fsync, 0–3600000 (`0` = tắt) | Có |
-| `sync.on_level` | `ERROR` | fsync ngay sau dòng ≥ level | Không |
-| `console` | `false` | Ghi thêm ra stderr | Không ² |
-| `console.color` | `true` | Màu theo level khi stderr là terminal | Không |
-| `syslog` | `false` | Ghi thêm vào syslog (Linux, macOS) | Không ² |
-| `reload.watch` | `true` | Đọc lại file cấu hình khi đổi (kiểm tra mỗi ≥ 1 s) | Không |
+| `level` | `INFO` | Root level, applies to every module without its own | Yes |
+| `module.<name>` | follows `level` | A module's own level (name ≤ 45 characters, ≤ 256 modules) | Yes ¹ |
+| `pattern` | `%D %T.%us [%L] [%t] %f:%l - %m` | Line layout, see [tokens](#pattern) | Yes |
+| `file` | `true` | Write a file | No ² |
+| `file.path` | `./logs/app.log` | Log file; relative to the working directory at init | No ² |
+| `file.max_size` | `256MB` | Rotate when the file exceeds this | No |
+| `file.max_files` | `5` | Files to keep, the current one included | No |
+| `file.rotate` | `size` | `size`, `daily`, `hourly` | No |
+| `file.compress` | `none` | `none`, `gzip` (needs a zlib build) | No |
+| `buffer.size` | `4MB` | RAM buffer, split across shards | No ² |
+| `full_policy` | `block` | Buffer full: wait (`block`) or drop the line (`drop`) | No |
+| `flush.interval_ms` | `200` | Maximum write period, 1–60000 | Yes |
+| `flush.on_level` | `OFF` | Lines ≥ level return only once written to the file | Yes |
+| `sync.interval_ms` | `1000` | fsync period, 0–3600000 (`0` = off) | Yes |
+| `sync.on_level` | `ERROR` | fsync right after a line ≥ level | No |
+| `console` | `false` | Also write to stderr | No ² |
+| `console.color` | `true` | Colour by level when stderr is a terminal | No |
+| `syslog` | `false` | Also write to syslog (Linux, macOS) | No ² |
+| `reload.watch` | `true` | Re-read the configuration file when it changes (checked every ≥ 1 s) | No |
 
-¹ Đọc lại là đọc **chồng lên** cấu hình đang chạy: xóa dòng `module.x` không gỡ level riêng của `x`, phải ghi giá trị mới.
-² Đổi lúc chạy thì in `file/buffer/sink changes need a restart` và giữ giá trị cũ. Các key "Không" còn lại: giữ giá trị cũ, không báo.
+¹ A reload is applied **on top of** the running configuration: deleting a `module.x` line does not remove `x`'s own level; write a new value instead.
+² Changing it at run time prints `file/buffer/sink changes need a restart` and keeps the old value. The other "No" keys: keep the old value, silently.
 
-## Các lựa chọn và cái giá
+## Choices and their cost
 
-### `full_policy`: buffer đầy thì chờ hay bỏ dòng
+### `full_policy`: wait or drop when the buffer is full
 
-Chỉ có tác dụng khi log nhanh hơn trần của thread nền (khoảng 4–5 M dòng/s ở máy đo). Flood 1 M dòng:
+Only matters when logging is faster than the background thread's ceiling (about 4–5 M lines/s on the test machine). Flood of 1 M lines:
 
-| | `block` (mặc định) | `drop` |
+| | `block` (default) | `drop` |
 |---|---|---|
-| Dòng bị bỏ, 8 / 16 thread | 0 / 0 | 0.9% / 23% (tệ nhất 33%) |
-| Lệnh log p99 / max, 16 thread | 671 ns / 2.88 ms | 691 ns / 1.99 ms |
-| Thông lượng end-to-end, 16 thread | 4.27 M/s | 5.04 M/s |
+| Lines dropped, 8 / 16 threads | 0 / 0 | 0.9% / 23% (worst 33%) |
+| Log call p99 / max, 16 threads | 671 ns / 2.88 ms | 691 ns / 1.99 ms |
+| End-to-end throughput, 16 threads | 4.27 M/s | 5.04 M/s |
 
-- **`block`**: không mất dòng; đổi lại khi quá tải, thread gọi log có lúc chờ vài ms, và đĩa chậm sẽ làm chậm ứng dụng.
-- **`drop`**: lệnh log không bao giờ chờ; đổi lại mất log đúng lúc quá tải (thường là lúc có chuyện). Một thread ồn có thể làm đầy shard của nó trong khi shard khác còn trống. Theo dõi bằng `tblog_dropped_count()` và dòng `tblog: N lines dropped` trong file.
-- Chọn `drop` chỉ khi thread gọi log có deadline cứng (vòng lặp thời gian thực, xử lý mạng).
+- **`block`**: no lines lost; in exchange, under overload the logging thread sometimes waits a few ms, and a slow disk slows the application.
+- **`drop`**: a log call never waits; in exchange, logs are lost exactly under overload (usually when something is going on). One noisy thread can fill its shard while others are still empty. Monitor with `tblog_dropped_count()` and the `tblog: N lines dropped` line in the file.
+- Choose `drop` only when the logging thread has a hard deadline (real-time loops, network processing).
 
-### `flush.on_level`: sống sót qua `kill -9`
+### `flush.on_level`: surviving `kill -9`
 
-Mặc định lệnh log trả về khi dòng còn trong RAM, nên `kill -9`, OOM killer, `TerminateProcess`, `_exit` làm mất phần còn trong buffer. Với `flush.on_level = ERROR`, lệnh ERROR chỉ trả về khi dòng đó (và mọi dòng trước nó của cùng thread) đã `write()` vào file.
+By default a log call returns while the line is still in RAM, so `kill -9`, the OOM killer, `TerminateProcess`, `_exit` lose whatever is in the buffer. With `flush.on_level = ERROR`, an ERROR call returns only once that line (and every earlier line from the same thread) has been `write()`n to the file.
 
-| | `OFF` (mặc định) | `ERROR` |
+| | `OFF` (default) | `ERROR` |
 |---|---|---|
-| Mất sau `kill -9`, 4 thread (TB / max, 20 lần) | 4 612 / 7 751 dòng | 174 / 396 dòng INFO, **0 tới dòng ERROR cuối** |
-| Mất sau `_Exit`, 1 thread | 954 / 1 811 | 56 / 96, **0 tới dòng ERROR cuối** |
-| Mỗi dòng ERROR, p50 1 / 8 thread, `sync.on_level = OFF` | 311 / 561 ns | 21 / 148 µs |
-| Như trên, `sync.on_level = ERROR`, ERROR dày | | 2.69 / 5.4 ms (≈ một fsync) |
-| Dòng dưới level | 311 ns | 311–391 ns: không đổi |
+| Lost after `kill -9`, 4 threads (mean / max, 20 runs) | 4 612 / 7 751 lines | 174 / 396 INFO lines, **0 up to the last ERROR line** |
+| Lost after `_Exit`, 1 thread | 954 / 1 811 | 56 / 96, **0 up to the last ERROR line** |
+| Per ERROR line, p50 1 / 8 threads, `sync.on_level = OFF` | 311 / 561 ns | 21 / 148 µs |
+| As above, `sync.on_level = ERROR`, dense ERRORs | | 2.69 / 5.4 ms (≈ one fsync) |
+| Lines below the level | 311 ns | 311–391 ns: unchanged |
 
-- **Ưu**: dòng lỗi cuối luôn còn khi process bị giết; dòng dưới level không tốn thêm.
-- **Nhược**: mỗi dòng ERROR chậm 70–260× (21–148 µs thay vì 311–561 ns). Chỉ trên Windows: kết hợp với `sync.on_level = ERROR` mà dòng ERROR dày thì mỗi dòng chờ cả một fsync (2.69–2.92 ms p50), vì `WriteFile` phải đợi `FlushFileBuffers` đang chạy. Linux và macOS không bị: 39 và 37 µs p50 với cùng cấu hình.
-- **Không đặt dưới `INFO`**: khi mọi dòng phải chờ, 1 thread chỉ còn 43.5 k dòng/s (`sync.on_level = OFF`) hoặc 376 dòng/s (`ERROR`). tblog cảnh báo.
-- Không fsync (mất điện vẫn cần `sync.*`). Không bao giờ treo: chờ tối đa 2 s; không chờ khi đang shutdown, đang crash, dòng bị `drop`, hoặc khi gọi từ thread nền.
+- **Pros**: the last error line always survives the process being killed; lines below the level cost nothing extra.
+- **Cons**: each ERROR line is 70–260× slower (21–148 µs instead of 311–561 ns). Windows only: combined with `sync.on_level = ERROR` and dense ERROR lines, each line waits for a whole fsync (2.69–2.92 ms p50), because `WriteFile` has to wait for a running `FlushFileBuffers`. Linux and macOS are not affected: 39 and 37 µs p50 with the same configuration.
+- **Do not set it below `INFO`**: when every line has to wait, 1 thread manages only 43.5 k lines/s (`sync.on_level = OFF`) or 376 lines/s (`ERROR`). tblog warns.
+- No fsync (power loss still needs `sync.*`). Never hangs: waits at most 2 s; does not wait during shutdown, during a crash, for a `drop`ped line, or when called from a background thread.
 
-### `sync.on_level`, `sync.interval_ms`: sống sót qua mất điện
+### `sync.on_level`, `sync.interval_ms`: surviving power loss
 
-fsync đẩy dữ liệu từ cache của OS xuống đĩa; tốn khoảng 2.5 ms trên NVMe ở máy đo. Nó chạy trên thread sync riêng, nên lệnh log không chờ.
+fsync pushes data from the OS cache to the disk; it costs about 2.5 ms on NVMe on the test machine. It runs on its own sync thread, so log calls do not wait.
 
-| Cấu hình | Ưu | Nhược |
+| Configuration | Pros | Cons |
 |---|---|---|
-| `sync.on_level = ERROR` (mặc định) | Dòng lỗi nằm trên đĩa vài ms sau khi log | Mỗi lượt ghi có dòng ERROR kéo theo một fsync |
-| `sync.interval_ms` nhỏ | Mất điện mất ít hơn: tối đa ≈ `sync.interval_ms` + `flush.interval_ms` | Nhiều lần ghi thật hơn (hao flash, pin) |
-| `sync.interval_ms = 0`, `sync.on_level = FATAL` | Ít lần ghi thật nhất, hợp với flash | Mất điện có thể mất tới khi kernel tự ghi (Linux: khoảng 30 s) |
+| `sync.on_level = ERROR` (default) | Error lines are on disk a few ms after being logged | Every write round containing an ERROR line triggers an fsync |
+| Small `sync.interval_ms` | Less lost on power loss: at most ≈ `sync.interval_ms` + `flush.interval_ms` | More physical writes (flash wear, battery) |
+| `sync.interval_ms = 0`, `sync.on_level = FATAL` | Fewest physical writes, suits flash | Power loss can lose everything until the kernel writes back by itself (Linux: about 30 s) |
 
-macOS dùng `F_FULLFSYNC` (ra khỏi cả cache của ổ đĩa), mỗi lần cỡ ms.
+macOS uses `F_FULLFSYNC` (out of the drive's cache too), a few ms each time.
 
-**`flush.on_level` khác `sync.on_level`:**
+**`flush.on_level` versus `sync.on_level`:**
 
 | | `flush.on_level` | `sync.on_level` |
 |---|---|---|
-| Lệnh log | Chờ tới khi dòng đã vào file | Trả về ngay |
-| Sau lượt ghi | Không fsync | fsync (thread sync) |
-| Sống sót `kill -9` khi lệnh trả về | Có | Chưa chắc |
-| Sống sót mất điện | Sau fsync kế tiếp | Vài ms sau khi lệnh trả về |
+| Log call | Waits until the line is in the file | Returns immediately |
+| After the write round | No fsync | fsync (sync thread) |
+| Survives `kill -9` once the call returns | Yes | Not guaranteed |
+| Survives power loss | After the next fsync | A few ms after the call returns |
 
-Dùng cả hai ở `ERROR`: dòng lỗi đã vào OS khi lệnh trả về, và lên đĩa vài ms sau.
+Use both at `ERROR`: the error line is in the OS when the call returns, and on disk a few ms later.
 
-### `flush.interval_ms`: chu kỳ ghi
+### `flush.interval_ms`: write period
 
-Thread nền ghi mỗi `flush.interval_ms`, hoặc sớm hơn khi một shard đầy 75%, có dòng ≥ `flush.on_level` / `sync.on_level`, hoặc `tblog_flush()`.
+The background thread writes every `flush.interval_ms`, or earlier when a shard is 75% full, a line ≥ `flush.on_level` / `sync.on_level` arrives, or `tblog_flush()` is called.
 
-- **Nhỏ (20–50)**: cửa sổ mất khi `kill -9` hẹp hơn; dòng hiện trong `tail -f` sớm hơn. Nhược: thread nền thức dậy nhiều hơn, mỗi lần ghi ít hơn.
-- **Lớn (1000)**: thread nền ít thức hơn (pin, flash).
-- Không ảnh hưởng lệnh log. Ở 20 k dòng/s mỗi thread, shard đầy 75% sau khoảng 96 ms, sớm hơn 200 ms mặc định, nên giảm xuống dưới 96 ms mới thu hẹp cửa sổ mất. Chưa đo với giá trị khác.
-- Cũng là độ lệch tối đa về thứ tự giữa dòng của các thread khác nhau, và độ trễ của ranh giới `daily` / `hourly`.
+- **Small (20–50)**: a narrower loss window on `kill -9`; lines appear sooner in `tail -f`. Con: the background thread wakes more often, writing less each time.
+- **Large (1000)**: the background thread wakes less (battery, flash).
+- Does not affect log calls. At 20 k lines/s per thread, a shard reaches 75% after about 96 ms, earlier than the 200 ms default, so only values under 96 ms narrow the loss window. Other values not measured.
+- It is also the maximum ordering skew between lines from different threads, and the delay of `daily` / `hourly` boundaries.
 
 ### `buffer.size`: RAM
 
-RAM dùng = 2 × max(`buffer.size`, N × 64 KB), N = số shard (lũy thừa của 2 ≥ số CPU, tối đa 16). Mặc định: 8 MB.
+RAM used = 2 × max(`buffer.size`, N × 64 KB), N = number of shards (power of 2 ≥ CPU count, at most 16). Default: 8 MB.
 
-- **Lớn (`16MB`, `64MB`)**: hấp thụ đợt log dồn dập mà không chờ (`block`) hay bỏ dòng (`drop`).
-- **Nhỏ (`256KB`)**: tiết kiệm RAM (4 CPU: 512 KB).
-- Ảnh hưởng tới số dòng mất khi `kill -9`. Mỗi thread mất tối đa phần nhỏ hơn trong hai giới hạn: 75% một shard, hoặc lượng log trong một `flush.interval_ms`. Đo ở 20 k dòng/s mỗi thread:
-  - 16 CPU: shard 256 KB, 75% ≈ 1 900 dòng; đo được tối đa 1 939.
-  - 4 CPU: shard 1 MB, 75% ≈ 7 500 dòng, nên giới hạn 200 ms ≈ 4 000 dòng thắng; đo được tối đa 3 722 (Linux), 4 460 (Windows), 6 725 (macOS VM, vượt giới hạn, chưa rõ nguyên nhân).
+- **Large (`16MB`, `64MB`)**: absorbs bursts without waiting (`block`) or dropping lines (`drop`).
+- **Small (`256KB`)**: saves RAM (4 CPUs: 512 KB).
+- Affects the number of lines lost on `kill -9`. Each thread loses at most the smaller of two limits: 75% of one shard, or one `flush.interval_ms` worth of logging. Measured at 20 k lines/s per thread:
+  - 16 CPUs: 256 KB shards, 75% ≈ 1 900 lines; measured maximum 1 939.
+  - 4 CPUs: 1 MB shards, 75% ≈ 7 500 lines, so the 200 ms limit ≈ 4 000 lines wins; measured maximum 3 722 (Linux), 4 460 (Windows), 6 725 (macOS VM, over the limit, cause unknown).
 
-### File: xoay, giữ, nén
+### Files: rotation, retention, compression
 
-- Dung lượng tối đa ≈ `file.max_size` × `file.max_files` (trước nén). File nhỏ thì xoay thường hơn (vài system call mỗi lần, cộng một lần nén nếu bật gzip).
-- `daily` / `hourly`: mỗi kỳ một file, dễ tìm và xóa theo ngày. `file.max_size` vẫn áp dụng; một kỳ vượt giới hạn sinh thêm `.1`, `.2`... Với `daily`, `file.max_files` = số ngày muốn giữ + 1.
-- `gzip`: nén trên một thread riêng, không làm chậm lệnh log hay thread nền. Nhược: tốn CPU mỗi lần xoay; trên flash phải ghi thêm file `.gz`. An toàn khi crash giữa chừng (`.gz.tmp` → fsync → đổi tên → mới xóa file gốc). Tỉ lệ nén: chưa đo.
-- Nên đặt `file.path` tuyệt đối. File bị xóa hoặc đổi tên từ bên ngoài (logrotate): tblog mở lại trong khoảng 1 s.
+- Maximum disk use ≈ `file.max_size` × `file.max_files` (before compression). Smaller files rotate more often (a few system calls each time, plus one compression if gzip is on).
+- `daily` / `hourly`: one file per period, easy to find and delete by date. `file.max_size` still applies; a period over the limit produces `.1`, `.2`... With `daily`, `file.max_files` = number of days to keep + 1.
+- `gzip`: compresses on its own thread, does not slow log calls or the background thread. Cons: CPU on each rotation; on flash an extra `.gz` file is written. Crash-safe midway (`.gz.tmp` → fsync → rename → only then delete the original). Compression ratio: not measured.
+- Prefer an absolute `file.path`. If the file is deleted or renamed from outside (logrotate), tblog reopens it within about 1 s.
 
-| `file.rotate` | File đã xoay |
+| `file.rotate` | Rotated files |
 |---|---|
-| `size` | `app.1.log` (mới nhất), `app.2.log`... |
+| `size` | `app.1.log` (newest), `app.2.log`... |
 | `daily` | `app.2026-11-13.log`, `app.2026-11-13.1.log`... |
 | `hourly` | `app.2026-11-13T14.log`... |
 
 ### Console, syslog
 
-Mọi sink chạy trên thread nền theo thứ tự file, console, syslog, sink riêng: một sink chậm làm chậm tất cả.
+Every sink runs on the background thread in the order file, console, syslog, custom sinks: one slow sink slows them all.
 
-- `console`: dùng cho terminal, container, systemd. Được xả khi crash như file. Nhược: terminal chậm (nhất là console Windows) làm thread nền chậm theo.
-- `syslog`: một system call mỗi dòng; không nhận phần xả khi crash; không có trên Windows.
-- `file = false` mà không còn sink nào: tblog bật `console` kèm cảnh báo.
-- Màu console và severity syslog lấy từ token `[%L]` trong `pattern`.
+- `console`: for terminals, containers, systemd. Drained on crash like the file. Con: a slow terminal (especially the Windows console) slows the background thread with it.
+- `syslog`: one system call per line; does not receive the crash drain; not available on Windows.
+- `file = false` with no other sink: tblog enables `console` with a warning.
+- Console colour and syslog severity are taken from the `[%L]` token in `pattern`.
 
 ### `pattern`
 
-| Token | Ý nghĩa | Token | Ý nghĩa |
+| Token | Meaning | Token | Meaning |
 |---|---|---|---|
-| `%D` | `YYYY-MM-DD` (giờ địa phương) | `%n` | Module (`-` = gốc) |
-| `%T` | `HH:MM:SS` | `%f` | Tên file nguồn |
-| `%us` / `%ms` | Micro / mili giây | `%l` | Số dòng |
-| `%L` | Level | `%F` | Tên hàm |
-| `%t` | Thread id của OS | `%m` | Nội dung |
+| `%D` | `YYYY-MM-DD` (local time) | `%n` | Module (`-` = root) |
+| `%T` | `HH:MM:SS` | `%f` | Source file name |
+| `%us` / `%ms` | Micro / milliseconds | `%l` | Line number |
+| `%L` | Level | `%F` | Function name |
+| `%t` | OS thread id | `%m` | Message |
 | `%%` | `%` | | |
 
-Dòng tối đa 1024 byte, dài hơn bị cắt và kết thúc bằng `...`. Dòng ngắn hơn thì file nhỏ hơn và thread nền ghi được nhiều dòng hơn mỗi giây.
+Lines are at most 1024 bytes; longer ones are truncated and end with `...`. Shorter lines mean smaller files and more lines per second through the background thread.
 
-## Sự cố nào, key nào bảo vệ
+## Which failure, which key protects
 
-| Sự cố | Mặc định mất | Bảo vệ |
+| Failure | Lost by default | Protection |
 |---|---|---|
-| Crash (SIGSEGV, `abort`, exception, tràn stack; Windows: SEH) | 0 (đo được) | Không cần. Ngoại lệ: tràn stack trên thread **chưa từng log** (Linux / macOS) thì handler không chạy được, mất như `kill -9` |
-| `exit()`, `return` từ `main` | 0 | Không cần |
-| `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Tới 75% một shard hoặc một `flush.interval_ms` log mỗi thread (đo được 1 900–4 500 dòng, xem [`buffer.size`](#buffersize-ram)) | `flush.on_level`, `tblog_flush()` ở điểm quan trọng |
-| Flood quá trần | 0 (`block` chờ) | `buffer.size`; `drop` thì mất dòng nhưng không chờ |
-| Mất điện, kernel panic | Tới ≈ `sync.interval_ms` + `flush.interval_ms` | `sync.on_level`, `sync.interval_ms`, `tblog_flush()` |
-| Đĩa đầy | Phần không ghi được (cảnh báo ra stderr) | Không có key |
+| Crash (SIGSEGV, `abort`, exception, stack overflow; Windows: SEH) | 0 (measured) | Not needed. Exception: a stack overflow on a thread that has **never logged** (Linux / macOS) prevents the handler from running, lost as with `kill -9` |
+| `exit()`, `return` from `main` | 0 | Not needed |
+| `kill -9`, OOM killer, `TerminateProcess`, `_exit` | Up to 75% of a shard or one `flush.interval_ms` of logging per thread (measured 1 900–4 500 lines, see [`buffer.size`](#buffersize-ram)) | `flush.on_level`, `tblog_flush()` at key points |
+| Flood over the ceiling | 0 (`block` waits) | `buffer.size`; `drop` loses lines but does not wait |
+| Power loss, kernel panic | Up to ≈ `sync.interval_ms` + `flush.interval_ms` | `sync.on_level`, `sync.interval_ms`, `tblog_flush()` |
+| Disk full | Whatever could not be written (warning on stderr) | No key |
 
-## Cảnh báo
+## Warnings
 
-Dạng `tblog: config: config line <N>: <lỗi>` lúc init và mỗi lần đọc lại: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, lỗi ngoặc kép, `option removed, ignored` (các key đã bỏ: `backend`, `mmap.region_size`, `format.mode`).
+Format `tblog: config: config line <N>: <error>` at init and on every reload: `unknown key`, `invalid level`, `invalid boolean`, `invalid number`, `size must be > 0`, `value out of range ... clamped`, `file.max_files must be >= 1`, quoting errors, `option removed, ignored` (removed keys: `backend`, `mmap.region_size`, `format.mode`).
 
-Sửa tổ hợp không dùng được: `gzip` khi không có zlib → `none`; `file = false` không còn sink → bật `console`; `flush.on_level` dưới `INFO` → chỉ cảnh báo.
+Unusable combinations are corrected: `gzip` without zlib → `none`; `file = false` with no sink left → `console` enabled; `flush.on_level` below `INFO` → warning only.
 
-## Cấu hình mẫu
+## Sample configurations
 
-Mọi mẫu đã chạy qua parser của tblog, không có cảnh báo. Key không ghi lấy mặc định.
+Every sample has been run through tblog's parser with no warnings. Keys not listed take their defaults.
 
-**Dịch vụ thông thường**: mặc định đã đủ (không mất dòng khi buffer đầy hay crash, fsync mỗi giây và sau dòng ERROR).
+**Typical service**: the defaults are enough (no lines lost when the buffer is full or on crash, fsync every second and after ERROR lines).
 
 ```ini
 file.path         = /var/log/myservice/app.log
@@ -179,7 +181,7 @@ file.max_files    = 10
 module.http       = WARN
 ```
 
-**Phải giữ log khi bị giết**: dòng ERROR còn sau `kill -9`; mỗi dòng ERROR tốn 21–148 µs, tới vài ms khi dày.
+**Logs must survive being killed**: ERROR lines survive `kill -9`; each ERROR line costs 21–148 µs, up to a few ms when dense.
 
 ```ini
 file.path         = /var/log/myservice/app.log
@@ -187,7 +189,7 @@ flush.interval_ms = 50
 flush.on_level    = ERROR
 ```
 
-**Latency thấp, không bao giờ chờ**: quá tải thì bỏ dòng.
+**Low latency, never wait**: drop lines under overload.
 
 ```ini
 file.path         = /var/log/trading/app.log
@@ -197,7 +199,7 @@ sync.on_level     = FATAL
 sync.interval_ms  = 5000
 ```
 
-**Embedded Linux trên flash**: ít RAM, ít lần ghi thật.
+**Embedded Linux on flash**: little RAM, few physical writes.
 
 ```ini
 level             = WARN
@@ -211,7 +213,7 @@ sync.interval_ms  = 0
 reload.watch      = false
 ```
 
-**Container (chỉ stderr)**:
+**Container (stderr only)**:
 
 ```ini
 file              = false
@@ -219,7 +221,7 @@ console           = true
 console.color     = false
 ```
 
-**Mỗi ngày một file, nén gzip, giữ một tháng**:
+**One file per day, gzip-compressed, kept for a month**:
 
 ```ini
 file.path         = /var/log/myservice/app.log

@@ -1,8 +1,10 @@
-# Build và cài đặt
+# Building and installing
 
-CMake là cách build chính trên mọi nền tảng. `Makefile` chỉ là lối tắt cho Linux.
+**English** | [Tiếng Việt](vi/build.md)
 
-Yêu cầu: CMake 3.10+; GCC/Clang (Linux), AppleClang (macOS 12+), MSVC 2019/2022 hoặc MinGW-w64 (Windows 8+). zlib tùy chọn (chỉ cho `file.compress = gzip`).
+CMake is the main build on every platform. The `Makefile` is only a shortcut for Linux.
+
+Requirements: CMake 3.10+; GCC/Clang (Linux), AppleClang (macOS 12+), MSVC 2019/2022 or MinGW-w64 (Windows 8+). zlib optional (only for `file.compress = gzip`).
 
 ## Build
 
@@ -13,41 +15,41 @@ ctest --test-dir build --output-on-failure  # MSVC: -C Release
 cmake --install build --prefix /usr/local
 ```
 
-- **MSVC**: thêm `-A x64`. zlib qua vcpkg: `vcpkg install zlib:x64-windows` rồi `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`. DLL, test, ví dụ nằm chung `build/bin/<Config>/`.
-- **MinGW**: shell MSYS2 MINGW64, `-G Ninja`. Thư viện build với `__USE_MINGW_ANSI_STDIO=1`, nên `%zu`, `%lld` chạy như trên Linux.
-- **macOS**: zlib có sẵn trong SDK. Dylib có install name `@rpath/libtblog.0.dylib`; link tay thì thêm `-Wl,-rpath,<prefix>/lib`.
-- **Sanitizer** (GCC/Clang): `-DTBLOG_SANITIZE=address,undefined` hoặc `thread`, mỗi cấu hình một thư mục build riêng.
+- **MSVC**: add `-A x64`. zlib through vcpkg: `vcpkg install zlib:x64-windows`, then `-DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake`. The DLL, tests and examples all go to `build/bin/<Config>/`.
+- **MinGW**: MSYS2 MINGW64 shell, `-G Ninja`. The library is built with `__USE_MINGW_ANSI_STDIO=1`, so `%zu`, `%lld` behave as on Linux.
+- **macOS**: zlib ships with the SDK. The dylib's install name is `@rpath/libtblog.0.dylib`; when linking by hand add `-Wl,-rpath,<prefix>/lib`.
+- **Sanitizers** (GCC/Clang): `-DTBLOG_SANITIZE=address,undefined` or `thread`, one build directory per configuration.
 
-## Option CMake
+## CMake options
 
-| Option | Mặc định | Ý nghĩa |
+| Option | Default | Meaning |
 |---|---|---|
-| `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` là bản động; `OFF` = bản tĩnh. Cả hai luôn được build |
-| `TBLOG_CXX_STANDARD` | `17` | Chuẩn C++ để build thư viện: `11`, `14`, `17` (MSVC: từ `14`). Không ràng buộc ứng dụng |
-| `TBLOG_WITH_ZLIB` | `ON` | Dùng zlib nếu tìm thấy |
-| `TBLOG_BUILD_TESTS` / `_EXAMPLES` / `_BENCH` | `OFF` | Test, ví dụ, benchmark |
-| `TBLOG_WERROR` | `OFF` | Warning là lỗi |
-| `TBLOG_SANITIZE` | rỗng | `address`, `thread`, `undefined` (kết hợp bằng dấu phẩy) |
-| `TBLOG_HEADERS_ONLY_CHECK` | `OFF` | Chỉ biên dịch thử header công khai |
+| `TBLOG_BUILD_SHARED` | `ON` | `tblog::tblog` is the shared library; `OFF` = static. Both are always built |
+| `TBLOG_CXX_STANDARD` | `17` | C++ standard used to build the library: `11`, `14`, `17` (MSVC: from `14`). Does not constrain the application |
+| `TBLOG_WITH_ZLIB` | `ON` | Use zlib if found |
+| `TBLOG_BUILD_TESTS` / `_EXAMPLES` / `_BENCH` | `OFF` | Tests, examples, benchmarks |
+| `TBLOG_WERROR` | `OFF` | Warnings are errors |
+| `TBLOG_SANITIZE` | empty | `address`, `thread`, `undefined` (comma-separated) |
+| `TBLOG_HEADERS_ONLY_CHECK` | `OFF` | Only test-compile the public headers |
 
-Khi được nhúng bằng `add_subdirectory`, tblog không đụng `CMAKE_BUILD_TYPE` của project cha; đặt option bằng `set(...)` trước đó.
+When embedded with `add_subdirectory`, tblog does not touch the parent project's `CMAKE_BUILD_TYPE`; set options with `set(...)` beforehand.
 
-## Tĩnh hay động
+## Static or shared
 
-| | Tĩnh | Động |
+| | Static | Shared |
 |---|---|---|
-| Ưu | Một file chạy; thoát process luôn shutdown bình thường | Nhiều chương trình dùng chung; cập nhật không cần build lại |
-| Nhược | Từ C phải link thêm runtime C++, `-pthread`, `-lz` (CMake / `pkg-config --static` làm sẵn) | Windows: khi thoát mà chưa gọi `tblog_shutdown()`, sink riêng không nhận các dòng cuối ([architecture.md](architecture.md#thoát-process-trên-windows)) |
+| Pros | One executable; process exit always shuts down normally | Shared by several programs; updates without rebuilding |
+| Cons | From C you must also link the C++ runtime, `-pthread`, `-lz` (CMake / `pkg-config --static` do it for you) | Windows: on exit without calling `tblog_shutdown()`, custom sinks do not receive the final lines ([architecture.md](architecture.md#process-exit-on-windows)) |
 
-## Dùng từ project khác
+## Using it from another project
 
 ```cmake
-find_package(tblog 0.1 REQUIRED)          # set(TBLOG_USE_STATIC ON) trước dòng này để chọn bản tĩnh
+find_package(tblog 0.1 REQUIRED)          # set(TBLOG_USE_STATIC ON) before this line to pick the static library
 target_link_libraries(app PRIVATE tblog::tblog)
 ```
 
-- Target: `tblog::tblog`, `tblog::tblog_static`, `tblog::tblog_shared`. Package tự kéo `Threads` và `ZLIB` khi cần.
-- Từ mã nguồn: `add_subdirectory(third_party/tblog)`, hoặc FetchContent (CMake 3.14+) ghim theo tag:
+- Targets: `tblog::tblog`, `tblog::tblog_static`, `tblog::tblog_shared`. The package pulls in `Threads` and `ZLIB` as needed.
+- From source: `add_subdirectory(third_party/tblog)`, or FetchContent (CMake 3.14+) pinned to a tag:
 
   ```cmake
   include(FetchContent)
@@ -55,37 +57,37 @@ target_link_libraries(app PRIVATE tblog::tblog)
   FetchContent_MakeAvailable(tblog)
   ```
 
-  Cùng các target như trên. Windows: `tblog.dll` được ghi vào `CMAKE_RUNTIME_OUTPUT_DIRECTORY` của project cha nếu có.
-- Link DLL bằng tay trên Windows: định nghĩa `TBLOG_DLL` trước khi include (`tblog::tblog_shared` làm sẵn).
-- pkg-config (Linux, macOS): `cc app.c $(pkg-config --cflags --libs tblog)`. Link tĩnh với GNU ld khi `.a` và `.so` cùng thư mục: thay `-ltblog` bằng `-l:libtblog.a`.
+  Same targets as above. Windows: `tblog.dll` is written to the parent project's `CMAKE_RUNTIME_OUTPUT_DIRECTORY` if set.
+- Linking the DLL by hand on Windows: define `TBLOG_DLL` before including (`tblog::tblog_shared` does it for you).
+- pkg-config (Linux, macOS): `cc app.c $(pkg-config --cflags --libs tblog)`. Static linking with GNU ld when `.a` and `.so` share a directory: replace `-ltblog` with `-l:libtblog.a`.
 
-## File được cài
+## Installed files
 
-| Nền tảng | Tĩnh | Động |
+| Platform | Static | Shared |
 |---|---|---|
-| Linux | `lib/libtblog.a` | `lib/libtblog.so.0.1.0` (+ symlink `.so.0`, `.so`) |
-| macOS | `lib/libtblog.a` | `lib/libtblog.0.1.0.dylib` (+ symlink) |
+| Linux | `lib/libtblog.a` | `lib/libtblog.so.0.1.0` (+ symlinks `.so.0`, `.so`) |
+| macOS | `lib/libtblog.a` | `lib/libtblog.0.1.0.dylib` (+ symlinks) |
 | Windows, MSVC | `lib/tblog_static.lib` | `bin/tblog.dll`, `lib/tblog.lib` |
 | Windows, MinGW | `lib/libtblog_static.a` | `bin/libtblog.dll`, `lib/libtblog.dll.a` |
 
-Cộng header `include/tblog/`, `<libdir>/cmake/tblog/`, `<libdir>/pkgconfig/tblog.pc`. Bản động chỉ export các hàm `tblog_*`.
+Plus the headers `include/tblog/`, `<libdir>/cmake/tblog/`, `<libdir>/pkgconfig/tblog.pc`. The shared library exports only the `tblog_*` functions.
 
 ## Makefile (Linux)
 
-| Lệnh | Kết quả |
+| Command | Result |
 |---|---|
-| `make` / `make static` / `make shared` | Thư viện vào `build/` |
-| `make test`, `make examples`, `make bench` | Test, ví dụ, benchmark |
-| `make install PREFIX=/usr/local` / `uninstall` | Cài / gỡ (nhận `DESTDIR`, `LIBDIR`...) |
-| `make check-symbols check-install` | Kiểm tra export và cài thử |
+| `make` / `make static` / `make shared` | Library into `build/` |
+| `make test`, `make examples`, `make bench` | Tests, examples, benchmarks |
+| `make install PREFIX=/usr/local` / `uninstall` | Install / uninstall (honours `DESTDIR`, `LIBDIR`...) |
+| `make check-symbols check-install` | Check exports and do a trial install |
 
-Biến: `STD=c++11|c++14|c++17`, `SAN=address|thread|undefined`, `HAVE_ZLIB=0|1`, `CXX`, `CC`, `AR`.
+Variables: `STD=c++11|c++14|c++17`, `SAN=address|thread|undefined`, `HAVE_ZLIB=0|1`, `CXX`, `CC`, `AR`.
 
-## Cross-compile
+## Cross-compiling
 
 ```bash
-cmake -S . -B build-arm64 -DCMAKE_TOOLCHAIN_FILE=<toolchain-của-bạn>.cmake
+cmake -S . -B build-arm64 -DCMAKE_TOOLCHAIN_FILE=<your-toolchain>.cmake
 make CXX=aarch64-linux-gnu-g++ CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
 ```
 
-CI không chạy test cross-compile. Ghi chú embedded: [platforms.md](platforms.md#embedded-linux).
+CI does not run cross-compile tests. Embedded notes: [platforms.md](platforms.md#embedded-linux).

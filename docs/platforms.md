@@ -1,40 +1,42 @@
-# Khác biệt giữa các nền tảng
+# Platform differences
+
+**English** | [Tiếng Việt](vi/platforms.md)
 
 | | Linux | macOS 12+ | Windows 8+ |
 |---|---|---|---|
-| fsync | `fdatasync` | `F_FULLFSYNC` (chậm hơn, xem dưới) | `FlushFileBuffers` |
-| Thread id (`%t`) | `gettid()` | `pthread_threadid_np` (32 bit) | `GetCurrentThreadId` |
-| Call stack khi crash | `backtrace_symbols_fd` (musl: không có) | Định dạng macOS | Chỉ địa chỉ, tự tra symbol |
-| Syslog | Có | Có (unified logging) | Không, `syslog = true` bị bỏ qua kèm cảnh báo |
-| Makefile | Có | Không, dùng CMake | Không, dùng CMake |
+| fsync | `fdatasync` | `F_FULLFSYNC` (slower, see below) | `FlushFileBuffers` |
+| Thread id (`%t`) | `gettid()` | `pthread_threadid_np` (32 bits) | `GetCurrentThreadId` |
+| Call stack on crash | `backtrace_symbols_fd` (musl: none) | macOS format | Addresses only, symbolise yourself |
+| Syslog | Yes | Yes (unified logging) | No, `syslog = true` is ignored with a warning |
+| Makefile | Yes | No, use CMake | No, use CMake |
 
-Mọi nền tảng: file mở ở chế độ append, handle không kế thừa sang process con, thư mục cha được tự tạo.
+All platforms: files are opened in append mode, handles are not inherited by child processes, parent directories are created automatically.
 
 ## Linux
 
-- **Tràn stack**: chỉ báo được trên thread có alternate signal stack. tblog cấp cho mỗi thread 64 KB bộ nhớ ảo ở lệnh log đầu tiên của nó, nên mọi thread đã log đều được bảo vệ (đo được 0 dòng mất; trước đây TB 2 065 dòng). Thread chưa từng log thì không. macOS cũng vậy.
-- `abort()` của glibc không xả stdio: ở đây `fprintf` mất TB 21 dòng còn tblog mất 0.
-- glibc và musl đều được CI chạy toàn bộ test. musl không in call stack khi crash (vẫn xả log). `-DTBLOG_NO_BACKTRACE` tắt call stack ở mọi nơi.
-- TSan trên kernel mới cần tắt ASLR (`setarch $(uname -m) -R`); CTest và `make SAN=thread test` tự làm.
+- **Stack overflow**: can only be reported on a thread with an alternate signal stack. tblog gives each thread 64 KB of virtual memory on its first log call, so every thread that has logged is protected (measured 0 lines lost; previously a mean of 2 065). A thread that has never logged is not. Same on macOS.
+- glibc's `abort()` does not flush stdio: here `fprintf` loses a mean of 21 lines while tblog loses 0.
+- CI runs the full test suite on both glibc and musl. musl prints no call stack on crash (the log is still drained). `-DTBLOG_NO_BACKTRACE` disables the call stack everywhere.
+- TSan on recent kernels needs ASLR off (`setarch $(uname -m) -R`); CTest and `make SAN=thread test` do this automatically.
 
 ### Embedded Linux
 
-- Cần runtime C++ trên máy đích, hoặc link `-static-libstdc++`.
-- RAM: 2 × max(`buffer.size`, N × 64 KB). Với 4 CPU và `buffer.size = 128KB`: 512 KB.
-- Flash: `sync.interval_ms = 0` giảm số lần ghi thật; dòng ≥ `sync.on_level` vẫn được fsync ngay. Mẫu cấu hình: [configuration.md](configuration.md#cấu-hình-mẫu).
-- Vi điều khiển không có OS: dùng [tblog-lite](lite.md).
+- Needs the C++ runtime on the target, or link with `-static-libstdc++`.
+- RAM: 2 × max(`buffer.size`, N × 64 KB). With 4 CPUs and `buffer.size = 128KB`: 512 KB.
+- Flash: `sync.interval_ms = 0` reduces physical writes; lines ≥ `sync.on_level` are still fsynced immediately. Sample configuration: [configuration.md](configuration.md#sample-configurations).
+- Microcontrollers without an OS: use [tblog-lite](lite.md).
 
 ## macOS
 
-- `fsync` của macOS chỉ đẩy dữ liệu tới ổ đĩa, ổ vẫn có thể giữ trong cache. tblog dùng `F_FULLFSYNC` để "đã sync" có cùng nghĩa như trên Linux. **Nhược**: mỗi lần sync tốn cỡ ms, nên `tblog_flush()` chờ lâu hơn; lệnh log không bị ảnh hưởng (sync chạy trên thread riêng).
-- Tràn stack trên thread phụ đến dưới dạng SIGBUS; được báo và xả buffer như Linux (đo được 0 dòng mất). Trên thread không có alternate stack, macOS giết process bằng SIGILL thay vào đó.
+- macOS's `fsync` only pushes data to the drive, which may still hold it in its cache. tblog uses `F_FULLFSYNC` so that "synced" means the same as on Linux. **Con**: each sync takes a few ms, so `tblog_flush()` waits longer; log calls are unaffected (sync runs on its own thread).
+- A stack overflow on a secondary thread arrives as SIGBUS; it is reported and the buffer drained as on Linux (measured 0 lines lost). On a thread without an alternate stack, macOS kills the process with SIGILL instead.
 
 ## Windows
 
-- MSVC không có chế độ C++11: build thư viện với `TBLOG_CXX_STANDARD=14` hoặc `17`.
-- Đường dẫn là UTF-8; `/` và `\` đều được; hỗ trợ UNC và `\\?\`.
-- File log mở với `FILE_SHARE_READ | WRITE | DELETE`: đọc, đổi tên, xóa được khi đang ghi (cần cho xoay file).
-- `WriteFile` phải chờ khi `FlushFileBuffers` đang chạy trên cùng file: `flush.on_level` + `sync.on_level` cùng level làm dòng ERROR chậm tới 2.69–5.4 ms (Linux / macOS: 37–39 µs) ([configuration.md](configuration.md#flushon_level-sống-sót-qua-kill--9)).
-- Console có màu khi bật được ANSI (Windows 10 1511+).
-- DLL: gọi `tblog_shutdown()` trước khi thoát; không `FreeLibrary` khi logger đang chạy ([architecture.md](architecture.md#thoát-process-trên-windows)).
-- ARM64: chỉ header được CI biên dịch thử; thư viện chưa build hay chạy trên ARM64.
+- MSVC has no C++11 mode: build the library with `TBLOG_CXX_STANDARD=14` or `17`.
+- Paths are UTF-8; both `/` and `\` work; UNC and `\\?\` are supported.
+- The log file is opened with `FILE_SHARE_READ | WRITE | DELETE`: it can be read, renamed and deleted while being written (needed for rotation).
+- `WriteFile` has to wait while `FlushFileBuffers` runs on the same file: `flush.on_level` + `sync.on_level` at the same level slows ERROR lines to 2.69–5.4 ms (Linux / macOS: 37–39 µs) ([configuration.md](configuration.md#flushon_level-surviving-kill--9)).
+- The console is coloured when ANSI can be enabled (Windows 10 1511+).
+- DLL: call `tblog_shutdown()` before exiting; do not `FreeLibrary` while the logger is running ([architecture.md](architecture.md#process-exit-on-windows)).
+- ARM64: CI only test-compiles the headers; the library has not been built or run on ARM64.

@@ -1,6 +1,8 @@
-# tblog-lite cho vi điều khiển
+# tblog-lite for microcontrollers
 
-[lite/](../lite/) là thư viện C99 riêng cho Cortex-M (FreeRTOS hoặc bare-metal), dùng **cùng tên macro** với tblog (`TBLOG_INFO`, `TBLOG_MWARN`, `TBLOG_COMPILE_LEVEL`...): code log chuyển qua lại giữa Linux và MCU chỉ khác dòng include và init.
+**English** | [Tiếng Việt](vi/lite.md)
+
+[lite/](../lite/) is a separate C99 library for Cortex-M (FreeRTOS or bare-metal) that uses **the same macro names** as tblog (`TBLOG_INFO`, `TBLOG_MWARN`, `TBLOG_COMPILE_LEVEL`...): logging code moves between Linux and an MCU with only the include line and init changing.
 
 ```c
 #include "tblog_lite.h"
@@ -11,63 +13,63 @@ static const tblog_lite_port port = { uart_write, my_tick_ms, my_irq_save, my_ir
 tblog_lite_init(&port);
 TBLOG_INFO("boot, %d sensors", 3);
 
-/* trong idle task hoặc vòng lặp chính: */
+/* in the idle task or main loop: */
 tblog_lite_process();
 ```
 
-## So với tblog đầy đủ
+## Compared with full tblog
 
 | | tblog-lite | tblog |
 |---|---|---|
-| Bộ nhớ | ~3 KB code, ~2.1 KB RAM (ring 2 KB) | 8 MB buffer mặc định |
-| Đầu ra | Hàm `write` của bạn, gọi từ `process()` | File, console, syslog, sink riêng |
-| Buffer đầy | Luôn bỏ dòng (đếm được) | Chờ hoặc bỏ |
-| Level | Một level toàn cục | Theo module |
-| Gọi từ ISR | Được | Không |
-| malloc, printf của libc | Không dùng | Có |
+| Memory | ~3 KB code, ~2.1 KB RAM (2 KB ring) | 8 MB buffer by default |
+| Output | Your `write` function, called from `process()` | File, console, syslog, custom sinks |
+| Buffer full | Always drops the line (counted) | Wait or drop |
+| Levels | One global level | Per module |
+| Callable from an ISR | Yes | No |
+| malloc, libc printf | Not used | Used |
 
-Số kích thước đo trên host x86-64 (`-Os`, `TBLOG_LITE_FLOAT=0`); bật số thực thêm ~2 KB code. **Chưa đo và chưa chạy trên phần cứng Cortex-M**: port FreeRTOS và bare-metal mới chỉ được kiểm tra cú pháp.
+Sizes measured on an x86-64 host (`-Os`, `TBLOG_LITE_FLOAT=0`); enabling floating point adds ~2 KB of code. **Not yet measured or run on Cortex-M hardware**: the FreeRTOS and bare-metal ports have only been syntax-checked.
 
-## Cách hoạt động
+## How it works
 
-- Lệnh log format vào stack (`TBLOG_LITE_LINE_MAX` byte) rồi chép vào ring tĩnh trong một critical section ngắn. **Không bao giờ chặn**, không bao giờ gọi `write`.
-- `tblog_lite_process()` / `tblog_lite_flush()` (do bạn gọi) đưa byte tới `write`. Ring đầy thì dòng bị bỏ, lần `process()` sau in `tblog-lite: N line(s) dropped`.
-- Dòng log trước `tblog_lite_init` vẫn nằm trong ring.
+- A log call formats onto the stack (`TBLOG_LITE_LINE_MAX` bytes), then copies into a static ring inside a short critical section. It **never blocks** and never calls `write`.
+- `tblog_lite_process()` / `tblog_lite_flush()` (called by you) hand the bytes to `write`. When the ring is full the line is dropped, and the next `process()` prints `tblog-lite: N line(s) dropped`.
+- Lines logged before `tblog_lite_init` still stay in the ring.
 
 ## API
 
-| Hàm | Việc |
+| Function | Purpose |
 |---|---|
-| `tblog_lite_init(port)` | Cài port; `port` phải sống suốt chương trình |
-| `tblog_lite_process()` | Ghi phần đang có trong ring, trả số byte; gọi lồng trả 0 |
-| `tblog_lite_flush()` | Ghi tới khi ring rỗng (trước reset, trong fault handler) |
-| `tblog_lite_set_level`, `tblog_lite_get_level` | Level toàn cục |
-| `tblog_lite_dropped_count()` | Số dòng bị bỏ |
-| `tblog_lite_snprintf` | Formatter riêng: `%d %u %x %c %s %p`, cờ, width, `hh h l ll z`; `%f %e %g` khi `TBLOG_LITE_FLOAT=1` |
+| `tblog_lite_init(port)` | Install the port; `port` must live for the whole program |
+| `tblog_lite_process()` | Write what is in the ring, returns the byte count; a nested call returns 0 |
+| `tblog_lite_flush()` | Write until the ring is empty (before a reset, in a fault handler) |
+| `tblog_lite_set_level`, `tblog_lite_get_level` | Global level |
+| `tblog_lite_dropped_count()` | Number of dropped lines |
+| `tblog_lite_snprintf` | Its own formatter: `%d %u %x %c %s %p`, flags, width, `hh h l ll z`; `%f %e %g` when `TBLOG_LITE_FLOAT=1` |
 
-Port: chỉ `write` bắt buộc. `timestamp()` cho số đầu dòng; `enter_critical` / `exit_critical` phải che mọi ngữ cảnh có log (task và ISR); `fatal()` gọi sau dòng FATAL. `TBLOG_LITE_COMPAT=1` (mặc định) thêm các tên `tblog_flush`, `tblog_set_level`... của tblog đầy đủ.
+Port: only `write` is required. `timestamp()` provides the number at the start of the line; `enter_critical` / `exit_critical` must cover every context that logs (tasks and ISRs); `fatal()` is called after a FATAL line. `TBLOG_LITE_COMPAT=1` (the default) adds full tblog's names `tblog_flush`, `tblog_set_level`...
 
-## Cấu hình lúc biên dịch
+## Compile-time configuration
 
-Đặt bằng `-D`, hoặc `tblog_lite_user_config.h` + `-DTBLOG_LITE_USER_CONFIG`. Thư viện và ứng dụng phải cùng giá trị.
+Set with `-D`, or `tblog_lite_user_config.h` + `-DTBLOG_LITE_USER_CONFIG`. The library and the application must use the same values.
 
-| Macro | Mặc định | Đổi khi |
+| Macro | Default | Change when |
 |---|---|---|
-| `TBLOG_LITE_BUF_SIZE` | `2048` | Ít RAM (nhỏ hơn) / hay bị bỏ dòng (lớn hơn) |
-| `TBLOG_LITE_LINE_MAX` | `128` | Cần dòng dài hơn (cũng là stack mỗi lệnh log) |
-| `TBLOG_LITE_FLOAT` | `0` | Cần `%f` (+~2 KB code, kéo số học double) |
-| `TBLOG_LITE_LONG_LONG` | `1` | `0`: tránh hàm chia 64 bit trên MCU 32 bit |
-| `TBLOG_LITE_FILELINE` | `1` | `0`: bỏ `file:line`, không có chuỗi `__FILE__` trong flash |
-| `TBLOG_LITE_MODULE` | `1` | `0`: bỏ tên module khỏi dòng |
-| `TBLOG_LITE_DEFAULT_LEVEL` | `TBLOG_LV_INFO` | Level sau reset |
-| `TBLOG_COMPILE_LEVEL` | `TBLOG_LV_TRACE` | Xóa hẳn lệnh dưới level khỏi flash |
+| `TBLOG_LITE_BUF_SIZE` | `2048` | Short of RAM (smaller) / lines often dropped (larger) |
+| `TBLOG_LITE_LINE_MAX` | `128` | You need longer lines (also the stack used per log call) |
+| `TBLOG_LITE_FLOAT` | `0` | You need `%f` (+~2 KB code, pulls in double arithmetic) |
+| `TBLOG_LITE_LONG_LONG` | `1` | `0`: avoid 64-bit division helpers on 32-bit MCUs |
+| `TBLOG_LITE_FILELINE` | `1` | `0`: drop `file:line`, no `__FILE__` strings in flash |
+| `TBLOG_LITE_MODULE` | `1` | `0`: drop the module name from the line |
+| `TBLOG_LITE_DEFAULT_LEVEL` | `TBLOG_LV_INFO` | Level after reset |
+| `TBLOG_COMPILE_LEVEL` | `TBLOG_LV_TRACE` | Remove calls below the level from flash entirely |
 
-## Port có sẵn
+## Bundled ports
 
-| Port | Trạng thái |
+| Port | Status |
 |---|---|
-| `lite/port/posix/` | Dùng cho test và demo |
-| `lite/port/freertos/` | Critical section BASEPRI; chưa chạy trên phần cứng |
-| `lite/port/cortex_m_baremetal/` | PRIMASK, SysTick hoặc `DWT->CYCCNT`, UART hoặc RTT; chưa chạy trên phần cứng |
+| `lite/port/posix/` | Used for tests and the demo |
+| `lite/port/freertos/` | BASEPRI critical section; not yet run on hardware |
+| `lite/port/cortex_m_baremetal/` | PRIMASK, SysTick or `DWT->CYCCNT`, UART or RTT; not yet run on hardware |
 
-Lệnh: `make -C lite` (thư viện), `test`, `test-asan`, `demo`, `size`. CI chạy cả bốn.
+Commands: `make -C lite` (library), `test`, `test-asan`, `demo`, `size`. CI runs all four.

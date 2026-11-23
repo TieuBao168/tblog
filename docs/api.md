@@ -1,77 +1,79 @@
 # API
 
-| Header | Dùng từ | Kiểu format |
-|---|---|---|
-| `<tblog/log.h>` | C99 (MSVC: C11), C++11 | `printf`, compiler kiểm tra format |
-| `<tblog/tblog.hpp>` | C++11, header-only, xây trên API C | `{}`, nhận kiểu tự định nghĩa |
+**English** | [Tiếng Việt](vi/api.md)
 
-## Vòng đời
+| Header | Usable from | Format style |
+|---|---|---|
+| `<tblog/log.h>` | C99 (MSVC: C11), C++11 | `printf`, format checked by the compiler |
+| `<tblog/tblog.hpp>` | C++11, header-only, built on the C API | `{}`, accepts user-defined types |
+
+## Lifecycle
 
 ```c
-int  tblog_init(const char *config_path);   /* 0 = OK, -1 = không mở được file log / buffer */
-void tblog_shutdown(void);                  /* ghi nốt, fsync, dừng thread; gọi nhiều lần không sao */
-void tblog_flush(void);                     /* ghi + fsync mọi dòng đã có, chờ tối đa 2 s */
+int  tblog_init(const char *config_path);   /* 0 = OK, -1 = could not open the log file / buffer */
+void tblog_shutdown(void);                  /* write the rest, fsync, stop threads; safe to call repeatedly */
+void tblog_flush(void);                     /* write + fsync every line so far, waits at most 2 s */
 ```
 
-- `tblog_init`: file cấu hình không đọc được thì dùng mặc định và vẫn trả `0`. Gọi lại khi đang chạy: không làm gì. Đăng ký `tblog_shutdown` với `atexit()`.
-- Chỉ nên init một lần: mỗi cặp init/shutdown giữ lại buffer của lần đó.
-- Trước `tblog_init` và sau `tblog_shutdown`, dòng log ra thẳng stderr (vẫn lọc level).
-- `_exit`, `quick_exit`, `kill -9`: không có shutdown, phần trong buffer bị mất ([độ bền](architecture.md#độ-bền-theo-tình-huống)).
+- `tblog_init`: if the configuration file cannot be read, defaults are used and it still returns `0`. Calling it again while running does nothing. It registers `tblog_shutdown` with `atexit()`.
+- Init only once: every init/shutdown pair keeps that round's buffer.
+- Before `tblog_init` and after `tblog_shutdown`, log lines go straight to stderr (levels are still filtered).
+- `_exit`, `quick_exit`, `kill -9`: no shutdown, whatever is in the buffer is lost ([durability](architecture.md#durability-by-scenario)).
 
-## Ghi log (C)
+## Logging (C)
 
 ```c
 TBLOG_TRACE(fmt, ...)  TBLOG_DEBUG  TBLOG_INFO  TBLOG_WARN  TBLOG_ERROR  TBLOG_FATAL
-TBLOG_MINFO(module, fmt, ...)  ...                /* theo module */
+TBLOG_MINFO(module, fmt, ...)  ...                /* per module */
 TBLOG_LOG(level, module, fmt, ...)
 ```
 
-- **Lệnh bị lọc không format, không tính đối số**: 1.16 ns, so với 0.60 ns của `if (flag) fprintf(...)`.
-- `module` phải là hằng (thường là literal): nó chỉ được đọc ở lần chạy đầu của call site, rồi được cache.
-- Dòng tối đa 1024 byte, dài hơn bị cắt thành `...`.
-- Lệnh log **chờ** trong hai trường hợp: buffer đầy với `full_policy = block` (mặc định), và dòng ≥ `flush.on_level` ([configuration.md](configuration.md#các-lựa-chọn-và-cái-giá)).
-- `TBLOG_FATAL`: ghi, `tblog_flush()`, rồi `abort()`. Bị lọc thì không `abort()`.
+- **A filtered call does not format and does not evaluate its arguments**: 1.16 ns, versus 0.60 ns for `if (flag) fprintf(...)`.
+- `module` must be constant (usually a literal): it is read only the first time the call site runs, then cached.
+- Lines are at most 1024 bytes; longer ones are truncated with `...`.
+- A log call **waits** in two cases: the buffer is full with `full_policy = block` (the default), and the line is ≥ `flush.on_level` ([configuration.md](configuration.md#choices-and-their-cost)).
+- `TBLOG_FATAL`: writes, `tblog_flush()`, then `abort()`. If filtered out, it does not `abort()`.
 
-### Xóa lệnh log lúc biên dịch
+### Removing log calls at compile time
 
 ```c
-#define TBLOG_COMPILE_LEVEL TBLOG_LV_INFO   /* hoặc -DTBLOG_COMPILE_LEVEL=TBLOG_LV_INFO */
+#define TBLOG_COMPILE_LEVEL TBLOG_LV_INFO   /* or -DTBLOG_COMPILE_LEVEL=TBLOG_LV_INFO */
 #include <tblog/log.h>
 ```
 
-Lệnh dưới level bị xóa hẳn (cả chuỗi format). Ưu: 0 ns và binary nhỏ hơn. Nhược: không bật lại được lúc chạy. Áp dụng cho từng file nguồn, cả API C++.
+Calls below the level are removed entirely (format string included). Pro: 0 ns and a smaller binary. Con: cannot be re-enabled at run time. Applies per source file, C++ API included.
 
-## Level và module
+## Levels and modules
 
 ```c
-void          tblog_set_level(const char *module, tblog_level lv);   /* NULL = gốc */
+void          tblog_set_level(const char *module, tblog_level lv);   /* NULL = root */
 tblog_level   tblog_get_level(const char *module);
 tblog_module *tblog_module_get(const char *name);
-uint64_t      tblog_dropped_count(void);   /* số dòng bị bỏ (chỉ full_policy = drop) */
+uint64_t      tblog_dropped_count(void);   /* number of dropped lines (full_policy = drop only) */
 ```
 
 - `TBLOG_LV_TRACE` < `DEBUG` < `INFO` < `WARN` < `ERROR` < `FATAL` < `OFF`.
-- Đổi level gốc thì mọi module chưa đặt riêng đổi theo. Có hiệu lực ngay.
-- Tối đa 256 module, tên ≤ 45 ký tự; vượt quá thì trả module gốc.
+- Changing the root level changes every module without its own level. Takes effect immediately.
+- At most 256 modules, names ≤ 45 characters; beyond that the root module is returned.
 
-## Sink riêng
+## Custom sinks
 
 ```c
 typedef void (*tblog_sink_write_fn)(void *ctx, const char *data, size_t len);
-typedef void (*tblog_sink_flush_fn)(void *ctx);   /* có thể NULL */
+typedef void (*tblog_sink_flush_fn)(void *ctx);   /* may be NULL */
 int tblog_add_sink(tblog_sink_write_fn write, tblog_sink_flush_fn flush, void *ctx);
 
 static void to_stdout(void *ctx, const char *d, size_t n) { fwrite(d, 1, n, (FILE *)ctx); }
-tblog_add_sink(to_stdout, NULL, stdout);          /* trước tblog_init */
+tblog_add_sink(to_stdout, NULL, stdout);          /* before tblog_init */
 tblog_init("log.conf");
 ```
 
-- Gọi **trước** `tblog_init`; không gỡ được. `-1` nếu logger đang chạy hoặc `write == NULL`.
-- `write` nhận một hoặc nhiều dòng hoàn chỉnh (kết thúc `\n`, không có NUL). `flush` được gọi sau mỗi lô.
-- Chạy trên thread nền, không bao giờ đồng thời, không bao giờ trong signal handler. Không gọi `tblog_init` / `shutdown` / `flush` từ trong sink.
-- **Nhược**: sink chậm làm chậm mọi sink; không nhận phần xả khi crash (chỉ file và console nhận).
+- Call it **before** `tblog_init`; sinks cannot be removed. Returns `-1` if the logger is running or `write == NULL`.
+- `write` receives one or more complete lines (ending in `\n`, no NUL). `flush` is called after each batch.
+- Runs on the background thread, never concurrently, never inside a signal handler. Do not call `tblog_init` / `shutdown` / `flush` from inside a sink.
+- **Cons**: a slow sink slows every sink; it does not receive the crash drain (only file and console do).
 
-## API C++
+## C++ API
 
 ```cpp
 #include <tblog/tblog.hpp>
@@ -81,33 +83,33 @@ TBLOGF_MWARN("network", "retry {}/{} after {:.1f}s", n, max, secs);
 
 tblog::Logger net("network");
 net.info("connected to {}:{}", host, port);
-TBLOGF_LOGGER(net, TBLOG_LV_DEBUG, "dump {}", expensive());   // không gọi expensive() nếu bị lọc
+TBLOGF_LOGGER(net, TBLOG_LV_DEBUG, "dump {}", expensive());   // expensive() not called if filtered
 ```
 
-**Macro hay `Logger`?**
+**Macro or `Logger`?**
 
 | | `TBLOGF_*` | `tblog::Logger` |
 |---|---|---|
-| Đối số khi bị lọc | Không tính | **Vẫn tính** (chỉ bỏ format) |
-| Cú pháp | Macro | Hàm thành viên, copy rẻ (một con trỏ) |
-| Dùng khi | Đối số đắt | Đối số rẻ, muốn gắn module vào object |
+| Arguments when filtered | Not evaluated | **Still evaluated** (only formatting is skipped) |
+| Syntax | Macro | Member function, cheap to copy (one pointer) |
+| Use when | Arguments are expensive | Arguments are cheap, you want the module attached to an object |
 
-Với `Logger` và đối số đắt: dùng `TBLOGF_LOGGER(lg, lv, ...)` hoặc `if (lg.enabled(lv))`.
+With `Logger` and expensive arguments: use `TBLOGF_LOGGER(lg, lv, ...)` or `if (lg.enabled(lv))`.
 
-- Format vào buffer trên stack `TBLOGF_BUF_SIZE` byte (mặc định 1024), không cấp phát.
-- `file:line` của `Logger` lấy qua `__builtin_FILE/LINE` (GCC 4.8+, Clang 9+, MSVC 19.26+); compiler cũ ghi `?:0`. Dùng `TBLOG_HERE` để ghi rõ.
+- Formats into a stack buffer of `TBLOGF_BUF_SIZE` bytes (1024 by default), no allocation.
+- `Logger`'s `file:line` comes from `__builtin_FILE/LINE` (GCC 4.8+, Clang 9+, MSVC 19.26+); older compilers write `?:0`. Use `TBLOG_HERE` to pass it explicitly.
 
-### Cú pháp format
+### Format syntax
 
-- `{}` đối số kế tiếp, `{N}` đối số thứ N, `{{` `}}` là ngoặc nhọn.
+- `{}` next argument, `{N}` argument N, `{{` `}}` are literal braces.
 - Spec: `{[N]:[[fill]align][sign][#][0][width][.precision][type]}`; `type`: `d x X o b B c e E f F g G s p`.
-- Kiểu có sẵn: số nguyên, `bool`, `char`, số thực, chuỗi C, `std::string`, `std::string_view` (C++17), con trỏ, `nullptr`, enum (in số).
-- `double` trên đường nóng: `{:.Nf}` nhanh hơn `{}`.
-- Sai format không crash, không ném exception; dòng log chứa `{!missing-arg}`, `{!extra-args}`, `{!bad-spec}` hoặc `{!bad-format}`.
+- Built-in types: integers, `bool`, `char`, floating point, C strings, `std::string`, `std::string_view` (C++17), pointers, `nullptr`, enums (printed as numbers).
+- `double` on a hot path: `{:.Nf}` is faster than `{}`.
+- A bad format never crashes or throws; the log line contains `{!missing-arg}`, `{!extra-args}`, `{!bad-spec}` or `{!bad-format}`.
 
-### Kiểu tự định nghĩa
+### User-defined types
 
-Định nghĩa `tblog_format` trong namespace của kiểu (tìm qua ADL):
+Define `tblog_format` in the type's namespace (found through ADL):
 
 ```cpp
 namespace geo {
@@ -117,12 +119,12 @@ inline void tblog_format(tblog::Sink &s, const Point &p) { s.format("({}, {})", 
 TBLOGF_INFO("at {:>12}", geo::Point{3, 4});
 ```
 
-Thứ tự tìm: `tblog_format(Sink&, const T&, const FormatSpec&)` (tự xử lý spec) → `tblog_format(Sink&, const T&)` (tblog tự đệm width) → enum → `operator<<` (ghi thẳng vào `Sink`, không qua `ostringstream`). Không có cách nào: lỗi biên dịch có thông báo rõ.
+Lookup order: `tblog_format(Sink&, const T&, const FormatSpec&)` (handles the spec itself) → `tblog_format(Sink&, const T&)` (tblog pads the width) → enum → `operator<<` (writes straight into the `Sink`, no `ostringstream`). None available: a compile error with a clear message.
 
-`tblog::format_to(buf, cap, fmt, args...)` format vào buffer của bạn (trả độ dài, không ghi NUL).
+`tblog::format_to(buf, cap, fmt, args...)` formats into your own buffer (returns the length, writes no NUL).
 
-## Thread-safety
+## Thread safety
 
-- Mọi lệnh log gọi được từ mọi thread, đồng thời. Dòng của cùng thread luôn đúng thứ tự.
-- `tblog_init`, `tblog_shutdown`, `tblog_add_sink` được tuần tự hóa bằng mutex; các hàm level an toàn giữa các thread.
-- Không gọi API tblog từ signal handler của bạn.
+- Every log call can be made from any thread, concurrently. Lines from the same thread are always in order.
+- `tblog_init`, `tblog_shutdown`, `tblog_add_sink` are serialised by a mutex; the level functions are thread-safe.
+- Do not call the tblog API from your own signal handlers.

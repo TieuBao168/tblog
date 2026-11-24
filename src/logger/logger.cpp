@@ -94,7 +94,7 @@ struct UserSink {
 std::vector<UserSink> *const g_user_sinks = new std::vector<UserSink>;  // never destroyed
 
 const Formatter &default_formatter() {
-    static Formatter f(Config().pattern);
+    static Formatter f(Config().pattern, Config().message_escape);
     return f;
 }
 
@@ -116,8 +116,8 @@ void reload(Runtime *rt) {
     print_warnings(warnings);
 
     apply_levels(next);
-    if (next.pattern != rt->cfg.pattern) {
-        rt->formatters.push_back(tblog::make_unique<Formatter>(next.pattern));
+    if (next.pattern != rt->cfg.pattern || next.message_escape != rt->cfg.message_escape) {
+        rt->formatters.push_back(tblog::make_unique<Formatter>(next.pattern, next.message_escape));
         rt->formatter.store(rt->formatters.back().get(), std::memory_order_release);
     }
     rt->flush_interval_ms.store(next.flush_interval_ms, std::memory_order_relaxed);
@@ -125,6 +125,7 @@ void reload(Runtime *rt) {
     rt->queue->set_flush_level(next.flush_level);
 
     if (next.file_enabled != rt->cfg.file_enabled || next.file.path != rt->cfg.file.path ||
+        next.file.mode != rt->cfg.file.mode ||
         next.buffer_size != rt->cfg.buffer_size || next.console != rt->cfg.console ||
         next.syslog != rt->cfg.syslog) {
         std::fprintf(stderr, "tblog: config: file/buffer/sink changes need a restart\n");
@@ -263,7 +264,7 @@ extern "C" int tblog_init(const char *config_path) {
     if (!rt->pipeline) return -1;
     rt->queue = &rt->pipeline->queue();
 
-    rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern));
+    rt->formatters.push_back(tblog::make_unique<Formatter>(rt->cfg.pattern, rt->cfg.message_escape));
     rt->formatter.store(rt->formatters.back().get(), std::memory_order_release);
     rt->flush_interval_ms.store(rt->cfg.flush_interval_ms);
     rt->sync_interval_ms.store(rt->cfg.sync_interval_ms);

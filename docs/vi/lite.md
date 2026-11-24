@@ -21,7 +21,7 @@ tblog_lite_process();
 
 | | tblog-lite | tblog |
 |---|---|---|
-| Bộ nhớ | ~3 KB code, ~2.1 KB RAM (ring 2 KB) | 8 MB buffer mặc định |
+| Bộ nhớ | ~3.7 KB code (3.4 KB với `TBLOG_LITE_ESCAPE=0`), ~2.1 KB RAM (ring 2 KB) | 8 MB buffer mặc định |
 | Đầu ra | Hàm `write` của bạn, gọi từ `process()` | File, console, syslog, sink riêng |
 | Buffer đầy | Luôn bỏ dòng (đếm được) | Chờ hoặc bỏ |
 | Level | Một level toàn cục | Theo module |
@@ -35,6 +35,7 @@ Số kích thước đo trên host x86-64 (`-Os`, `TBLOG_LITE_FLOAT=0`); bật s
 - Lệnh log format vào stack (`TBLOG_LITE_LINE_MAX` byte) rồi chép vào ring tĩnh trong một critical section ngắn. **Không bao giờ chặn**, không bao giờ gọi `write`.
 - `tblog_lite_process()` / `tblog_lite_flush()` (do bạn gọi) đưa byte tới `write`. Ring đầy thì dòng bị bỏ, lần `process()` sau in `tblog-lite: N line(s) dropped`.
 - Dòng log trước `tblog_lite_init` vẫn nằm trong ring.
+- Ký tự điều khiển trong nội dung được escape như tblog đầy đủ, nên mỗi lệnh một dòng (`TBLOG_LITE_ESCAPE`).
 
 ## API
 
@@ -61,6 +62,7 @@ Port: chỉ `write` bắt buộc. `timestamp()` cho số đầu dòng; `enter_cr
 | `TBLOG_LITE_LONG_LONG` | `1` | `0`: tránh hàm chia 64 bit trên MCU 32 bit |
 | `TBLOG_LITE_FILELINE` | `1` | `0`: bỏ `file:line`, không có chuỗi `__FILE__` trong flash |
 | `TBLOG_LITE_MODULE` | `1` | `0`: bỏ tên module khỏi dòng |
+| `TBLOG_LITE_ESCAPE` | `1` | `0`: ghi nguyên ký tự điều khiển trong nội dung (bớt ~270 byte code); `1` escape chúng như `message.escape` của tblog đầy đủ |
 | `TBLOG_LITE_DEFAULT_LEVEL` | `TBLOG_LV_INFO` | Level sau reset |
 | `TBLOG_COMPILE_LEVEL` | `TBLOG_LV_TRACE` | Xóa hẳn lệnh dưới level khỏi flash |
 

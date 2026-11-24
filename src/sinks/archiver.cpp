@@ -61,6 +61,7 @@ void Archiver::configure(const FileOptions &opt) {
     max_files_ = opt.max_files < 1 ? 1 : opt.max_files;
     rotate_ = opt.rotate;
     compress_ = opt.compress;
+    mode_ = opt.mode;
 #ifndef TBLOG_HAVE_ZLIB
     compress_ = CompressMode::None;  // validate_config() already warned
 #endif
@@ -392,8 +393,17 @@ void Archiver::compressor_main() {
         if (abort_.load() || j == jobs_.end()) break;
         j->active = true;
         const std::string tmp = j->src + ".gz.tmp";
-        pf::FileHandle in = pf::file_open(j->src, pf::OpenMode::Read);
-        pf::FileHandle out = in.valid() ? pf::file_open(tmp, pf::OpenMode::Truncate) : pf::no_file();
+        // Neither file may be a symbolic link planted by someone who can
+        // write the log directory: reading through one would copy its target
+        // into the .gz, truncating through one would destroy its target. The
+        // temporary file is created fresh (O_EXCL): a stale one is removed
+        // first, and anything that reappears in between makes the open fail.
+        pf::FileHandle in = pf::file_open(j->src, pf::OpenMode::ReadNoFollow);
+        pf::FileHandle out = pf::no_file();
+        if (in.valid()) {
+            pf::remove_file(tmp);
+            out = pf::file_open(tmp, pf::OpenMode::CreateNew, mode_);
+        }
         if (!in.valid() || !out.valid()) {
             if (!j->cancelled)
                 std::fprintf(stderr, "tblog: compress %s: %s\n", j->src.c_str(),

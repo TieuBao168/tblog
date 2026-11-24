@@ -18,6 +18,10 @@
 //   Full / notify are per shard: the worker is woken when one shard reaches
 //   75% or on an urgent line (only the first notifier since the last take
 //   pays for the syscall); Drop / Block apply to the caller's shard.
+//   The shard lock (spinlock.h): Block waits for it (spin, yield, then
+//   sleep); Drop gives up after a bounded spin and drops the line, so a
+//   holder descheduled inside its critical section never stalls a Drop
+//   caller (e.g. a real-time thread spinning on a lower-priority holder).
 //
 // Crash safety (crash_drain, async-signal-safe):
 //   Each buffer's committed length `len` is an atomic, published with a
@@ -143,17 +147,7 @@
 #include <new>
 #include <thread>
 
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-#include <immintrin.h>
-#define TBLOG_CPU_RELAX() _mm_pause()
-#elif defined(__aarch64__)
-#define TBLOG_CPU_RELAX() __asm__ __volatile__("yield")
-#elif defined(_M_ARM64) || defined(_M_ARM64EC)
-#include <intrin.h>
-#define TBLOG_CPU_RELAX() __yield()
-#else
-#define TBLOG_CPU_RELAX() ((void)0)
-#endif
+#include "queue/spinlock.h"
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #define TBLOG_COLD __declspec(noinline)
@@ -182,87 +176,6 @@ constexpr size_t kMinShardSize = 64u << 10;
 constexpr unsigned kWorkerWaitMs = 2000;    // handler: the worker's write in flight
 constexpr unsigned kAppendWaitMs = 50;      // handler: appends inside a shard lock (all shards)
 constexpr unsigned kAfterCrashWaitMs = 5000;  // post-crash append: drain + claim
-
-// Bounded back-off for the crash paths: 256 pauses, 256 yields, then 1 ms
-// sleeps until `budget_ms` of steady-clock time has passed. step() returns
-// false once the budget is used up (budget 0: after the first probe).
-// Async-signal-safe in practice: pause, sched_yield / SwitchToThread,
-// nanosleep / Sleep and clock_gettime / QueryPerformanceCounter only.
-class Backoff {
-public:
-    explicit Backoff(unsigned budget_ms) noexcept : budget_ms_(budget_ms) {}
-    bool step() noexcept {
-        if (budget_ms_ == 0) return false;
-        if (n_ < 256) {
-            ++n_;
-            TBLOG_CPU_RELAX();
-            return true;
-        }
-        if (n_ < 512) {
-            ++n_;
-            std::this_thread::yield();
-            return true;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (n_ == 512) {
-            ++n_;
-            deadline_ = now + std::chrono::milliseconds(budget_ms_);
-        } else if (now >= deadline_) {
-            budget_ms_ = 0;
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        return true;
-    }
-
-private:
-    unsigned budget_ms_;
-    unsigned n_ = 0;
-    std::chrono::steady_clock::time_point deadline_{};
-};
-
-class SpinLock {
-public:
-    // Test-and-test-and-set: spin on a plain load (no cache-line ping-pong),
-    // pause between probes, yield after a while (holder may be descheduled).
-    void lock() noexcept {
-        unsigned spins = 0;
-        while (flag_.test_and_set(std::memory_order_acquire)) {
-            while (locked_.load(std::memory_order_relaxed)) {
-                if (++spins < 256) TBLOG_CPU_RELAX();
-                else std::this_thread::yield();
-            }
-        }
-        locked_.store(true, std::memory_order_relaxed);
-    }
-    void unlock() noexcept {
-        locked_.store(false, std::memory_order_relaxed);
-        flag_.clear(std::memory_order_release);
-    }
-    // Crash handler: give up when `bo` is used up (the holder may be the
-    // crashing thread itself).
-    bool try_lock(Backoff &bo) noexcept {
-        for (;;) {
-            if (!locked_.load(std::memory_order_relaxed) &&
-                !flag_.test_and_set(std::memory_order_acquire)) {
-                locked_.store(true, std::memory_order_relaxed);
-                return true;
-            }
-            if (!bo.step()) return false;
-        }
-    }
-
-private:
-    // std::atomic_flag has no load() before C++20, so mirror its state.
-    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
-    std::atomic<bool> locked_{false};
-};
-
-struct SpinGuard {
-    explicit SpinGuard(SpinLock &l) : l_(l) { l_.lock(); }
-    ~SpinGuard() { l_.unlock(); }
-    SpinLock &l_;
-};
 
 struct Buffer {
     char *data = nullptr;
@@ -358,7 +271,21 @@ bool Queue::append(const char *data, uint32_t len, tblog_level lv) noexcept {
         uint64_t gen = 0;
         bool ok = false;
         {
-            SpinGuard g(sh.spin);
+            // Drop never waits for a holder that was descheduled (spinlock.h);
+            // Block waits, but gives up once the queue is closed, so a holder
+            // that died inside append (a crash) cannot hang it.
+            const bool locked = policy_ == FullPolicy::Drop ? sh.spin.try_lock_bounded()
+                                                            : sh.spin.lock_unless(closed_);
+            if (TBLOG_UNLIKELY(!locked)) {
+                // Closed or crashed meanwhile (a crash drain probing the lock,
+                // a holder that died in here): the post-crash path writes the
+                // line. Otherwise (Drop only) the line is dropped like one
+                // that does not fit.
+                if (closed_.load(std::memory_order_relaxed)) return append_closed(data, len);
+                dropped_.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            std::lock_guard<SpinLock> g(sh.spin, std::adopt_lock);
             // Re-checked under the lock: close() / crash_drain() barriers.
             if (TBLOG_UNLIKELY(closed_.load(std::memory_order_relaxed))) goto closed;
             Buffer &b = sh.bufs[sh.active.load(std::memory_order_relaxed)];
@@ -429,7 +356,7 @@ size_t Queue::take(Batch &out) noexcept {
     // Swap every non-empty shard (short critical sections).
     for (size_t i = 0; i < nshards_; ++i) {
         Shard &sh = shards_[i];
-        SpinGuard g(sh.spin);
+        std::lock_guard<SpinLock> g(sh.spin);
         // A crash handler passed (or is about to pass) its barrier: leave
         // every shard as it found it. The lock orders this load after the
         // handler's store when the handler took this lock first.
@@ -518,7 +445,7 @@ void Queue::close() noexcept {
     closed_.store(true, std::memory_order_relaxed);
     // Barrier: appends that saw closed_ == false finish before we return;
     // later ones see closed_ (the lock orders them after this store).
-    for (size_t i = 0; i < nshards_; ++i) SpinGuard g(shards_[i].spin);
+    for (size_t i = 0; i < nshards_; ++i) std::lock_guard<SpinLock> g(shards_[i].spin);
     wake_blocked();
     wake_flush_waiters();
     wake();

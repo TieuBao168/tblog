@@ -89,6 +89,7 @@ N shard (lũy thừa của 2 ≥ số CPU, tối đa 16), mỗi thread gắn c�
 
 - **Ưu**: các thread gần như không tranh nhau. Thông lượng tăng theo số thread (1.89 M → 4.34 M dòng/s từ 1 lên 8 thread), p99 giữ dưới 1 µs. `fprintf` dùng chung một `FILE*` thì giảm (365 k → 213 k) và p99 lên 330 µs.
 - **Nhược**: dòng của các thread khác nhau có thể lệch thứ tự thời gian tối đa khoảng một `flush.interval_ms`. Dòng của cùng một thread luôn đúng thứ tự.
+- Spinlock chỉ giữ trong một lần chép. `block` quay, `yield`, rồi ngủ (để thread giữ khóa ưu tiên thấp hơn bị chen ngang được chạy) và thôi chờ khi queue đã đóng; `drop` bỏ cuộc sau một vòng quay ngắn và bỏ dòng. Nhờ vậy thread real-time không bao giờ quay mãi sau một thread giữ khóa bị chen ngang hay đã crash.
 
 ### 3. Format trên thread gọi log
 

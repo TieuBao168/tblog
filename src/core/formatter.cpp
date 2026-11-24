@@ -104,11 +104,80 @@ struct Out {
     inline void puts(const char *s) { put(s, std::strlen(s)); }
 };
 
+// ---------------------------------------------------------- message.escape
+inline bool needs_escape(unsigned char c) { return (c < 0x20 && c != '\t') || c == 0x7f; }
+
+// Bytes written for c: "\n" / "\r" -> 2, other control -> 4 ("\xHH"), else 1.
+inline size_t escaped_len(unsigned char c) {
+    if (!needs_escape(c)) return 1;
+    return (c == '\n' || c == '\r') ? 2 : 4;
+}
+
+// Escapes the message bytes buf[start, *end) in place (see Formatter in
+// formatter.h), growing the text up to `lim`. Trailing '\n' are dropped
+// first. Returns false if the escaped text had to be cut at `lim`.
+// No allocation: the common case (no control byte) is one scan; otherwise
+// the escapes are written back to front, which never overwrites a byte that
+// is still to be read because the text only grows.
+// True if some byte of w is below 0x20 (tab included) or equal to 0x7F
+// (bit tricks "has less than" / "has value"; exact as to existence, bytes
+// >= 0x80 never match). Lets the common case skip 8 bytes per step.
+inline bool word_has_control(uint64_t w) {
+    const uint64_t ones = 0x0101010101010101ull, high = 0x8080808080808080ull;
+    const uint64_t below = (w - ones * 0x20) & ~w & high;
+    const uint64_t x = w ^ (ones * 0x7f);
+    const uint64_t del = (x - ones) & ~x & high;
+    return (below | del) != 0;
+}
+
+bool escape_message(char *buf, size_t start, size_t *end, size_t lim) {
+    size_t e = *end;
+    while (e > start && buf[e - 1] == '\n') --e;
+    size_t i = start;
+    for (uint64_t w; i + 8 <= e; i += 8) {
+        std::memcpy(&w, buf + i, 8);
+        if (word_has_control(w)) break;
+    }
+    while (i < e && !needs_escape(static_cast<unsigned char>(buf[i]))) ++i;
+    if (i == e) {
+        *end = e;
+        return true;
+    }
+    // How many source bytes fit once escaped (only whole escapes).
+    size_t out = i, src = i;
+    while (src < e) {
+        const size_t l = escaped_len(static_cast<unsigned char>(buf[src]));
+        if (out + l > lim) break;
+        out += l;
+        ++src;
+    }
+    const bool complete = src == e;
+    static const char kHex[] = "0123456789abcdef";
+    size_t w = out;
+    while (src > i) {
+        const unsigned char c = static_cast<unsigned char>(buf[--src]);
+        if (!needs_escape(c)) {
+            buf[--w] = static_cast<char>(c);
+        } else if (c == '\n' || c == '\r') {
+            buf[--w] = c == '\n' ? 'n' : 'r';
+            buf[--w] = '\\';
+        } else {
+            buf[--w] = kHex[c & 0xF];
+            buf[--w] = kHex[c >> 4];
+            buf[--w] = 'x';
+            buf[--w] = '\\';
+        }
+    }
+    *end = out;
+    return complete;
+}
+
 }  // namespace
 
 struct Formatter::Impl {
     std::string text;  // concatenated literal text
     std::vector<Op> ops;
+    bool escape = true;  // message.escape
 
     void add_literal(const char *s, size_t n) {
         if (n == 0) return;
@@ -123,7 +192,8 @@ struct Formatter::Impl {
     void add(OpKind k) { ops.push_back({k, 0, 0}); }
 };
 
-Formatter::Formatter(const std::string &pattern) : impl_(new Impl) {
+Formatter::Formatter(const std::string &pattern, bool escape_message) : impl_(new Impl) {
+    impl_->escape = escape_message;
     const char *p = pattern.c_str();
     const char *end = p + pattern.size();
     const char *lit = p;
@@ -231,12 +301,14 @@ size_t Formatter::format(char *out, size_t cap, const Record &rec, const char *f
                 int n = std::vsnprintf(out + o.pos, avail, fmt, cp);
                 va_end(cp);
                 if (n < 0) break;  // encoding error: drop message
+                const size_t start = o.pos;
                 if ((size_t)n >= avail) {
                     o.pos = o.lim;
                     o.trunc = true;
                 } else {
                     o.pos += (size_t)n;
                 }
+                if (impl_->escape && !escape_message(out, start, &o.pos, o.lim)) o.trunc = true;
                 break;
             }
         }

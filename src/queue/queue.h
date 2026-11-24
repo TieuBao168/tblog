@@ -83,8 +83,9 @@ public:
     Queue &operator=(const Queue &) = delete;
 
     // ---- caller threads (hot path). `data` is one complete line ending in
-    // '\n'. Returns false if the line was dropped (full under Drop, longer
-    // than a shard, or the queue is closed). Once the queue crashed the line
+    // '\n'. Returns false if the line was dropped (full under Drop, its shard
+    // lock held past a bounded spin under Drop, longer than a shard, or the
+    // queue is closed). Once the queue crashed the line
     // is written synchronously to the crash-safe sinks, after the crash
     // drain, and true is returned.
     // lv >= flush level and the line was buffered: returns only once the

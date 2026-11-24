@@ -33,17 +33,35 @@ void fill_info(const struct stat &st, FileInfo *out) noexcept {
 }  // namespace
 
 // ------------------------------------------------------------------ files
-FileHandle file_open(const std::string &path, OpenMode mode) noexcept {
+FileHandle file_open(const std::string &path, OpenMode mode, unsigned perms) noexcept {
+    // O_NOFOLLOW: a symbolic link as the last component fails with ELOOP
+    // (see OpenMode in platform.h).
     int flags = O_CLOEXEC;
     switch (mode) {
-        case OpenMode::Append: flags |= O_WRONLY | O_CREAT | O_APPEND; break;
+        case OpenMode::Append: flags |= O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW; break;
         case OpenMode::Read: flags |= O_RDONLY; break;
-        case OpenMode::Truncate: flags |= O_WRONLY | O_CREAT | O_TRUNC; break;
+        case OpenMode::ReadNoFollow: flags |= O_RDONLY | O_NOFOLLOW; break;
+        case OpenMode::Truncate: flags |= O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW; break;
+        case OpenMode::CreateNew: flags |= O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW; break;
     }
     int fd;
     do {
-        fd = ::open(path.c_str(), flags, 0644);
+        fd = ::open(path.c_str(), flags, static_cast<mode_t>(perms & 07777));
     } while (fd < 0 && errno == EINTR);
+    // O_NOFOLLOW does not catch a hard link: a regular file with a second
+    // name could be another file of the attacker's choosing (systems without
+    // fs.protected_hardlinks, e.g. macOS). Log and rotated files have one.
+    if (fd >= 0 && mode != OpenMode::Read) {
+        struct stat st;
+        int err = 0;
+        if (::fstat(fd, &st) != 0) err = errno;
+        else if (S_ISREG(st.st_mode) && st.st_nlink > 1) err = EMLINK;
+        if (err) {
+            ::close(fd);
+            errno = err;
+            return FileHandle{-1};
+        }
+    }
     return FileHandle{fd};
 }
 

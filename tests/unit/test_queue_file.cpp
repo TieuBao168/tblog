@@ -4,6 +4,8 @@
 #include "logger/pipeline.h"
 #include "pipeline_util.h"
 #include "queue/queue.h"
+#include "queue/spinlock.h"
+#include "sinks/archiver.h"
 #include "sinks/file_sink.h"
 #include "sinks/rotating_file.h"
 #include "sinks/sink.h"
@@ -22,6 +24,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 using namespace tblog;
 
@@ -180,6 +187,114 @@ TEST(rotating_names) {
     ASSERT_TRUE(r3.open(o));
     EXPECT_EQ(r3.rotated_name(1), d.file("a.b/.hidden.1"));
 }
+
+// A symbolic link planted at the log path (directory writable by others)
+// must not make tblog append to the link's target; files are created with
+// file.mode (0640 by default), not world-readable.
+TEST(rotating_refuses_symlink_and_applies_mode) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks and permission bits");
+#else
+    TempDir d("symlink");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.log").c_str()) == 0);
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        EXPECT_FALSE(rf.open(o));  // ELOOP, reported on stderr
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+
+    const mode_t old_mask = ::umask(022);
+    ::unlink(d.file("app.log").c_str());
+    for (unsigned mode : {0640u, 0600u}) {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.mode = mode;
+        ASSERT_TRUE(rf.open(o));
+        struct stat st;
+        ASSERT_TRUE(::stat(o.path.c_str(), &st) == 0);
+        EXPECT_EQ(static_cast<unsigned>(st.st_mode & 0777), mode);
+        rf.close();
+        ::unlink(o.path.c_str());
+    }
+    ::umask(old_mask);
+
+    // A hard link (second name of another file) is refused too (EMLINK).
+    ASSERT_TRUE(::link(victim.c_str(), d.file("app.log").c_str()) == 0);
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        EXPECT_FALSE(rf.open(o));
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+#endif
+}
+
+#ifdef TBLOG_HAVE_ZLIB
+// The compressor's temporary file is created fresh: a link planted at
+// app.1.log.gz.tmp is replaced, never followed (its target is not truncated).
+TEST(rotating_gzip_tmp_symlink_not_followed) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks");
+#else
+    TempDir d("gztmp");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    {
+        RotatingFile rf;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.max_size = 1000;
+        o.max_files = 3;
+        o.compress = CompressMode::Gzip;
+        ASSERT_TRUE(rf.open(o));
+        ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.1.log.gz.tmp").c_str()) == 0);
+        for (int i = 1; i <= 15; ++i) {  // one rotation (10 lines per file)
+            std::string l = fixed_line(i);
+            rf.write_all(l.data(), l.size());
+        }
+        rf.close();  // waits for the compression
+    }
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+    EXPECT_TRUE(fs::exists(d.file("app.1.log.gz")));
+    EXPECT_FALSE(fs::exists(d.file("app.1.log.gz.tmp")));
+#endif
+}
+
+// Read side: a rotated file replaced by a link to another file is not
+// compressed (its target would be copied into a readable .gz).
+TEST(archiver_does_not_compress_through_symlink) {
+#if defined(_WIN32)
+    TINY_SKIP("POSIX symlinks");
+#else
+    TempDir d("gzread");
+    fs::create_directories(d.path);
+    const std::string victim = d.file("victim.txt");
+    ASSERT_TRUE(tos::write_file(victim, "SECRET\n"));
+    ASSERT_TRUE(::symlink(victim.c_str(), d.file("app.1.log").c_str()) == 0);
+    {
+        Archiver a;
+        FileOptions o;
+        o.path = d.file("app.log");
+        o.max_files = 3;
+        o.compress = CompressMode::Gzip;
+        a.configure(o);
+        a.recover();
+        a.start();  // queues app.1.log for compression
+        a.finish();
+    }
+    EXPECT_FALSE(fs::exists(d.file("app.1.log.gz")));
+    EXPECT_TRUE(read_file(victim) == "SECRET\n");
+#endif
+}
+#endif
 
 TEST(rotating_rotation_count) {
     TempDir d("rot");
@@ -368,6 +483,77 @@ TEST(queue_drop_policy_stalled_worker) {
     EXPECT_TRUE(b->queue().append(line.data(), 64, TBLOG_LV_INFO));
     b->shutdown();
     EXPECT_TRUE(read_file(o.file.path) == expect + line);
+}
+
+// full_policy = drop: a held shard lock (holder descheduled) makes the caller
+// give up after a bounded spin instead of waiting for the holder.
+TEST(spinlock_bounded_try_gives_up_on_held_lock) {
+    SpinLock l;
+    l.lock();
+    bool got = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread t([&] { got = l.try_lock_bounded(); });
+    t.join();
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    EXPECT_FALSE(got);
+    EXPECT_TRUE(waited < std::chrono::seconds(1));  // ~256 pauses + 64 yields
+    l.unlock();
+    EXPECT_TRUE(l.try_lock_bounded());
+    l.unlock();
+}
+
+// full_policy = block: lock() waits through its spin, yield and sleep phases
+// for a holder that sleeps inside the critical section, and still excludes.
+TEST(spinlock_lock_waits_for_sleeping_holder) {
+    SpinLock l;
+    std::atomic<bool> held{false};
+    std::atomic<bool> released{false};
+    std::thread holder([&] {
+        std::lock_guard<SpinLock> g(l);
+        held = true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        released = true;
+    });
+    while (!held) std::this_thread::yield();
+    {
+        std::lock_guard<SpinLock> g(l);  // reaches the sleep phase while the holder sleeps
+        EXPECT_TRUE(released.load());
+    }
+    holder.join();
+
+    // Mutual exclusion with holders that sometimes sleep inside the lock.
+    const int kThreads = 4, kIters = 20000 / kScale;
+    long counter = 0;  // plain: only ever touched under the lock
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < kIters; ++i) {
+                std::lock_guard<SpinLock> g(l);
+                ++counter;
+                if (i % 2000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        });
+    for (auto &t : ts) t.join();
+    EXPECT_EQ(counter, static_cast<long>(kThreads) * kIters);
+}
+
+// full_policy = block after a crash: a holder that died inside append never
+// unlocks; lock_unless() gives up once the queue's closed flag is set, and
+// append() then takes the post-crash path instead of hanging.
+TEST(spinlock_lock_unless_stops_when_closed) {
+    SpinLock l;
+    l.lock();  // never unlocked by this "dead" holder until the end
+    std::atomic<bool> closed{false};
+    std::atomic<int> result{-1};
+    std::thread waiter([&] { result = l.lock_unless(closed) ? 1 : 0; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(result.load(), -1);  // still waiting (sleep phase)
+    closed = true;
+    waiter.join();
+    EXPECT_EQ(result.load(), 0);
+    l.unlock();
+    EXPECT_TRUE(l.lock_unless(closed));  // free: taken even when closed is set
+    l.unlock();
 }
 
 TEST(queue_block_policy_loses_nothing) {

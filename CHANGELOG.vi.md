@@ -2,6 +2,27 @@
 
 [English](CHANGELOG.md) | **Tiếng Việt**
 
+## Chưa phát hành
+
+### Không tương thích
+
+- **File log không bao giờ được mở qua symlink hay hard link thứ hai.** Nếu chính đường dẫn log là link thì `tblog_init` giờ thất bại (`Too many levels of symbolic links` / `Too many links`); link ở phần thư mục vẫn dùng được. Cách chuyển: thay link bằng đường dẫn thật.
+- **Ký tự điều khiển trong nội dung được escape mặc định** (`message.escape = true`): xuống dòng thành `\n`, ký tự điều khiển khác thành `\xHH`, dấu xuống dòng ở cuối bị bỏ, nên mỗi lệnh một dòng. Hành vi cũ: `message.escape = false`.
+- **File log mới được tạo với quyền `0640`** (trước: `0644`): người dùng khác trên máy không còn đọc được. Hành vi cũ: `file.mode = 0644`.
+- **`file.max_files` giới hạn tối đa 10000** (vượt thì bị kẹp kèm cảnh báo).
+
+### Thêm
+
+- **`message.escape`**: escape ký tự điều khiển trong nội dung; tốn 6–10 ns mỗi dòng (microbenchmark của formatter). tblog-lite: `TBLOG_LITE_ESCAPE` (mặc định 1, ~270 byte code).
+- **`file.mode`**: quyền của các file tblog tạo (bát phân, chủ phải có quyền ghi; Linux, macOS).
+
+### Sửa
+
+- **Link cài sẵn trong thư mục log có thể chuyển hướng việc ghi và đọc.** `app.log → <file bất kỳ>` làm process nối log vào file đích; link giữa các file đã xoay làm bộ nén gzip xóa trắng file đích (`app.N.log.gz.tmp`) hoặc chép nó vào file `.gz` (`app.N.log`). Giờ mở bằng `O_NOFOLLOW` kèm kiểm tra hard link, file tạm bằng `O_EXCL`. Windows: từ chối symlink và junction; các reparse point khác (file giữ chỗ OneDrive, file đã dedup) mở bình thường.
+- **Dữ liệu log bằng `%s` / `{}` có thể tạo dòng log giả** (và bản ghi syslog với severity riêng) qua ký tự xuống dòng, và gửi mã điều khiển tới terminal. Giờ được escape (`message.escape`).
+- **Khóa shard có thể chờ vô hạn.** Thread real-time (`SCHED_FIFO` / `SCHED_RR`) có thể quay mãi sau một thread giữ khóa ưu tiên thấp hơn bị chen ngang trên cùng CPU, và một thread có thể treo sau thread giữ khóa đã crash giữa lệnh log. Giờ `block` quay, `yield`, rồi ngủ từng 50 µs và thôi chờ khi queue đã đóng; `drop` bỏ cuộc sau một vòng quay ngắn và bỏ dòng (có đếm), nên giờ cũng có thể bỏ dòng khi nhiều thread dùng chung shard trên ít CPU. Dòng không lấy được khóa vì crash được ghi thẳng, như sau crash. Đường không tranh khóa chỉ thêm một lệnh rẽ nhánh.
+- **`file.max_files` không có giới hạn trên**: xoay theo kích thước đổi tên mọi file được giữ, nên giá trị quá lớn làm thread nền đứng lại mỗi lần xoay.
+
 ## 0.1.0 (2026-11-22)
 
 Bản phát hành đầu tiên.

@@ -18,10 +18,13 @@ namespace tblog {
 // Bounds of flush.interval_ms and sync.interval_ms (sync: 0 = periodic sync off).
 constexpr uint32_t kFlushIntervalMinMs = 1, kFlushIntervalMaxMs = 60000;
 constexpr uint32_t kSyncIntervalMaxMs = 3600000;
+// Upper bound of file.max_files (size rotation renames every kept file).
+constexpr int kMaxFilesLimit = 10000;
 
 struct Config {
     tblog_level level = TBLOG_LV_INFO;
     std::string pattern = "%D %T.%us [%L] [%t] %f:%l - %m";
+    bool message_escape = true;  // message.escape: control characters in %m escaped
     bool file_enabled = true;  // `file`: false = no log file (console / syslog / user sinks only)
     FileOptions file;
     size_t buffer_size = 4u << 20;
@@ -37,7 +40,8 @@ struct Config {
     bool reload_watch = true;
 };
 
-// Keys: level, pattern, file, file.path, file.max_size, file.max_files,
+// Keys: level, pattern, message.escape, file, file.path, file.mode,
+// file.max_size, file.max_files (1..kMaxFilesLimit),
 // file.rotate (size|daily|hourly), file.compress (none|gzip; gzip needs a
 // zlib build), buffer.size, full_policy (drop|block),
 // flush.interval_ms, flush.on_level, sync.interval_ms, sync.on_level,
@@ -60,7 +64,8 @@ bool load_config(const char *path, Config &out, std::vector<std::string> *warnin
 // (tblog_init and hot-reload). Returns true iff no warning was added.
 // Rules:
 //   * file.compress = gzip in a build without zlib -> none (warning)
-//   * file.max_files < 1 -> 1, file.max_size == 0 -> 1 (programmatic configs;
+//   * file.max_files < 1 -> 1, > kMaxFilesLimit -> kMaxFilesLimit,
+//     file.max_size == 0 -> 1, file.mode > 0777 or without owner write -> 0640 (programmatic configs;
 //     the parser already rejects these)
 //   * flush.interval_ms clamped to [kFlushIntervalMinMs, kFlushIntervalMaxMs],
 //     sync.interval_ms to [0, kSyncIntervalMaxMs] (programmatic configs; the

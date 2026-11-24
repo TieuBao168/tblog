@@ -279,6 +279,46 @@ TEST(fmt_truncation) {
     EXPECT_EQ(s.substr(s.size() - 4), std::string("...\n"));
 }
 
+// message.escape: data in %m cannot start a forged line or reach the
+// terminal as control codes; the pattern itself is not touched.
+TEST(fmt_message_escape) {
+    Record r = make_rec(kTs);
+    Formatter f("[%L]\t%m");
+    EXPECT_EQ(fmt_line(f, 256, r, "user %s", "bob\n[ERROR] forged"),
+              std::string("[WARN]\tuser bob\\n[ERROR] forged\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "%s", "a\rb\x1b[31mred\x7f\x01z"),
+              std::string("[WARN]\ta\\rb\\x1b[31mred\\x7f\\x01z\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "%s", "tab\tkept, C:\\dir kept"),
+              std::string("[WARN]\ttab\tkept, C:\\dir kept\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "%c|", 0), std::string("[WARN]\t\\x00|\n"));
+    // Trailing newlines (printf habit) are dropped, not escaped.
+    EXPECT_EQ(fmt_line(f, 256, r, "done\n"), std::string("[WARN]\tdone\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "done\n\n"), std::string("[WARN]\tdone\n"));
+    EXPECT_EQ(fmt_line(f, 256, r, "a\nb\n"), std::string("[WARN]\ta\\nb\n"));
+    // message.escape = false: written as is (one extra line).
+    Formatter raw("[%L] %m", false);
+    EXPECT_EQ(fmt_line(raw, 256, r, "%s", "a\nb"), std::string("[WARN] a\nb\n"));
+}
+
+TEST(fmt_message_escape_bounds) {
+    Record r = make_rec(kTs);
+    Formatter f("[%L] %m %F");
+    const char unit[] = {'a', '\x1b', '\n', '\x01', 'b'};
+    for (size_t cap : {64u, 65u, 66u, 67u, 100u, 1024u}) {
+        for (size_t len = 0; len < 1200; len += (len < 80 ? 1 : 97)) {
+            std::string m;
+            for (size_t i = 0; i < len; ++i) m.push_back(unit[i % sizeof unit]);
+            std::string s = fmt_line(f, cap, r, "%s", m.c_str());
+            EXPECT_TRUE(!s.empty() && s.size() <= cap && s.back() == '\n');
+            EXPECT_TRUE(s.find('\n') == s.size() - 1);  // exactly one line
+            bool ctrl = false;
+            for (char ch : s.substr(0, s.size() - 1))
+                ctrl = ctrl || (static_cast<unsigned char>(ch) < 0x20 && ch != '\t');
+            EXPECT_FALSE(ctrl);
+        }
+    }
+}
+
 TEST(fmt_newline_always_present) {
     Record r = make_rec();
     const char *pats[] = {"", "%m", "%D %T.%us [%L] [%t] %f:%l - %m", "%%%", "x%"};

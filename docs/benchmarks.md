@@ -25,7 +25,7 @@ Compares tblog with the simplest way to log: `fprintf` into a file. No compariso
 | macOS | GitHub Actions, Apple M1 (VM), 3 CPUs, macOS 26, clang 21 | Shared VM; clock step 41 ns |
 | Windows CI | GitHub Actions, EPYC 9V45, 4 CPUs, Windows Server 2025, MSVC 19.52 | Shared VM; slow disk (fsync) |
 
-CI performance figures come from the first bench run (commit `47e4c97`, machines as above). Log-loss figures come from the run after the stack-overflow fix (commit `12fb37d`); in that run Linux ran on a Xeon Platinum 8370C and Windows on an EPYC 7763 (still 4 CPUs). CI machines are noisy: only compare variants with each other on the same machine, not across machines. The laptop does not pin its CPU frequency: tblog's end-to-end figures vary ±20–40% between runs.
+CI performance figures come from the first bench run (commit `47e4c97`, machines as above). Log-loss figures come from the run after the stack-overflow fix (commit `12fb37d`); in that run Linux ran on a Xeon Platinum 8370C and Windows on an EPYC 7763 (still 4 CPUs). CI machines are noisy: only compare variants with each other on the same machine, not across machines. The laptop does not pin its CPU frequency: tblog's end-to-end figures vary ±20–40% between runs. Two later changes are not in these figures: `drop` also drops a line whose shard lock stays busy after a short spin (commit `dd7791a`), and `message.escape` (on by default) adds 6–10 ns per line ([configuration.md](configuration.md#messageescape-one-call-one-line)).
 
 ## Cross-platform comparison
 

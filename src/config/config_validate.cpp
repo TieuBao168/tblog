@@ -35,6 +35,14 @@ bool validate_config(Config &c, std::vector<std::string> *warnings, size_t user_
         c.file.max_files = 1;
         add(warnings, &n, "file.max_files must be >= 1, set to 1");
     }
+    if (c.file.max_files > kMaxFilesLimit) {
+        c.file.max_files = kMaxFilesLimit;
+        add(warnings, &n, "file.max_files clamped to " + std::to_string(kMaxFilesLimit));
+    }
+    if (c.file.mode > 0777 || !(c.file.mode & 0200)) {
+        c.file.mode = FileOptions().mode;
+        add(warnings, &n, "invalid file.mode, using 0640");
+    }
     if (c.file.max_size == 0) {
         c.file.max_size = 1;
         add(warnings, &n, "file.max_size must be > 0, set to 1 byte");
